@@ -224,6 +224,33 @@ class CrosswalkStateTests(unittest.TestCase):
 
 
 class RuntimeSafetyTests(unittest.TestCase):
+    def test_straight_maneuver_uses_normal_follow_mode(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.left_turn_bias = 0.12
+        follower.right_turn_bias = 0.12
+        follower.straight_bias = 0.0
+
+        self.assertEqual(follower.maneuver_mode("straight"), ("normal", 0.0))
+
+    def test_left_and_right_maneuvers_keep_side_follow_modes(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.left_turn_bias = 0.12
+        follower.right_turn_bias = 0.12
+        follower.straight_bias = 0.0
+
+        self.assertEqual(follower.maneuver_mode("left"), ("left", 0.12))
+        self.assertEqual(follower.maneuver_mode("right"), ("right", -0.12))
+
+    def test_initial_intersection_segment_should_not_force_right_follow(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.enter_intersection_straight_time = 0.6
+        follower.straight_bias = 0.0
+        mode, bias, allow_single = follower.maneuver_follow_choice("left", 0.2, "left", 0.12)
+
+        self.assertEqual(mode, "normal")
+        self.assertEqual(bias, 0.0)
+        self.assertFalse(allow_single)
+
     def test_detect_only_disables_motion_even_when_dry_run_is_false(self):
         self.assertFalse(line_cy.motion_commands_enabled(False, True))
         self.assertFalse(line_cy.motion_commands_enabled(True, False))

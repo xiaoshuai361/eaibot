@@ -903,7 +903,11 @@ class LaneFollower:
         return cv2.resize(frame, (self.process_width, int(height * scale)), interpolation=cv2.INTER_AREA)
     def get_turn_cmd(self):
         cmd = str(rospy.get_param("~turn_cmd", "straight")).lower().strip()
-        return cmd if cmd in ("left", "straight", "right") else "straight"
+        if cmd in ("left", "straight", "right"):
+            return cmd
+        if hasattr(rospy, "logwarn"):
+            rospy.logwarn("未知 turn_cmd=%s，已按 straight 处理；可选值: left / straight / right", cmd)
+        return "straight"
     def lane_width(self, frame_width):
         return self.vision.expected_width(frame_width, self.lane_width_estimate, self.lane_width_pixels)
     def update_lane_width(self, debug, frame_width):
@@ -978,7 +982,7 @@ class LaneFollower:
         if step <= 0:
             return angular
         return self.last_angular + clamp(angular - self.last_angular, -step, step)
-    def line_control(self, frame, binary, follow_mode="normal", speed=None, bias=0.0):
+    def line_control(self, frame, binary, follow_mode="normal", speed=None, bias=0.0, allow_single_turn=True):
         width = frame.shape[1]
         if not self.initialized:
             self.last_mid = width // 2
@@ -1004,7 +1008,7 @@ class LaneFollower:
             keep = clamp(self.angular_smooth_keep, 0.0, 0.9)
             angular = keep * self.last_angular + (1.0 - keep) * angular
             linear = capped_speed(self.line_speed, speed)
-            if follow_mode == "normal":
+            if follow_mode == "normal" and allow_single_turn:
                 raw = self.raw_single_turn(debug)
                 stable = self.stable_single_turn(raw)
                 debug["raw_single_turn"] = raw
@@ -1044,7 +1048,11 @@ class LaneFollower:
             return "left", self.left_turn_bias
         if cmd == "right":
             return "right", -self.right_turn_bias
-        return "right", self.straight_bias
+        return "normal", self.straight_bias
+    def maneuver_follow_choice(self, cmd, elapsed, mode, bias):
+        if cmd == "straight" or elapsed < self.enter_intersection_straight_time:
+            return "normal", self.straight_bias, False
+        return mode, bias, True
     def run_maneuver(self, cmd):
         mode, bias = self.maneuver_mode(cmd)
         self.state = "MANEUVER"
@@ -1065,11 +1073,10 @@ class LaneFollower:
             self.last_stop = self.vision.detect_stopline_before_crosswalk(binary)
             lane_binary = self.suppress_crosswalk_regions(binary, self.last_stop)
             elapsed = rospy.get_time() - start
-            if elapsed < self.enter_intersection_straight_time:
-                active_mode, active_bias = "right", self.straight_bias
-            else:
-                active_mode, active_bias = mode, bias
-            centers, _ = self.line_control(frame, lane_binary, active_mode, self.side_follow_speed, active_bias)
+            active_mode, active_bias, allow_single_turn = self.maneuver_follow_choice(cmd, elapsed, mode, bias)
+            centers, _ = self.line_control(
+                frame, lane_binary, active_mode, self.side_follow_speed, active_bias, allow_single_turn
+            )
 
             crosswalk_visible = (
                 self.last_stop.get("confidence", 0.0) >= self.crosswalk_clear_confidence
