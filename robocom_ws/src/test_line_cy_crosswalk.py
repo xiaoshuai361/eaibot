@@ -39,6 +39,12 @@ def load_line_cy():
 line_cy = load_line_cy()
 
 
+def fill_rotated_rect(binary, center, size, angle, value=255):
+    polygon = cv2.boxPoints((center, size, angle)).astype(np.int32)
+    cv2.fillConvexPoly(binary, polygon, value)
+    return polygon
+
+
 class StoplineGeometryTests(unittest.TestCase):
     def test_long_edge_angle_is_zero_for_horizontal_rectangle(self):
         points = cv2.boxPoints(((100.0, 80.0), (120.0, 18.0), 0.0))
@@ -97,6 +103,39 @@ class CrosswalkMaskTests(unittest.TestCase):
         for x, y in stripe_centers:
             self.assertEqual(int(cleaned[y, x]), 0)
         self.assertEqual(int(cleaned[120, 25]), 255)
+
+
+class CrosswalkMisclassificationTests(unittest.TestCase):
+    def test_thin_long_lane_fragments_do_not_form_crosswalk_stripes(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        for center in [(120.0, 240.0), (260.0, 238.0), (400.0, 242.0)]:
+            fill_rotated_rect(binary, center, (9.0, 90.0), -58.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertEqual(result["stripe_polygons"], [])
+
+    def test_grouped_short_thick_bars_are_crosswalk_stripes(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        for x in [180, 245, 310, 375, 440]:
+            fill_rotated_rect(binary, (float(x), 220.0), (32.0, 95.0), 4.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertEqual(len(result["stripe_polygons"]), 5)
+
+    def test_diagonal_lane_with_stripes_is_not_a_stopline(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        fill_rotated_rect(binary, (250.0, 285.0), (450.0, 16.0), -35.0)
+        for x in [235, 300, 365, 430, 495]:
+            fill_rotated_rect(binary, (float(x), 210.0), (32.0, 92.0), -6.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
 
 
 class AlignmentControlTests(unittest.TestCase):

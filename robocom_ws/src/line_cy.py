@@ -17,74 +17,44 @@ import rospy
 from geometry_msgs.msg import Twist
 
 
-# ===================== 常用调车参数（优先只改这里）=====================
-# 摄像头/运行模式
+# 常用调车参数：详细说明见 /home/eaibot/zcy/循迹操作.md
 LANE_CAM_INDEX = 2
-# 前方巡线摄像头编号；不对时运行加 _camera_index:=0/1/2/3。
 PROCESS_WIDTH = 640
-# 高分辨率图像先缩到这个宽度再识别和控车；设 0 表示不缩放。
 DRY_RUN = True
-# True=不发 /cmd_vel，只看识别。
 DETECT_ONLY = True
-# True=只检测显示，不执行停车/路口通过。
 DEBUG_VIEW = True
-# True=打开 line_cy_processed 处理图。
 RAW_VIEW = False
-# True=打开 line_cy_raw 原图窗口；运行时可加 _raw_view:=true。
 
-# 速度与转向
 LINEAR_SPEED = 0.10
-# 普通巡线速度；稳定后再加到 0.12~0.16。
 SINGLE_LINE_SPEED = 0.08
-# 单边线找线速度。仍然前进，不停车；稳定后可加到 0.10。
 MAX_ANGULAR = 0.6
-# 最大角速度；拐不动可略增，左右摆动就降。
 SINGLE_LINE_MIN_ANGULAR = 0.15
-# 单边线找线时最小转向量；车仍前进，只是给更大的转向量找回丢失线。
 ANGULAR_SMOOTH_KEEP = 0.70
-# 角速度低通滤波，越大越稳，越小越灵敏。
 ANGULAR_STEP_LIMIT = 0.05
-# 每帧角速度最大变化量，摇摆时降到 0.05~0.06。
 
-# PID：没丢线但弯道拐太多/太少，主要调 BIG；直线左右摆，主要调 SMALL。
 PID_KP_SMALL = 0.0028
 PID_KD_SMALL = 0.0008
 PID_KP_BIG = 0.03
 PID_KD_BIG = 0.002
 PID_KI = 0
 DEV_THRESHOLD = 100
-# 偏差大于该像素阈值时使用大 PID。
 
-# 识别区域与补线
 ROI_TOP_RATIO = 0.28
 ROI_BOTTOM_RATIO = 0.62
-# ROI 绿色框。看得太近受车身影响就降低 BOTTOM；看不到弯道提前量就降低 TOP。
 SINGLE_CENTER_FACTOR = 0.6
-# 单边线补中心激进程度；补线太多/压线就降，找线不够就升。
 
-# 白天反光/黑线提取
 BLACK_V_MAX = 80
-# 黑线发灰或反光识别不到时，优先加到 65~85；地面噪声变多就往回降。
 ADAPTIVE_BLOCK_SIZE = 31
-# 自适应阈值窗口，保持奇数；一般 21~41，通常不用大改。
 ADAPTIVE_C = 5
-# 越小越容易把“发灰的黑线”提出来；白天看不到线就降到 4~5。
 BLUR_KERNEL_SIZE = 5
-# 灰度高斯模糊核，保持奇数；一般不用改。
 MORPH_KERNEL_SIZE = 3
-# 开闭运算核；地面散点噪声多可加到 5，细线被吃掉就降回 1~3。
 
-# 斑马线停车
 STOP_CONFIDENCE_MIN = 0.72
-STOP_TRIGGER_Y_RATIO = 0.58
-# 停止横线必须到画面这个高度以下才真正停车；太小会远处提前停，太大可能刹得晚。
 STOP_FRONT_CENTER_MARGIN_RATIO = 0.28
-# 停止横线必须在画面中部附近，或横线本身跨过画面中心；防止左侧远处露一点就触发。
 STOP_STABLE_FRAMES = 3
 STOP_HOLD_TIME = 1.0
 STOP_COOLDOWN_TIME = 5.0
 
-# 斑马线接近与横条摆正
 APPROACH_CROSSWALK_SPEED = 0.06
 ALIGN_TRIGGER_Y_RATIO = 0.82
 ALIGN_KP = 0.025
@@ -96,24 +66,18 @@ ALIGN_TIMEOUT = 5.0
 ALIGN_ANGULAR_SIGN = 1.0
 CROSSWALK_LOST_FRAMES = 6
 
-# 路口通过与恢复
 SIDE_FOLLOW_SPEED = 0.10
-# 路口单边补线速度。
 ENTER_INTERSECTION_STRAIGHT_TIME = 0.6
-# 停车后先低速跟右线直行这段时间，把车身摆正并真正进入路口，再执行左/右转。
 INTERSECTION_MIN_TIME = 1.2
 INTERSECTION_MAX_TIME = 15.0
 RECOVER_DUAL_FRAMES = 10
 CROSSWALK_CLEAR_CONFIDENCE = 0.45
-# 路口通过时，斑马线/停止线置信度低于它才算“基本离开斑马线区域”。
 CROSSWALK_CLEAR_FRAMES = 8
-# 连续多少帧确认斑马线区域已离开后，才允许恢复普通巡线。
 LEFT_TURN_BIAS = 0.12
 RIGHT_TURN_BIAS = 0.12
 STRAIGHT_BIAS = 0.0
-# =============================================================
 
-# ===================== 少改参数（算法内部阈值，通常不用动）=====================
+# 算法内部阈值，通常不用调。
 CAMERA_BACKEND = "v4l2"
 CAMERA_STARTUP_WAIT = 3.0
 DEBUG_MAX_WIDTH = 960
@@ -139,11 +103,9 @@ PAIR_MAX_GAP_RATIO = 0.96
 PAIR_CENTER_JUMP_RATIO = 0.30
 OUTSIDE_MARGIN_RATIO = 0.10
 SINGLE_WIDTH_FLOOR_RATIO = 0.52
-NORMAL_TURN_HINT_FROM_CMD = False
 SINGLE_TURN_CONFIRM_FRAMES = 4
 SINGLE_TURN_RELEASE_FRAMES = 6
 KALMAN_FAIL_MAX = 8
-# =============================================================
 
 
 def clamp(value, low, high):
@@ -162,6 +124,14 @@ def long_edge_angle_deg(points):
     while angle < -90.0:
         angle += 180.0
     return angle
+
+
+def undirected_angle_delta_deg(a, b):
+    """比较线段方向，不区分 180 度反向。"""
+    delta = abs(float(a) - float(b))
+    while delta > 90.0:
+        delta = abs(delta - 180.0)
+    return delta
 
 
 def alignment_angular(angle_deg, kp, min_angular, max_angular, direction_sign):
@@ -205,7 +175,6 @@ def find_contours(binary):
 
 class CameraReader:
     """后台读摄像头，避免主线程卡在 cap.read() 后 Ctrl-C 不响应。"""
-
     def __init__(self, camera_index, backend):
         self.cap = self._open(camera_index, backend)
         self.lock = threading.Lock()
@@ -215,7 +184,6 @@ class CameraReader:
         self.last_read_seq = -1
         self.running = False
         self.thread = None
-
         if self.cap is not None and self.cap.isOpened():
             try:
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -225,17 +193,14 @@ class CameraReader:
             self.thread = threading.Thread(target=self._loop)
             self.thread.daemon = True
             self.thread.start()
-
     def _open(self, camera_index, backend):
         if backend == "v4l2" and hasattr(cv2, "CAP_V4L2"):
             cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
             if cap.isOpened():
                 return cap
         return cv2.VideoCapture(camera_index)
-
     def isOpened(self):
         return self.cap is not None and self.cap.isOpened()
-
     def _loop(self):
         while self.running and not rospy.is_shutdown():
             ok, frame = self.cap.read()
@@ -246,7 +211,6 @@ class CameraReader:
                     self.latest_seq += 1
             if not ok:
                 time.sleep(0.02)
-
     def read(self, timeout=0.5):
         end = time.time() + timeout
         while not rospy.is_shutdown() and time.time() < end:
@@ -257,7 +221,6 @@ class CameraReader:
                     return True, frame
             time.sleep(0.01)
         return False, None
-
     def release(self):
         self.running = False
         if self.thread is not None and self.thread.is_alive():
@@ -276,12 +239,10 @@ class PIDController:
         self.integral = 0.0
         self.last_error = 0.0
         self.last_time = None
-
     def reset(self):
         self.integral = 0.0
         self.last_error = 0.0
         self.last_time = None
-
     def update(self, deviation):
         now = rospy.get_time()
         dt = 0.05 if self.last_time is None else max(now - self.last_time, 0.001)
@@ -297,7 +258,6 @@ class PIDController:
 
 class LineVision:
     """黑线提取、车道中心计算、停车线检测和调试信息生成。"""
-
     def __init__(self):
         self.lower_black = BLACK_HSV_LOWER
         self.upper_black = BLACK_HSV_UPPER
@@ -321,9 +281,7 @@ class LineVision:
         self.single_center_factor = SINGLE_CENTER_FACTOR
         self.single_width_floor_ratio = SINGLE_WIDTH_FLOOR_RATIO
         self.stop_confidence_min = STOP_CONFIDENCE_MIN
-        self.stop_trigger_y_ratio = STOP_TRIGGER_Y_RATIO
         self.stop_front_center_margin_ratio = STOP_FRONT_CENTER_MARGIN_RATIO
-
     def mask_black(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         color_mask = cv2.inRange(hsv, self.lower_black, self.upper_black)
@@ -342,7 +300,6 @@ class LineVision:
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         return binary
-
     def expected_width(self, width, lane_width_estimate, lane_width_pixels):
         if lane_width_pixels > 0:
             value = lane_width_pixels
@@ -351,7 +308,6 @@ class LineVision:
         else:
             value = width * self.default_width_ratio
         return clamp(float(value), width * self.width_min_ratio, width * self.width_max_ratio)
-
     def row_groups(self, row_pixels, width):
         if len(row_pixels) == 0:
             return []
@@ -367,19 +323,16 @@ class LineVision:
             start = last = pixel
         self._append_group(groups, start, last, width)
         return groups
-
     def _append_group(self, groups, left, right, width):
         group_width = right - left + 1
         if self.min_group_width <= group_width <= width * self.max_group_width_ratio:
             groups.append((left, right, (left + right) * 0.5, group_width))
-
     def best_pair(self, groups, width, expected_width, prior_center):
         if len(groups) < 2:
             return None
         min_gap = max(width * 0.18, expected_width * (1.0 - self.pair_width_tolerance))
         max_gap = min(width * self.pair_max_gap_ratio, expected_width * (1.0 + self.pair_width_tolerance))
         prior = width * 0.5 if prior_center is None else float(prior_center)
-
         best = None
         ordered = sorted(groups, key=lambda item: item[2])
         for i in range(len(ordered) - 1):
@@ -402,7 +355,6 @@ class LineVision:
         if best is None:
             return None
         return best[1], best[2]
-
     def filter_outside(self, groups, pair, width, expected_width):
         if pair is None:
             return groups, []
@@ -413,7 +365,6 @@ class LineVision:
         kept = [group for group in groups if min_x <= group[2] <= max_x]
         ignored = [group for group in groups if group not in kept]
         return kept, ignored
-
     def single_reference(self, groups, width, side_hint, prior_center, expected_width):
         if not groups:
             return None
@@ -427,7 +378,6 @@ class LineVision:
             candidates = [g for g in groups if g[2] < width * 0.90] or groups
             return min(candidates, key=lambda g: abs(g[2] - target) + g[2] * 0.02 / width)
         return min(groups, key=lambda g: abs(g[2] - prior))
-
     def single_side(self, ref, width, side_hint):
         """判断单条线是左边界还是右边界；明显偏左/偏右时画面位置优先。"""
         center = ref[2]
@@ -438,11 +388,9 @@ class LineVision:
         if side_hint in ("left", "right"):
             return side_hint
         return "left" if center < width * 0.5 else "right"
-
     def row_center(self, groups, width, expected_width, prior_center, follow_mode, side_hint):
         pair = self.best_pair(groups, width, expected_width, prior_center)
         valid, ignored = self.filter_outside(groups, pair, width, expected_width)
-
         if pair is not None:
             left, right = pair
             lane_width = right[0] - left[1]
@@ -453,7 +401,6 @@ class LineVision:
                 center = right[0] - expected_width * self.single_center_factor
                 return center, valid, ignored, "right_ref_pair", lane_width, left, right, right[0]
             return (left[1] + right[0]) * 0.5, valid, ignored, "dual", lane_width, left, right, None
-
         if follow_mode in ("left", "right"):
             ref = self.single_reference(valid, width, follow_mode, prior_center, expected_width)
             ignored.extend([g for g in valid if g != ref])
@@ -462,34 +409,29 @@ class LineVision:
             if follow_mode == "left":
                 return ref[1] + expected_width * self.single_center_factor, [ref], ignored, "left_ref_single", None, None, None, ref[1]
             return ref[0] - expected_width * self.single_center_factor, [ref], ignored, "right_ref_single", None, None, None, ref[0]
-
         if len(valid) > 1:
             ref = self.single_reference(valid, width, side_hint, prior_center, expected_width)
             ignored.extend([g for g in valid if g != ref])
             valid = [ref] if ref is not None else []
         if not valid:
             return None, valid, ignored, "missing", None, None, None, None
-
         ref = valid[0]
         single_width = max(expected_width, width * self.single_width_floor_ratio)
         side = self.single_side(ref, width, side_hint)
         if side == "left":
             return ref[1] + single_width * self.single_center_factor, valid, ignored, "left_single", None, None, None, ref[1]
         return ref[0] - single_width * self.single_center_factor, valid, ignored, "right_single", None, None, None, ref[0]
-
     def scan(self, binary, kalman, last_mid, failed_count, lane_width, follow_mode, side_hint):
         height, width = binary.shape[:2]
         search_top = int(height * self.roi_top_ratio)
         search_bot = int(height * self.roi_bottom_ratio)
         scan_rows = np.linspace(search_bot, search_top, self.scan_rows).astype(int)
-
         candidates = []
         lane_rows = []
         debug_groups = []
         ignored_groups = []
         lane_widths = []
         dual_rows = left_single_rows = right_single_rows = 0
-
         for index, y in enumerate(scan_rows):
             pixels = np.where(binary[y, :] == 255)[0]
             groups = self.row_groups(pixels, width)
@@ -518,7 +460,6 @@ class LineVision:
         predicted = kalman.predict()
         if raw_mid is not None:
             raw_mid = int(clamp(raw_mid, 0, width - 1))
-
         max_jump = width * (0.65 if follow_mode != "normal" else 0.45)
         if raw_mid is not None and abs(raw_mid - last_mid) < max_jump:
             measurement = np.array([[np.float32(raw_mid)]])
@@ -531,7 +472,6 @@ class LineVision:
                 kalman.statePost = np.array([[width // 2], [0]], np.float32)
                 mid = width // 2
                 failed_count = 0
-
         mid = int(clamp(mid, 0, width - 1))
         debug = {
             "raw_mid": raw_mid,
@@ -549,7 +489,6 @@ class LineVision:
             "side_hint": side_hint,
         }
         return mid - width * 0.5, [(mid, search_bot)], failed_count, debug
-
     def _row_debug(self, width, y, center, kind, left, right, ref_edge, lane_width):
         info = {"y": int(y), "center_x": int(clamp(center, 0, width - 1)), "left_x": None, "right_x": None, "virtual_x": None}
         if left is not None:
@@ -566,7 +505,6 @@ class LineVision:
                 info["virtual_x"] = int(clamp(ref_edge - lane_width, 0, width - 1))
                 info["left_x"] = info["virtual_x"]
         return info
-
     def fuse_candidates(self, candidates, dual_rows, left_single_rows, right_single_rows, follow_mode):
         if not candidates:
             return None, None
@@ -585,7 +523,6 @@ class LineVision:
         values = np.array([c[0] for c in fused], dtype=np.float32)
         weights = np.array([c[2] for c in fused], dtype=np.float32)
         return int(np.average(values, weights=weights)), dominant
-
     def detect_stopline_before_crosswalk(self, binary):
         height, width = binary.shape[:2]
         roi = binary.copy()
@@ -613,6 +550,10 @@ class LineVision:
                 "polygon": polygon.tolist(),
                 "angle_deg": long_edge_angle_deg(polygon),
                 "bottom_y": int(np.max(polygon[:, 1])),
+                "center": (float(cx), float(cy)),
+                "long_side": float(long_side),
+                "short_side": float(short_side),
+                "ratio": float(ratio),
             }
 
             fill = area / float(w * h + 1)
@@ -623,16 +564,14 @@ class LineVision:
             if (axis_stop or rotated_stop) and cy > height * 0.22:
                 stops.append(candidate)
 
-            axis_stripe = width * 0.012 <= w <= width * 0.18 and height * 0.035 <= h <= height * 0.36 and fill > 0.22
-            rotated_stripe = (
-                width * 0.012 <= short_side <= width * 0.10
-                and height * 0.045 <= long_side <= height * 0.38
-                and ratio > 1.8
+            stripe_shape = (
+                1.6 <= ratio <= 5.5
+                and width * 0.025 <= short_side <= width * 0.12
+                and height * 0.06 <= long_side <= height * 0.36
                 and rect_fill > 0.22
             )
-            if axis_stripe or rotated_stripe:
+            if stripe_shape:
                 stripes.append(candidate)
-
         best = None
         for stop in stops:
             scored = self._score_stop_group(stop, stripes, binary.shape)
@@ -641,61 +580,70 @@ class LineVision:
         if best is None:
             # 没有完整停止线时，只返回“成组”的斑马线条纹，避免边线被误框后也被屏蔽。
             selected = self._select_crosswalk_stripes(stripes, binary.shape)
-            stripe_boxes = [item["box"] for item in selected]
             confidence = min(0.6, len(selected) / 5.0 * 0.45)
             return {
                 "candidate": False,
-                "detected": False,
                 "confidence": confidence,
                 "stop_box": None,
                 "stop_polygon": None,
                 "stop_angle_deg": None,
                 "stop_bottom_y": 0,
-                "stripe_boxes": stripe_boxes,
                 "stripe_polygons": [item["polygon"] for item in selected],
             }
-        stopline_y = best.get("stopline_y", 0)
         best["in_front"] = self._stop_is_in_front(best["stop_box"], binary.shape)
-        best["close_enough"] = stopline_y >= height * self.stop_trigger_y_ratio
         best["candidate"] = (
             best["order_ok"]
             and best["in_front"]
             and best["confidence"] >= self.stop_confidence_min
         )
-        best["detected"] = best["candidate"] and best["close_enough"]
         return best
-
     def _select_crosswalk_stripes(self, stripes, shape):
         """只保留横向成组分布的斑马线条纹，单根边线/区域线不算斑马线。"""
         height, width = shape[:2]
         if len(stripes) < 3:
             return []
-
         best_group = []
-        ordered = sorted(stripes, key=lambda item: item["box"][0] + item["box"][2] * 0.5)
+        ordered = sorted(stripes, key=lambda item: item["center"][0])
         for base in ordered:
-            bx, by, bw, bh = base["box"]
-            base_cy = by + bh * 0.5
+            base_cy = base["center"][1]
             group = []
             for item in ordered:
-                x, y, w, h = item["box"]
-                cx = x + w * 0.5
-                cy = y + h * 0.5
+                cx, cy = item["center"]
                 same_band = abs(cy - base_cy) <= height * 0.18
                 not_side_edge = width * 0.08 <= cx <= width * 0.92
                 if same_band and not_side_edge:
                     group.append(item)
+            group = self._consistent_stripe_group(group, width, height)
             if len(group) > len(best_group):
                 best_group = group
-
         if len(best_group) < 3:
             return []
-        centers_x = [item["box"][0] + item["box"][2] * 0.5 for item in best_group]
+        centers_x = [item["center"][0] for item in best_group]
         spread = max(centers_x) - min(centers_x)
         if spread < width * 0.16:
             return []
         return best_group
-
+    def _consistent_stripe_group(self, group, width, height):
+        if len(group) < 3:
+            return []
+        long_median = float(np.median([item["long_side"] for item in group]))
+        short_median = float(np.median([item["short_side"] for item in group]))
+        angle_median = float(np.median([item["angle_deg"] for item in group]))
+        consistent = []
+        for item in group:
+            long_ok = long_median * 0.55 <= item["long_side"] <= long_median * 1.80
+            short_ok = short_median * 0.55 <= item["short_side"] <= short_median * 1.80
+            angle_ok = undirected_angle_delta_deg(item["angle_deg"], angle_median) <= 20.0
+            if long_ok and short_ok and angle_ok:
+                consistent.append(item)
+        if len(consistent) < 3:
+            return []
+        consistent = sorted(consistent, key=lambda item: item["center"][0])
+        centers_x = [item["center"][0] for item in consistent]
+        gaps = [centers_x[i + 1] - centers_x[i] for i in range(len(centers_x) - 1)]
+        if min(gaps) < max(3.0, short_median * 0.50):
+            return []
+        return consistent
     def _stop_is_in_front(self, stop_box, shape):
         """停车线必须接近车头正前方；侧边远处露出的横条不能触发路口。"""
         height, width = shape[:2]
@@ -707,38 +655,44 @@ class LineVision:
         center_in_band = abs(stop_center_x - center_x) <= margin
         wide_enough = w >= width * 0.18
         return crosses_center or (center_in_band and wide_enough)
-
     def _score_stop_group(self, stop, stripes, shape):
         height, width = shape[:2]
         sx, sy, sw, sh = stop["box"]
-        stop_y = sy + sh * 0.5
-        selected = []
-        for stripe in stripes:
-            x, y, w, h = stripe["box"]
-            cx = x + w * 0.5
-            if y + h > stop_y + height * 0.035:
-                continue
-            if sx - width * 0.20 <= cx <= sx + sw + width * 0.20:
-                selected.append(stripe)
+        selected = self._select_crosswalk_stripes(stripes, shape)
         if len(selected) < 3:
             return None
-        nearest = max(item["box"][1] + item["box"][3] for item in selected)
-        order_ok = stop_y > nearest - height * 0.005
-        centers = [item["box"][0] + item["box"][2] * 0.5 for item in selected]
+        centers = [item["center"][0] for item in selected]
+        group_x = float(np.mean(centers))
+        if not (sx - width * 0.05 <= group_x <= sx + sw + width * 0.05):
+            return None
+        stop_y = self._line_y_at_x(stop, group_x)
+        if stop_y is None:
+            return None
+        nearest = max(item["bottom_y"] for item in selected)
+        order_ok = nearest - height * 0.01 <= stop_y <= nearest + height * 0.35
         spread = (max(centers) - min(centers)) / float(width * 0.35)
-        confidence = min(1.0, len(selected) / 5.0) * 0.45 + min(1.0, spread) * 0.25 + (0.30 if order_ok else 0.0)
+        angle_penalty = min(0.15, abs(stop["angle_deg"]) / 90.0 * 0.15)
+        confidence = (
+            min(1.0, len(selected) / 5.0) * 0.45
+            + min(1.0, spread) * 0.25
+            + (0.30 if order_ok else 0.0)
+            - angle_penalty
+        )
         return {
             "confidence": confidence,
             "order_ok": order_ok,
-            "stopline_y": int(stop_y),
-            "crosswalk_y_range": (int(min(item["box"][1] for item in selected)), int(nearest)),
             "stop_box": stop["box"],
             "stop_polygon": stop["polygon"],
             "stop_angle_deg": stop["angle_deg"],
             "stop_bottom_y": stop["bottom_y"],
-            "stripe_boxes": [item["box"] for item in selected],
             "stripe_polygons": [item["polygon"] for item in selected],
         }
+    def _line_y_at_x(self, item, x):
+        angle = np.radians(item["angle_deg"])
+        if abs(np.cos(angle)) < 0.12:
+            return None
+        cx, cy = item["center"]
+        return float(cy + np.tan(angle) * (float(x) - cx))
 
 
 class LaneFollower:
@@ -747,70 +701,61 @@ class LaneFollower:
         self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self.twist = Twist()
         self.vision = LineVision()
-
-        self.camera_index = int(rospy.get_param("~camera_index", LANE_CAM_INDEX))
-        self.camera_backend = str(rospy.get_param("~camera_backend", CAMERA_BACKEND)).lower().strip()
-        self.camera_startup_wait = float(rospy.get_param("~camera_startup_wait", CAMERA_STARTUP_WAIT))
-        self.process_width = int(rospy.get_param("~process_width", PROCESS_WIDTH))
-        self.dry_run = bool(rospy.get_param("~dry_run", DRY_RUN))
-        self.detect_only = bool(rospy.get_param("~detect_only", DETECT_ONLY))
-        self.debug_view = bool(rospy.get_param("~debug_view", DEBUG_VIEW))
-        self.raw_view = bool(rospy.get_param("~raw_view", RAW_VIEW))
-        self.debug_max_width = int(rospy.get_param("~debug_max_width", DEBUG_MAX_WIDTH))
-        self.destroy_windows_on_exit = bool(rospy.get_param("~destroy_windows_on_exit", DESTROY_WINDOWS_ON_EXIT))
-
-        self.line_speed = float(rospy.get_param("~line_speed", LINEAR_SPEED))
-        self.single_line_speed = float(rospy.get_param("~single_line_speed", SINGLE_LINE_SPEED))
-        self.search_speed = float(rospy.get_param("~search_speed", SEARCH_SPEED))
-        self.max_angular = float(rospy.get_param("~max_angular", MAX_ANGULAR))
-        self.single_line_min_angular = float(rospy.get_param("~single_line_min_angular", SINGLE_LINE_MIN_ANGULAR))
-        self.angular_smooth_keep = float(rospy.get_param("~angular_smooth_keep", ANGULAR_SMOOTH_KEEP))
-        self.angular_step_limit = float(rospy.get_param("~angular_step_limit", ANGULAR_STEP_LIMIT))
-        self.search_angular_limit = float(rospy.get_param("~search_angular_limit", SEARCH_ANGULAR_LIMIT))
-        self.normal_turn_hint_from_cmd = bool(rospy.get_param("~normal_turn_hint_from_cmd", NORMAL_TURN_HINT_FROM_CMD))
-        self.single_confirm = int(rospy.get_param("~single_turn_confirm_frames", SINGLE_TURN_CONFIRM_FRAMES))
-        self.single_release = int(rospy.get_param("~single_turn_release_frames", SINGLE_TURN_RELEASE_FRAMES))
-
-        self.stop_stable_frames = int(rospy.get_param("~stop_stable_frames", STOP_STABLE_FRAMES))
-        self.stop_hold_time = float(rospy.get_param("~stop_hold_time", STOP_HOLD_TIME))
-        self.stop_cooldown_time = float(rospy.get_param("~stop_cooldown_time", STOP_COOLDOWN_TIME))
-        self.approach_crosswalk_speed = float(
-            rospy.get_param("~approach_crosswalk_speed", APPROACH_CROSSWALK_SPEED)
+        self.camera_backend = CAMERA_BACKEND
+        self.camera_startup_wait = CAMERA_STARTUP_WAIT
+        self.debug_max_width = DEBUG_MAX_WIDTH
+        self.single_line_min_angular = SINGLE_LINE_MIN_ANGULAR
+        self.angular_smooth_keep = ANGULAR_SMOOTH_KEEP
+        self.angular_step_limit = ANGULAR_STEP_LIMIT
+        self.search_angular_limit = SEARCH_ANGULAR_LIMIT
+        self.single_confirm = SINGLE_TURN_CONFIRM_FRAMES
+        self.single_release = SINGLE_TURN_RELEASE_FRAMES
+        params = (
+            ("camera_index", LANE_CAM_INDEX, int),
+            ("process_width", PROCESS_WIDTH, int),
+            ("dry_run", DRY_RUN, bool),
+            ("detect_only", DETECT_ONLY, bool),
+            ("debug_view", DEBUG_VIEW, bool),
+            ("raw_view", RAW_VIEW, bool),
+            ("line_speed", LINEAR_SPEED, float),
+            ("single_line_speed", SINGLE_LINE_SPEED, float),
+            ("search_speed", SEARCH_SPEED, float),
+            ("max_angular", MAX_ANGULAR, float),
+            ("stop_stable_frames", STOP_STABLE_FRAMES, int),
+            ("stop_hold_time", STOP_HOLD_TIME, float),
+            ("stop_cooldown_time", STOP_COOLDOWN_TIME, float),
+            ("approach_crosswalk_speed", APPROACH_CROSSWALK_SPEED, float),
+            ("align_trigger_y_ratio", ALIGN_TRIGGER_Y_RATIO, float),
+            ("align_kp", ALIGN_KP, float),
+            ("align_max_angular", ALIGN_MAX_ANGULAR, float),
+            ("align_min_angular", ALIGN_MIN_ANGULAR, float),
+            ("align_angle_tolerance_deg", ALIGN_ANGLE_TOLERANCE_DEG, float),
+            ("align_stable_frames", ALIGN_STABLE_FRAMES, int),
+            ("align_timeout", ALIGN_TIMEOUT, float),
+            ("align_angular_sign", ALIGN_ANGULAR_SIGN, float),
+            ("crosswalk_lost_frames", CROSSWALK_LOST_FRAMES, int),
+            ("side_follow_speed", SIDE_FOLLOW_SPEED, float),
+            ("enter_intersection_straight_time", ENTER_INTERSECTION_STRAIGHT_TIME, float),
+            ("intersection_min_time", INTERSECTION_MIN_TIME, float),
+            ("intersection_max_time", INTERSECTION_MAX_TIME, float),
+            ("recover_dual_frames", RECOVER_DUAL_FRAMES, int),
+            ("crosswalk_clear_confidence", CROSSWALK_CLEAR_CONFIDENCE, float),
+            ("crosswalk_clear_frames", CROSSWALK_CLEAR_FRAMES, int),
+            ("left_turn_bias", LEFT_TURN_BIAS, float),
+            ("right_turn_bias", RIGHT_TURN_BIAS, float),
+            ("straight_bias", STRAIGHT_BIAS, float),
+            ("lane_width_pixels", LANE_WIDTH_PIXELS, float),
         )
-        self.align_trigger_y_ratio = float(rospy.get_param("~align_trigger_y_ratio", ALIGN_TRIGGER_Y_RATIO))
-        self.align_kp = float(rospy.get_param("~align_kp", ALIGN_KP))
-        self.align_max_angular = float(rospy.get_param("~align_max_angular", ALIGN_MAX_ANGULAR))
-        self.align_min_angular = float(rospy.get_param("~align_min_angular", ALIGN_MIN_ANGULAR))
-        self.align_angle_tolerance_deg = float(
-            rospy.get_param("~align_angle_tolerance_deg", ALIGN_ANGLE_TOLERANCE_DEG)
-        )
-        self.align_stable_frames = int(rospy.get_param("~align_stable_frames", ALIGN_STABLE_FRAMES))
-        self.align_timeout = float(rospy.get_param("~align_timeout", ALIGN_TIMEOUT))
-        self.align_angular_sign = float(rospy.get_param("~align_angular_sign", ALIGN_ANGULAR_SIGN))
-        self.crosswalk_lost_frames = int(rospy.get_param("~crosswalk_lost_frames", CROSSWALK_LOST_FRAMES))
-        self.side_follow_speed = float(rospy.get_param("~side_follow_speed", SIDE_FOLLOW_SPEED))
-        self.enter_intersection_straight_time = float(
-            rospy.get_param("~enter_intersection_straight_time", ENTER_INTERSECTION_STRAIGHT_TIME)
-        )
-        self.intersection_min_time = float(rospy.get_param("~intersection_min_time", INTERSECTION_MIN_TIME))
-        self.intersection_max_time = float(rospy.get_param("~intersection_max_time", INTERSECTION_MAX_TIME))
-        self.recover_dual_frames = int(rospy.get_param("~recover_dual_frames", RECOVER_DUAL_FRAMES))
-        self.crosswalk_clear_confidence = float(
-            rospy.get_param("~crosswalk_clear_confidence", CROSSWALK_CLEAR_CONFIDENCE)
-        )
-        self.crosswalk_clear_frames = int(rospy.get_param("~crosswalk_clear_frames", CROSSWALK_CLEAR_FRAMES))
-        self.left_turn_bias = float(rospy.get_param("~left_turn_bias", LEFT_TURN_BIAS))
-        self.right_turn_bias = float(rospy.get_param("~right_turn_bias", RIGHT_TURN_BIAS))
-        self.straight_bias = float(rospy.get_param("~straight_bias", STRAIGHT_BIAS))
+        for name, default, cast in params:
+            setattr(self, name, cast(rospy.get_param("~" + name, default)))
 
-        self.lane_width_pixels = float(rospy.get_param("~lane_width_pixels", LANE_WIDTH_PIXELS))
         self.lane_width_estimate = None
         self.configure_vision_params()
 
         self.pid = PIDController(
-            float(rospy.get_param("~kp", PID_KP_SMALL)),
-            float(rospy.get_param("~ki", PID_KI)),
-            float(rospy.get_param("~kd", PID_KD_SMALL)),
+            PID_KP_SMALL,
+            PID_KI,
+            PID_KD_SMALL,
             (-self.max_angular, self.max_angular),
         )
         self.kalman = self._make_kalman()
@@ -819,7 +764,7 @@ class LaneFollower:
         self.failed_count = 0
         self.last_angular = 0.0
         self.last_debug = {}
-        self.last_stop = {"detected": False, "confidence": 0.0}
+        self.last_stop = {"candidate": False, "confidence": 0.0, "stripe_polygons": []}
         self.state = "FOLLOW_LINE"
         self.stop_hits = 0
         self.stop_cooldown_until = 0.0
@@ -842,14 +787,12 @@ class LaneFollower:
             "line_cy 启动: camera_index=%d, process_width=%d, turn_cmd=%s, dry_run=%s, detect_only=%s, raw_view=%s",
             self.camera_index, self.process_width, self.get_turn_cmd(), self.dry_run, self.detect_only, self.raw_view,
         )
-
     def configure_vision_params(self):
         """常用视觉参数接 ROS；黑线提取参数优先直接改文件顶部宏定义。"""
         black_v_max = int(clamp(BLACK_V_MAX, 0, 255))
         blur_kernel_size = int(BLUR_KERNEL_SIZE)
         adaptive_block_size = int(ADAPTIVE_BLOCK_SIZE)
         morph_kernel_size = int(MORPH_KERNEL_SIZE)
-
         if blur_kernel_size < 1:
             blur_kernel_size = 1
         if blur_kernel_size % 2 == 0:
@@ -870,20 +813,10 @@ class LaneFollower:
         self.vision.roi_top_ratio = float(rospy.get_param("~roi_top_ratio", ROI_TOP_RATIO))
         self.vision.roi_bottom_ratio = float(rospy.get_param("~roi_bottom_ratio", ROI_BOTTOM_RATIO))
         self.vision.default_width_ratio = float(rospy.get_param("~default_lane_width_ratio", DEFAULT_LANE_WIDTH_RATIO))
-        self.vision.width_min_ratio = float(rospy.get_param("~lane_width_min_ratio", LANE_WIDTH_MIN_RATIO))
-        self.vision.width_max_ratio = float(rospy.get_param("~lane_width_max_ratio", LANE_WIDTH_MAX_RATIO))
-        self.vision.pair_width_tolerance = float(rospy.get_param("~lane_pair_width_tolerance", PAIR_WIDTH_TOLERANCE))
-        self.vision.pair_max_gap_ratio = float(rospy.get_param("~lane_pair_max_gap_ratio", PAIR_MAX_GAP_RATIO))
-        self.vision.pair_center_jump_ratio = float(rospy.get_param("~lane_pair_max_center_jump_ratio", PAIR_CENTER_JUMP_RATIO))
-        self.vision.outside_margin_ratio = float(rospy.get_param("~outside_filter_margin_ratio", OUTSIDE_MARGIN_RATIO))
-        self.vision.single_center_factor = float(rospy.get_param("~single_line_center_factor", SINGLE_CENTER_FACTOR))
-        self.vision.single_width_floor_ratio = float(rospy.get_param("~single_line_width_floor_ratio", SINGLE_WIDTH_FLOOR_RATIO))
         self.vision.stop_confidence_min = float(rospy.get_param("~stop_confidence_min", STOP_CONFIDENCE_MIN))
-        self.vision.stop_trigger_y_ratio = float(rospy.get_param("~stop_trigger_y_ratio", STOP_TRIGGER_Y_RATIO))
         self.vision.stop_front_center_margin_ratio = float(
             rospy.get_param("~stop_front_center_margin_ratio", STOP_FRONT_CENTER_MARGIN_RATIO)
         )
-
     def _make_kalman(self):
         kalman = cv2.KalmanFilter(2, 1)
         kalman.transitionMatrix = np.array([[1, 1], [0, 1]], np.float32)
@@ -891,7 +824,6 @@ class LaneFollower:
         kalman.processNoiseCov = np.eye(2, dtype=np.float32) * 1e-4
         kalman.measurementNoiseCov = np.array([[1]], np.float32) * 1e-1
         return kalman
-
     def resize_frame(self, frame):
         if self.process_width <= 0:
             return frame
@@ -900,14 +832,11 @@ class LaneFollower:
             return frame
         scale = float(self.process_width) / float(width)
         return cv2.resize(frame, (self.process_width, int(height * scale)), interpolation=cv2.INTER_AREA)
-
     def get_turn_cmd(self):
         cmd = str(rospy.get_param("~turn_cmd", "straight")).lower().strip()
         return cmd if cmd in ("left", "straight", "right") else "straight"
-
     def lane_width(self, frame_width):
         return self.vision.expected_width(frame_width, self.lane_width_estimate, self.lane_width_pixels)
-
     def update_lane_width(self, debug, frame_width):
         widths = debug.get("lane_widths", [])
         if not widths:
@@ -916,7 +845,6 @@ class LaneFollower:
         if measured < frame_width * LANE_WIDTH_MIN_RATIO or measured > frame_width * LANE_WIDTH_MAX_RATIO:
             return
         self.lane_width_estimate = measured if self.lane_width_estimate is None else 0.85 * self.lane_width_estimate + 0.15 * measured
-
     def publish_cmd(self, linear, angular):
         self.twist.linear.x = float(linear)
         self.twist.linear.y = self.twist.linear.z = 0.0
@@ -924,13 +852,11 @@ class LaneFollower:
         self.twist.angular.z = float(clamp(angular, -self.max_angular, self.max_angular))
         if motion_commands_enabled(self.dry_run, self.detect_only):
             self.pub.publish(self.twist)
-
     def stop_robot(self, duration=0.0):
         self.publish_cmd(0.0, 0.0)
         if duration > 0:
             rospy.sleep(duration)
             self.publish_cmd(0.0, 0.0)
-
     def update_pid_gain(self, deviation):
         if abs(deviation) < DEV_THRESHOLD:
             self.pid.kp = float(rospy.get_param("~kp_small", PID_KP_SMALL))
@@ -938,18 +864,6 @@ class LaneFollower:
         else:
             self.pid.kp = float(rospy.get_param("~kp_big", PID_KP_BIG))
             self.pid.kd = float(rospy.get_param("~kd_big", PID_KD_BIG))
-
-    def normal_side_hint(self):
-        if self.normal_turn_hint_from_cmd:
-            cmd = self.get_turn_cmd()
-            if cmd == "left":
-                return "right"
-            if cmd == "right":
-                return "left"
-        # 不再根据上一帧角速度猜左右线。上一帧打错方向时，这个猜测会把当前右线误判成左线，
-        # 导致中心点补到右侧并继续猛右拐。无明确指令时交给画面位置判断。
-        return None
-
     def raw_single_turn(self, debug):
         dual = debug.get("dual_rows", 0)
         left = debug.get("left_single_rows", 0)
@@ -961,7 +875,6 @@ class LaneFollower:
         if left >= 2 and left > right:
             return "right"
         return None
-
     def stable_single_turn(self, raw_turn):
         if raw_turn is None:
             self.single_candidate = None
@@ -983,7 +896,6 @@ class LaneFollower:
         else:
             self.single_candidate = raw_turn
             self.single_candidate_frames = 1
-
         need = max(1, self.single_confirm) if self.single_latched is None else max(1, self.single_confirm) + 1
         if self.single_candidate_frames >= need:
             if self.single_latched != raw_turn:
@@ -992,21 +904,18 @@ class LaneFollower:
             self.single_candidate = None
             self.single_candidate_frames = 0
         return self.single_latched
-
     def limit_angular_step(self, angular):
         step = max(0.0, self.angular_step_limit)
         if step <= 0:
             return angular
         return self.last_angular + clamp(angular - self.last_angular, -step, step)
-
     def line_control(self, frame, binary, follow_mode="normal", speed=None, bias=0.0):
         width = frame.shape[1]
         if not self.initialized:
             self.last_mid = width // 2
             self.kalman.statePost = np.array([[self.last_mid], [0]], np.float32)
             self.initialized = True
-
-        side_hint = self.normal_side_hint() if follow_mode == "normal" else None
+        side_hint = None
         deviation, centers, self.failed_count, debug = self.vision.scan(
             binary, self.kalman, self.last_mid, self.failed_count, self.lane_width(width), follow_mode, side_hint
         )
@@ -1014,7 +923,6 @@ class LaneFollower:
         self.last_debug = debug
         self.update_lane_width(debug, width)
         self.update_pid_gain(deviation)
-
         if self.failed_count > 3:
             angular = clamp(self.last_angular * 0.5, -self.search_angular_limit, self.search_angular_limit)
             if follow_mode == "left":
@@ -1038,12 +946,10 @@ class LaneFollower:
                 elif stable == "right":
                     angular = min(angular, -self.single_line_min_angular)
                     linear = min(linear, self.single_line_speed)
-
         angular = self.limit_angular_step(clamp(angular, -self.max_angular, self.max_angular))
         self.last_angular = angular
         self.publish_cmd(linear, angular)
         return centers, angular
-
     def suppress_crosswalk_regions(self, binary, stop_result):
         """路口补线时抹掉斑马线/停止线候选框，避免条纹被当成左右车道线。"""
         if not stop_result:
@@ -1052,7 +958,6 @@ class LaneFollower:
         height, width = cleaned.shape[:2]
         pad = max(4, int(width * 0.018))
         mask = np.zeros_like(cleaned)
-
         polygons = []
         if stop_result.get("stop_polygon"):
             polygons.append(stop_result["stop_polygon"])
@@ -1060,27 +965,17 @@ class LaneFollower:
         for polygon in polygons:
             points = np.asarray(polygon, dtype=np.int32).reshape(-1, 2)
             cv2.fillConvexPoly(mask, points, 255)
-
-        if not stop_result.get("stop_polygon") and stop_result.get("stop_box"):
-            x, y, w, h = stop_result["stop_box"]
-            cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
-        if not stop_result.get("stripe_polygons"):
-            for x, y, w, h in stop_result.get("stripe_boxes", []):
-                cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
-
         if np.any(mask):
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1))
             mask = cv2.dilate(mask, kernel)
             cleaned[mask > 0] = 0
         return cleaned
-
     def maneuver_mode(self, cmd):
         if cmd == "left":
             return "left", self.left_turn_bias
         if cmd == "right":
             return "right", -self.right_turn_bias
         return "right", self.straight_bias
-
     def run_maneuver(self, cmd):
         mode, bias = self.maneuver_mode(cmd)
         self.state = "MANEUVER"
@@ -1090,7 +985,6 @@ class LaneFollower:
         start = rospy.get_time()
         rate = rospy.Rate(20)
         rospy.loginfo("进入路口补线: cmd=%s mode=%s", cmd, mode)
-
         while not rospy.is_shutdown() and rospy.get_time() - start <= self.intersection_max_time:
             ok, frame = self.cap.read()
             if not ok:
@@ -1110,8 +1004,8 @@ class LaneFollower:
 
             crosswalk_visible = (
                 self.last_stop.get("confidence", 0.0) >= self.crosswalk_clear_confidence
-                or len(self.last_stop.get("stripe_boxes", [])) >= 3
-                or self.last_stop.get("detected", False)
+                or len(self.last_stop.get("stripe_polygons", [])) >= 3
+                or self.last_stop.get("candidate", False)
             )
             if crosswalk_visible:
                 crosswalk_clear = 0
@@ -1129,14 +1023,10 @@ class LaneFollower:
                 dual_stable += 1
             else:
                 dual_stable = max(0, dual_stable - 1)
-            if self.raw_view:
-                self.show_raw_frame(raw_frame)
-            if self.debug_view:
-                self.draw_debug(lane_binary, centers, self.last_stop)
+            self.show_views(raw_frame, lane_binary, centers)
             if dual_stable >= self.recover_dual_frames:
                 break
             rate.sleep()
-
         elapsed = rospy.get_time() - start
         if elapsed >= self.intersection_max_time:
             rospy.logwarn("路口补线达到 %.1f 秒上限，按保护逻辑恢复巡线", self.intersection_max_time)
@@ -1149,14 +1039,12 @@ class LaneFollower:
         self.last_reliable_stop = None
         self.stop_cooldown_until = rospy.get_time() + self.stop_cooldown_time
         rospy.loginfo("路口动作完成，恢复巡线")
-
     def process_frame(self, frame):
         raw_frame = frame.copy()
         frame = self.resize_frame(frame)
         binary = self.vision.mask_black(frame)
         self.last_stop = self.vision.detect_stopline_before_crosswalk(binary)
         lane_binary = self.suppress_crosswalk_regions(binary, self.last_stop)
-
         now = rospy.get_time()
         candidate = bool(self.last_stop.get("candidate", False))
         cooldown_ready = now >= self.stop_cooldown_until
@@ -1165,7 +1053,6 @@ class LaneFollower:
             self.crosswalk_lost_count = 0
         elif self.state in ("APPROACH_CROSSWALK", "ALIGN_STOPLINE"):
             self.crosswalk_lost_count += 1
-
         entry_ready = False
         if self.state == "FOLLOW_LINE":
             if candidate and cooldown_ready:
@@ -1173,12 +1060,10 @@ class LaneFollower:
             else:
                 self.stop_hits = max(0, self.stop_hits - 1)
             entry_ready = self.stop_hits >= self.stop_stable_frames and not self.detect_only
-
         effective_stop = self.last_stop if candidate else self.last_reliable_stop
         bottom_ratio = 0.0
         if effective_stop is not None and frame.shape[0] > 0:
             bottom_ratio = effective_stop.get("stop_bottom_y", 0) / float(frame.shape[0])
-
         align_timed_out = (
             self.state == "ALIGN_STOPLINE"
             and self.align_started_at > 0.0
@@ -1219,19 +1104,14 @@ class LaneFollower:
                 else:
                     rospy.logerr("%s 持续丢失停车横条，保持停车等待人工检查", previous_state)
             rospy.loginfo("循迹状态切换: %s -> %s", previous_state, self.state)
-
         if self.state == "APPROACH_CROSSWALK":
             if effective_stop is not None and not candidate:
                 lane_binary = self.suppress_crosswalk_regions(lane_binary, effective_stop)
             centers, _ = self.line_control(
                 frame, lane_binary, "normal", speed=min(self.line_speed, self.approach_crosswalk_speed)
             )
-            if self.raw_view:
-                self.show_raw_frame(raw_frame)
-            if self.debug_view:
-                self.draw_debug(lane_binary, centers, self.last_stop)
+            self.show_views(raw_frame, lane_binary, centers)
             return
-
         if self.state == "ALIGN_STOPLINE":
             angle = self.last_stop.get("stop_angle_deg") if candidate else None
             if angle is None:
@@ -1258,26 +1138,20 @@ class LaneFollower:
                 self.run_maneuver(self.get_turn_cmd())
                 return
 
-            if self.raw_view:
-                self.show_raw_frame(raw_frame)
-            if self.debug_view:
-                self.draw_debug(lane_binary, [], self.last_stop)
+            self.show_views(raw_frame, lane_binary, [])
             return
-
         if self.state == "CROSSWALK_WAIT":
             self.stop_robot(0.0)
-            if self.raw_view:
-                self.show_raw_frame(raw_frame)
-            if self.debug_view:
-                self.draw_debug(lane_binary, [], self.last_stop)
+            self.show_views(raw_frame, lane_binary, [])
             return
 
         centers, _ = self.line_control(frame, lane_binary, "normal")
+        self.show_views(raw_frame, lane_binary, centers)
+    def show_views(self, raw_frame, binary, centers):
         if self.raw_view:
             self.show_raw_frame(raw_frame)
         if self.debug_view:
-            self.draw_debug(lane_binary, centers, self.last_stop)
-
+            self.draw_debug(binary, centers, self.last_stop)
     def show_raw_frame(self, frame):
         display = frame
         height, width = frame.shape[:2]
@@ -1290,7 +1164,6 @@ class LaneFollower:
         except cv2.error as exc:
             rospy.logwarn("原图窗口打开失败，关闭 raw_view: %s", exc)
             self.raw_view = False
-
     def draw_debug(self, binary, centers, stop_result):
         display = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         height, width = binary.shape[:2]
@@ -1298,7 +1171,6 @@ class LaneFollower:
         bot = self.last_debug.get("search_bot", int(height * ROI_BOTTOM_RATIO))
         cv2.rectangle(display, (0, top), (width - 1, bot), (0, 180, 0), 2)
         cv2.line(display, (width // 2, 0), (width // 2, height - 1), (90, 90, 90), 1)
-
         for x, y, left, right in self.last_debug.get("groups", []):
             cv2.circle(display, (x, y), 3, (255, 80, 0), -1)
             cv2.line(display, (left, y), (right, y), (255, 80, 0), 1)
@@ -1315,26 +1187,15 @@ class LaneFollower:
             cv2.circle(display, (row["center_x"], y), 5, (0, 255, 0), -1)
         for x, y in centers:
             cv2.circle(display, (int(x), int(y)), 8, (0, 255, 0), 2)
-
         if stop_result:
             if stop_result.get("stop_polygon"):
                 polygon = np.asarray(stop_result["stop_polygon"], dtype=np.int32).reshape(-1, 1, 2)
                 cv2.polylines(display, [polygon], True, (0, 0, 255), 3)
-            elif stop_result.get("stop_box"):
-                x, y, w, h = stop_result["stop_box"]
-                cv2.rectangle(display, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            stripe_polygons = stop_result.get("stripe_polygons", [])
-            if stripe_polygons:
-                for points in stripe_polygons:
-                    polygon = np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(display, [polygon], True, (0, 255, 255), 2)
-            else:
-                for x, y, w, h in stop_result.get("stripe_boxes", []):
-                    cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 255), 2)
-
+            for points in stop_result.get("stripe_polygons", []):
+                polygon = np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(display, [polygon], True, (0, 255, 255), 2)
         align_y = int(height * self.align_trigger_y_ratio)
         cv2.line(display, (0, align_y), (width - 1, align_y), (0, 128, 255), 1)
-
         status = "state={} hint={} raw={} single={} conf={:.2f} width={:.0f} fail={}".format(
             self.state,
             self.last_debug.get("side_hint"),
@@ -1358,7 +1219,6 @@ class LaneFollower:
         cv2.putText(display, crosswalk_status, (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 128, 255), 2)
         cv2.putText(display, "ROI green | active cyan/blue | ignored dark-red | virtual magenta | center green",
                     (10, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1)
-
         if self.debug_max_width > 0 and width > self.debug_max_width:
             scale = float(self.debug_max_width) / float(width)
             display = cv2.resize(display, (self.debug_max_width, int(height * scale)))
@@ -1368,7 +1228,6 @@ class LaneFollower:
         except cv2.error as exc:
             rospy.logwarn("处理图窗口打开失败，关闭 debug_view: %s", exc)
             self.debug_view = False
-
     def run(self):
         rate = rospy.Rate(20)
         no_frame_count = 0
@@ -1391,7 +1250,6 @@ class LaneFollower:
                 rate.sleep()
         finally:
             self.cleanup()
-
     def cleanup(self):
         if self.cleaned:
             return
@@ -1405,7 +1263,7 @@ class LaneFollower:
                 self.cap.release()
         except Exception:
             pass
-        if self.destroy_windows_on_exit:
+        if DESTROY_WINDOWS_ON_EXIT:
             try:
                 cv2.destroyAllWindows()
             except Exception:
