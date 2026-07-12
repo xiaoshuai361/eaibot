@@ -105,6 +105,7 @@ PAIR_CENTER_JUMP_RATIO = 0.30
 OUTSIDE_MARGIN_RATIO = 0.10
 SINGLE_WIDTH_FLOOR_RATIO = 0.52
 LANE_CONTINUITY_JUMP_RATIO = 0.12
+SINGLE_SIDE_HINT_FRAMES = 12
 SINGLE_TURN_CONFIRM_FRAMES = 4
 SINGLE_TURN_RELEASE_FRAMES = 6
 KALMAN_FAIL_MAX = 8
@@ -381,14 +382,18 @@ class LineVision:
             return min(candidates, key=lambda g: abs(g[2] - target) + g[2] * 0.02 / width)
         return min(groups, key=lambda g: abs(g[2] - prior))
     def single_side(self, ref, width, side_hint):
-        """判断单条线是左边界还是右边界；明显偏左/偏右时画面位置优先。"""
+        """判断单条线是左边界还是右边界；有历史提示时不因过中心线立即翻边。"""
         center = ref[2]
+        if side_hint in ("left", "right"):
+            if side_hint == "left" and center > width * 0.70:
+                return "right"
+            if side_hint == "right" and center < width * 0.30:
+                return "left"
+            return side_hint
         if center > width * 0.55:
             return "right"
         if center < width * 0.45:
             return "left"
-        if side_hint in ("left", "right"):
-            return side_hint
         return "left" if center < width * 0.5 else "right"
     def row_center(self, groups, width, expected_width, prior_center, follow_mode, side_hint):
         pair = self.best_pair(groups, width, expected_width, prior_center)
@@ -463,11 +468,15 @@ class LineVision:
                 "kind": kind,
                 "left_edge": None if left is None else left[1],
                 "right_edge": None if right is None else right[0],
+                "single_left": None if len(valid) != 1 else valid[0][0],
+                "single_right": None if len(valid) != 1 else valid[0][1],
             })
             lane_rows.append(self._row_debug(width, y, center, kind, left, right, ref_edge, lane_width))
 
         if follow_mode == "normal":
+            candidates, row_entries = self._fix_single_line_side(candidates, row_entries, width, lane_width, side_hint)
             candidates, row_entries = self._fix_discontinuous_pairs(candidates, row_entries, width, lane_width)
+            lane_rows = self._lane_rows_from_entries(row_entries, width, lane_width)
             dual_rows = len([item for item in row_entries if item["kind"] == "dual"])
             left_single_rows = len([item for item in row_entries if item["kind"] == "left_single"])
             right_single_rows = len([item for item in row_entries if item["kind"] == "right_single"])
@@ -504,6 +513,43 @@ class LineVision:
             "side_hint": side_hint,
         }
         return mid - width * 0.5, [(mid, search_bot)], failed_count, debug
+    def _single_side_from_entries(self, entries, width, side_hint):
+        single_entries = [item for item in entries if item["kind"] in ("left_single", "right_single")]
+        if len(single_entries) < 2:
+            return None
+        lower = max(single_entries, key=lambda item: item["y"])
+        ref_center = (lower["single_left"] + lower["single_right"]) * 0.5
+        if side_hint in ("left", "right"):
+            if side_hint == "left" and ref_center > width * 0.70:
+                return "right"
+            if side_hint == "right" and ref_center < width * 0.30:
+                return "left"
+            return side_hint
+        return "left" if ref_center < width * 0.5 else "right"
+    def _fix_single_line_side(self, candidates, entries, width, lane_width, side_hint):
+        if any(item["kind"] == "dual" for item in entries):
+            return candidates, entries
+        side = self._single_side_from_entries(entries, width, side_hint)
+        if side is None:
+            return candidates, entries
+        fixed_entries = []
+        fixed_candidates = []
+        for item in entries:
+            item = item.copy()
+            if item["kind"] in ("left_single", "right_single"):
+                if side == "left":
+                    item["kind"] = "left_single"
+                    item["left_edge"] = item["single_right"]
+                    item["right_edge"] = None
+                    item["center"] = item["single_right"] + lane_width * self.single_center_factor
+                else:
+                    item["kind"] = "right_single"
+                    item["left_edge"] = None
+                    item["right_edge"] = item["single_left"]
+                    item["center"] = item["single_left"] - lane_width * self.single_center_factor
+            fixed_entries.append(item)
+            fixed_candidates.append((item["center"], item["y"], item["weight"], item["kind"]))
+        return fixed_candidates, fixed_entries
     def _continuous_side(self, entries, key, width):
         values = [float(item[key]) for item in entries if item.get(key) is not None]
         if len(values) < 3:
@@ -534,6 +580,28 @@ class LineVision:
             fixed_entries.append(item)
             fixed_candidates.append((item["center"], item["y"], item["weight"], item["kind"]))
         return fixed_candidates, fixed_entries
+    def _lane_rows_from_entries(self, entries, width, lane_width):
+        rows = []
+        for item in entries:
+            center = item["center"]
+            kind = item["kind"]
+            info = {"y": int(item["y"]), "center_x": int(clamp(center, 0, width - 1)),
+                    "left_x": None, "right_x": None, "virtual_x": None}
+            if kind == "dual":
+                info["left_x"] = int(clamp(item["left_edge"], 0, width - 1))
+                info["right_x"] = int(clamp(item["right_edge"], 0, width - 1))
+            elif kind == "left_single":
+                ref = item["single_right"] if item["single_right"] is not None else item["left_edge"]
+                info["left_x"] = int(clamp(ref, 0, width - 1))
+                info["virtual_x"] = int(clamp(ref + lane_width, 0, width - 1))
+                info["right_x"] = info["virtual_x"]
+            elif kind == "right_single":
+                ref = item["single_left"] if item["single_left"] is not None else item["right_edge"]
+                info["right_x"] = int(clamp(ref, 0, width - 1))
+                info["virtual_x"] = int(clamp(ref - lane_width, 0, width - 1))
+                info["left_x"] = info["virtual_x"]
+            rows.append(info)
+        return rows
     def _row_debug(self, width, y, center, kind, left, right, ref_edge, lane_width):
         info = {"y": int(y), "center_x": int(clamp(center, 0, width - 1)), "left_x": None, "right_x": None, "virtual_x": None}
         if left is not None:
@@ -845,6 +913,8 @@ class LaneFollower:
         self.single_candidate = None
         self.single_candidate_frames = 0
         self.single_release_count = 0
+        self.single_side_hint = None
+        self.single_side_hint_frames = 0
         self.cleaned = False
 
         self.cap = CameraReader(self.camera_index, self.camera_backend)
@@ -982,18 +1052,30 @@ class LaneFollower:
         if step <= 0:
             return angular
         return self.last_angular + clamp(angular - self.last_angular, -step, step)
+    def update_single_side_hint(self, debug, follow_mode):
+        if follow_mode != "normal":
+            return
+        dominant = debug.get("dominant")
+        if dominant in ("left_single", "right_single"):
+            self.single_side_hint = "left" if dominant == "left_single" else "right"
+            self.single_side_hint_frames = SINGLE_SIDE_HINT_FRAMES
+        elif self.single_side_hint_frames > 0:
+            self.single_side_hint_frames -= 1
+            if self.single_side_hint_frames <= 0:
+                self.single_side_hint = None
     def line_control(self, frame, binary, follow_mode="normal", speed=None, bias=0.0, allow_single_turn=True):
         width = frame.shape[1]
         if not self.initialized:
             self.last_mid = width // 2
             self.kalman.statePost = np.array([[self.last_mid], [0]], np.float32)
             self.initialized = True
-        side_hint = None
+        side_hint = self.single_side_hint if self.single_side_hint_frames > 0 else None
         deviation, centers, self.failed_count, debug = self.vision.scan(
             binary, self.kalman, self.last_mid, self.failed_count, self.lane_width(width), follow_mode, side_hint
         )
         self.last_mid = centers[-1][0]
         self.last_debug = debug
+        self.update_single_side_hint(debug, follow_mode)
         self.update_lane_width(debug, width)
         self.update_pid_gain(deviation)
         if self.failed_count > 3:

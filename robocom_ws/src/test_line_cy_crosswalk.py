@@ -165,6 +165,47 @@ class CrosswalkMisclassificationTests(unittest.TestCase):
         self.assertEqual(debug["dominant"], "left_single")
         self.assertEqual(failed_count, 0)
 
+    def test_single_left_lane_keeps_side_after_crossing_image_center(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (95, 430), (470, 130), 255, 14)
+
+        vision = line_cy.LineVision()
+        kalman = cv2.KalmanFilter(2, 1)
+        kalman.transitionMatrix = np.array([[1, 1], [0, 1]], np.float32)
+        kalman.measurementMatrix = np.array([[1, 0]], np.float32)
+        kalman.processNoiseCov = np.eye(2, dtype=np.float32) * 1e-4
+        kalman.measurementNoiseCov = np.array([[1]], np.float32) * 1e-1
+        kalman.statePost = np.array([[320], [0]], np.float32)
+
+        deviation, centers, failed_count, debug = vision.scan(
+            binary, kalman, 320, 0, 280.0, "normal", None
+        )
+
+        self.assertEqual(debug["dominant"], "left_single")
+        self.assertEqual(debug["right_single_rows"], 0)
+        self.assertGreater(debug["raw_mid"], 320)
+        self.assertEqual(failed_count, 0)
+
+    def test_single_side_hint_prevents_center_crossing_from_flipping_side(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (360, 430), (500, 130), 255, 14)
+
+        vision = line_cy.LineVision()
+        kalman = cv2.KalmanFilter(2, 1)
+        kalman.transitionMatrix = np.array([[1, 1], [0, 1]], np.float32)
+        kalman.measurementMatrix = np.array([[1, 0]], np.float32)
+        kalman.processNoiseCov = np.eye(2, dtype=np.float32) * 1e-4
+        kalman.measurementNoiseCov = np.array([[1]], np.float32) * 1e-1
+        kalman.statePost = np.array([[320], [0]], np.float32)
+
+        deviation, centers, failed_count, debug = vision.scan(
+            binary, kalman, 320, 0, 260.0, "normal", "left"
+        )
+
+        self.assertEqual(debug["dominant"], "left_single")
+        self.assertEqual(debug["right_single_rows"], 0)
+        self.assertGreater(debug["raw_mid"], 430)
+
     def test_diagonal_lane_with_stripes_is_not_a_stopline(self):
         binary = np.zeros((480, 640), dtype=np.uint8)
         fill_rotated_rect(binary, (250.0, 285.0), (450.0, 16.0), -35.0)
