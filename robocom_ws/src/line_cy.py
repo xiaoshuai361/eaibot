@@ -74,6 +74,7 @@ RECOVER_DUAL_FRAMES = 10
 CROSSWALK_CLEAR_CONFIDENCE = 0.45
 CROSSWALK_TRACK_CONFIDENCE = 0.52
 CROSSWALK_CLEAR_FRAMES = 8
+MANEUVER_CROSSWALK_MEMORY_FRAMES = 16
 LEFT_TURN_BIAS = 0.12
 RIGHT_TURN_BIAS = 0.12
 STRAIGHT_BIAS = 0.0
@@ -400,6 +401,8 @@ class LineVision:
         valid, ignored = self.filter_outside(groups, pair, width, expected_width)
         if pair is not None:
             left, right = pair
+            valid = [left, right]
+            ignored = [group for group in groups if group != left and group != right]
             lane_width = right[0] - left[1]
             if follow_mode == "left":
                 center = left[1] + expected_width * self.single_center_factor
@@ -702,6 +705,7 @@ class LineVision:
                 "stop_angle_deg": None,
                 "stop_bottom_y": 0,
                 "stripe_polygons": [item["polygon"] for item in selected],
+                "loose_stripe_polygons": [item["polygon"] for item in stripes],
             }
         best["in_front"] = self._stop_is_in_front(best["stop_box"], binary.shape)
         best["candidate"] = (
@@ -709,6 +713,7 @@ class LineVision:
             and best["in_front"]
             and best["confidence"] >= self.stop_confidence_min
         )
+        best["loose_stripe_polygons"] = [item["polygon"] for item in stripes]
         return best
     def _select_crosswalk_stripes(self, stripes, shape):
         """只保留横向成组分布的斑马线条纹，单根边线/区域线不算斑马线。"""
@@ -1105,7 +1110,7 @@ class LaneFollower:
         self.last_angular = angular
         self.publish_cmd(linear, angular)
         return centers, angular
-    def suppress_crosswalk_regions(self, binary, stop_result):
+    def suppress_crosswalk_regions(self, binary, stop_result, include_loose=False):
         """路口补线时抹掉斑马线/停止线候选框，避免条纹被当成左右车道线。"""
         if not stop_result:
             return binary
@@ -1117,6 +1122,8 @@ class LaneFollower:
         if stop_result.get("stop_polygon"):
             polygons.append(stop_result["stop_polygon"])
         polygons.extend(stop_result.get("stripe_polygons", []))
+        if include_loose:
+            polygons.extend(stop_result.get("loose_stripe_polygons", []))
         for polygon in polygons:
             points = np.asarray(polygon, dtype=np.int32).reshape(-1, 2)
             cv2.fillConvexPoly(mask, points, 255)
@@ -1135,12 +1142,32 @@ class LaneFollower:
         if cmd == "straight" or elapsed < self.enter_intersection_straight_time:
             return "normal", self.straight_bias, False
         return mode, bias, True
+    def crosswalk_visible_for_maneuver(self, stop_result):
+        return (
+            stop_result.get("confidence", 0.0) >= self.crosswalk_clear_confidence
+            or len(stop_result.get("stripe_polygons", [])) >= 3
+            or stop_result.get("candidate", False)
+        )
+    def crosswalk_mask_result(self, current, remembered=None):
+        if remembered is None:
+            return current
+        merged = {
+            "stop_polygon": current.get("stop_polygon") or remembered.get("stop_polygon"),
+            "stripe_polygons": [],
+            "loose_stripe_polygons": [],
+        }
+        for source in (remembered, current):
+            merged["stripe_polygons"].extend(source.get("stripe_polygons", []))
+            merged["loose_stripe_polygons"].extend(source.get("loose_stripe_polygons", []))
+        return merged
     def run_maneuver(self, cmd):
         mode, bias = self.maneuver_mode(cmd)
         self.state = "MANEUVER"
         self.pid.reset()
         dual_stable = 0
         crosswalk_clear = 0
+        crosswalk_memory = None
+        crosswalk_memory_frames = 0
         start = rospy.get_time()
         rate = rospy.Rate(20)
         rospy.loginfo("进入路口补线: cmd=%s mode=%s", cmd, mode)
@@ -1153,18 +1180,23 @@ class LaneFollower:
             frame = self.resize_frame(frame)
             binary = self.vision.mask_black(frame)
             self.last_stop = self.vision.detect_stopline_before_crosswalk(binary)
-            lane_binary = self.suppress_crosswalk_regions(binary, self.last_stop)
+            crosswalk_visible = self.crosswalk_visible_for_maneuver(self.last_stop)
+            if crosswalk_visible:
+                crosswalk_memory = self.last_stop
+                crosswalk_memory_frames = MANEUVER_CROSSWALK_MEMORY_FRAMES
+            elif crosswalk_memory_frames > 0:
+                crosswalk_memory_frames -= 1
+            remembered = crosswalk_memory if crosswalk_memory_frames > 0 else None
+            mask_result = self.crosswalk_mask_result(self.last_stop, remembered)
+            lane_binary = self.suppress_crosswalk_regions(
+                binary, mask_result, include_loose=remembered is not None
+            )
             elapsed = rospy.get_time() - start
             active_mode, active_bias, allow_single_turn = self.maneuver_follow_choice(cmd, elapsed, mode, bias)
             centers, _ = self.line_control(
                 frame, lane_binary, active_mode, self.side_follow_speed, active_bias, allow_single_turn
             )
 
-            crosswalk_visible = (
-                self.last_stop.get("confidence", 0.0) >= self.crosswalk_clear_confidence
-                or len(self.last_stop.get("stripe_polygons", [])) >= 3
-                or self.last_stop.get("candidate", False)
-            )
             if crosswalk_visible:
                 crosswalk_clear = 0
             else:

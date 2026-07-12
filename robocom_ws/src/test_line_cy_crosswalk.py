@@ -104,6 +104,19 @@ class CrosswalkMaskTests(unittest.TestCase):
             self.assertEqual(int(cleaned[y, x]), 0)
         self.assertEqual(int(cleaned[120, 25]), 255)
 
+    def test_loose_stripes_are_removed_only_in_maneuver_memory_window(self):
+        binary = np.zeros((180, 260), dtype=np.uint8)
+        loose_polygon = cv2.boxPoints(((120.0, 88.0), (28.0, 85.0), 4.0)).astype(np.int32)
+        cv2.fillConvexPoly(binary, loose_polygon, 255)
+
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        result = {"loose_stripe_polygons": [loose_polygon.tolist()], "stripe_polygons": []}
+        normal_cleaned = follower.suppress_crosswalk_regions(binary, result)
+        memory_cleaned = follower.suppress_crosswalk_regions(binary, result, include_loose=True)
+
+        self.assertEqual(int(normal_cleaned[88, 120]), 255)
+        self.assertEqual(int(memory_cleaned[88, 120]), 0)
+
 
 class CrosswalkMisclassificationTests(unittest.TestCase):
     def test_thin_long_lane_fragments_do_not_form_crosswalk_stripes(self):
@@ -217,6 +230,23 @@ class CrosswalkMisclassificationTests(unittest.TestCase):
         self.assertFalse(result["candidate"])
         self.assertIsNone(result["stop_polygon"])
 
+    def test_dual_lane_row_keeps_only_two_active_edges(self):
+        vision = line_cy.LineVision()
+        groups = [
+            (40, 52, 46.0, 13),
+            (205, 217, 211.0, 13),
+            (398, 410, 404.0, 13),
+        ]
+
+        center, valid, ignored, kind, measured_width, left, right, ref_edge = vision.row_center(
+            groups, 640, 360.0, 320.0, "normal", None
+        )
+
+        self.assertEqual(kind, "dual")
+        self.assertEqual(valid, [groups[0], groups[2]])
+        self.assertIn(groups[1], ignored)
+        self.assertAlmostEqual(center, (groups[0][1] + groups[2][0]) * 0.5)
+
 
 class AlignmentControlTests(unittest.TestCase):
     def test_horizontal_stopline_requires_no_rotation(self):
@@ -291,6 +321,16 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(mode, "normal")
         self.assertEqual(bias, 0.0)
         self.assertFalse(allow_single)
+
+    def test_crosswalk_mask_result_combines_memory_and_current_loose_stripes(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        current = {"stripe_polygons": [], "loose_stripe_polygons": [[[1, 1], [2, 1], [2, 2], [1, 2]]]}
+        remembered = {"stripe_polygons": [[[3, 3], [4, 3], [4, 4], [3, 4]]], "loose_stripe_polygons": []}
+
+        merged = follower.crosswalk_mask_result(current, remembered)
+
+        self.assertEqual(len(merged["stripe_polygons"]), 1)
+        self.assertEqual(len(merged["loose_stripe_polygons"]), 1)
 
     def test_detect_only_disables_motion_even_when_dry_run_is_false(self):
         self.assertFalse(line_cy.motion_commands_enabled(False, True))
