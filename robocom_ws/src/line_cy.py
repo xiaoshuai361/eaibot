@@ -40,7 +40,7 @@ PID_KI = 0
 DEV_THRESHOLD = 100
 
 ROI_TOP_RATIO = 0.28
-ROI_BOTTOM_RATIO = 0.62
+ROI_BOTTOM_RATIO = 0.68
 SINGLE_CENTER_FACTOR = 0.6
 
 BLACK_V_MAX = 80
@@ -49,7 +49,7 @@ ADAPTIVE_C = 5
 BLUR_KERNEL_SIZE = 5
 MORPH_KERNEL_SIZE = 3
 
-STOP_CONFIDENCE_MIN = 0.72
+STOP_CONFIDENCE_MIN = 0.68
 STOP_FRONT_CENTER_MARGIN_RATIO = 0.28
 STOP_STABLE_FRAMES = 3
 STOP_HOLD_TIME = 1.0
@@ -72,6 +72,7 @@ INTERSECTION_MIN_TIME = 1.2
 INTERSECTION_MAX_TIME = 15.0
 RECOVER_DUAL_FRAMES = 10
 CROSSWALK_CLEAR_CONFIDENCE = 0.45
+CROSSWALK_TRACK_CONFIDENCE = 0.52
 CROSSWALK_CLEAR_FRAMES = 8
 LEFT_TURN_BIAS = 0.12
 RIGHT_TURN_BIAS = 0.12
@@ -103,6 +104,7 @@ PAIR_MAX_GAP_RATIO = 0.96
 PAIR_CENTER_JUMP_RATIO = 0.30
 OUTSIDE_MARGIN_RATIO = 0.10
 SINGLE_WIDTH_FLOOR_RATIO = 0.52
+LANE_CONTINUITY_JUMP_RATIO = 0.12
 SINGLE_TURN_CONFIRM_FRAMES = 4
 SINGLE_TURN_RELEASE_FRAMES = 6
 KALMAN_FAIL_MAX = 8
@@ -431,6 +433,7 @@ class LineVision:
         debug_groups = []
         ignored_groups = []
         lane_widths = []
+        row_entries = []
         dual_rows = left_single_rows = right_single_rows = 0
         for index, y in enumerate(scan_rows):
             pixels = np.where(binary[y, :] == 255)[0]
@@ -453,9 +456,21 @@ class LineVision:
                 left_single_rows += 1
             elif kind == "right_single":
                 right_single_rows += 1
-
+            row_entries.append({
+                "center": center,
+                "y": y,
+                "weight": weight,
+                "kind": kind,
+                "left_edge": None if left is None else left[1],
+                "right_edge": None if right is None else right[0],
+            })
             lane_rows.append(self._row_debug(width, y, center, kind, left, right, ref_edge, lane_width))
 
+        if follow_mode == "normal":
+            candidates, row_entries = self._fix_discontinuous_pairs(candidates, row_entries, width, lane_width)
+            dual_rows = len([item for item in row_entries if item["kind"] == "dual"])
+            left_single_rows = len([item for item in row_entries if item["kind"] == "left_single"])
+            right_single_rows = len([item for item in row_entries if item["kind"] == "right_single"])
         raw_mid, dominant = self.fuse_candidates(candidates, dual_rows, left_single_rows, right_single_rows, follow_mode)
         predicted = kalman.predict()
         if raw_mid is not None:
@@ -489,6 +504,36 @@ class LineVision:
             "side_hint": side_hint,
         }
         return mid - width * 0.5, [(mid, search_bot)], failed_count, debug
+    def _continuous_side(self, entries, key, width):
+        values = [float(item[key]) for item in entries if item.get(key) is not None]
+        if len(values) < 3:
+            return False
+        max_jump = width * LANE_CONTINUITY_JUMP_RATIO
+        jumps = [abs(values[i + 1] - values[i]) for i in range(len(values) - 1)]
+        return max(jumps) <= max_jump
+    def _fix_discontinuous_pairs(self, candidates, entries, width, lane_width):
+        pair_entries = [item for item in entries if item["kind"] == "dual"]
+        if len(pair_entries) < 2:
+            return candidates, entries
+        left_ok = self._continuous_side(pair_entries, "left_edge", width)
+        right_ok = self._continuous_side(pair_entries, "right_edge", width)
+        if left_ok == right_ok:
+            return candidates, entries
+        fixed_entries = []
+        fixed_candidates = []
+        for item in entries:
+            if item["kind"] == "dual":
+                if left_ok:
+                    item = item.copy()
+                    item["kind"] = "left_single"
+                    item["center"] = item["left_edge"] + lane_width * self.single_center_factor
+                elif right_ok:
+                    item = item.copy()
+                    item["kind"] = "right_single"
+                    item["center"] = item["right_edge"] - lane_width * self.single_center_factor
+            fixed_entries.append(item)
+            fixed_candidates.append((item["center"], item["y"], item["weight"], item["kind"]))
+        return fixed_candidates, fixed_entries
     def _row_debug(self, width, y, center, kind, left, right, ref_edge, lane_width):
         info = {"y": int(y), "center_x": int(clamp(center, 0, width - 1)), "left_x": None, "right_x": None, "virtual_x": None}
         if left is not None:
@@ -622,7 +667,30 @@ class LineVision:
         spread = max(centers_x) - min(centers_x)
         if spread < width * 0.16:
             return []
-        return best_group
+        return self._expand_crosswalk_group(best_group, stripes, shape)
+    def _expand_crosswalk_group(self, core_group, stripes, shape):
+        height, width = shape[:2]
+        center_y = float(np.median([item["center"][1] for item in core_group]))
+        long_median = float(np.median([item["long_side"] for item in core_group]))
+        short_median = float(np.median([item["short_side"] for item in core_group]))
+        angle_median = float(np.median([item["angle_deg"] for item in core_group]))
+        min_x = min(item["center"][0] for item in core_group) - width * 0.22
+        max_x = max(item["center"][0] for item in core_group) + width * 0.22
+        expanded = []
+        for item in stripes:
+            cx, cy = item["center"]
+            if not (width * 0.08 <= cx <= width * 0.94 and min_x <= cx <= max_x):
+                continue
+            same_band = abs(cy - center_y) <= height * 0.22
+            size_ok = (
+                long_median * 0.45 <= item["long_side"] <= long_median * 2.70
+                and short_median * 0.35 <= item["short_side"] <= short_median * 2.60
+            )
+            angle_ok = undirected_angle_delta_deg(item["angle_deg"], angle_median) <= 35.0
+            if same_band and size_ok and angle_ok:
+                expanded.append(item)
+        expanded = sorted(expanded, key=lambda item: item["center"][0])
+        return expanded if len(expanded) >= len(core_group) else core_group
     def _consistent_stripe_group(self, group, width, height):
         if len(group) < 3:
             return []
@@ -740,6 +808,7 @@ class LaneFollower:
             ("intersection_max_time", INTERSECTION_MAX_TIME, float),
             ("recover_dual_frames", RECOVER_DUAL_FRAMES, int),
             ("crosswalk_clear_confidence", CROSSWALK_CLEAR_CONFIDENCE, float),
+            ("crosswalk_track_confidence", CROSSWALK_TRACK_CONFIDENCE, float),
             ("crosswalk_clear_frames", CROSSWALK_CLEAR_FRAMES, int),
             ("left_turn_bias", LEFT_TURN_BIAS, float),
             ("right_turn_bias", RIGHT_TURN_BIAS, float),
@@ -1047,8 +1116,13 @@ class LaneFollower:
         lane_binary = self.suppress_crosswalk_regions(binary, self.last_stop)
         now = rospy.get_time()
         candidate = bool(self.last_stop.get("candidate", False))
+        tracking_visible = (
+            self.state in ("APPROACH_CROSSWALK", "ALIGN_STOPLINE")
+            and self.last_stop.get("stop_polygon") is not None
+            and self.last_stop.get("confidence", 0.0) >= self.crosswalk_track_confidence
+        )
         cooldown_ready = now >= self.stop_cooldown_until
-        if candidate:
+        if candidate or tracking_visible:
             self.last_reliable_stop = self.last_stop
             self.crosswalk_lost_count = 0
         elif self.state in ("APPROACH_CROSSWALK", "ALIGN_STOPLINE"):

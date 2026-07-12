@@ -126,6 +126,45 @@ class CrosswalkMisclassificationTests(unittest.TestCase):
         self.assertFalse(result["candidate"])
         self.assertEqual(len(result["stripe_polygons"]), 5)
 
+    def test_perspective_crosswalk_group_keeps_right_side_bars(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        bars = [
+            ((220.0, 240.0), (32.0, 105.0), -8.0),
+            ((290.0, 240.0), (35.0, 108.0), -6.0),
+            ((360.0, 240.0), (38.0, 112.0), -4.0),
+            ((465.0, 245.0), (70.0, 145.0), 4.0),
+            ((550.0, 250.0), (75.0, 150.0), 9.0),
+        ]
+        for center, size, angle in bars:
+            fill_rotated_rect(binary, center, size, angle)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertEqual(len(result["stripe_polygons"]), len(bars))
+
+    def test_lane_scan_ignores_sparse_crosswalk_bars_when_left_edge_is_continuous(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (65, 430), (250, 120), 255, 12)
+        for center in [(440.0, 250.0), (520.0, 250.0), (600.0, 250.0)]:
+            fill_rotated_rect(binary, center, (42.0, 120.0), 6.0)
+
+        vision = line_cy.LineVision()
+        kalman = cv2.KalmanFilter(2, 1)
+        kalman.transitionMatrix = np.array([[1, 1], [0, 1]], np.float32)
+        kalman.measurementMatrix = np.array([[1, 0]], np.float32)
+        kalman.processNoiseCov = np.eye(2, dtype=np.float32) * 1e-4
+        kalman.measurementNoiseCov = np.array([[1]], np.float32) * 1e-1
+        kalman.statePost = np.array([[320], [0]], np.float32)
+
+        deviation, centers, failed_count, debug = vision.scan(
+            binary, kalman, 320, 0, 360.0, "normal", None
+        )
+
+        self.assertLess(centers[-1][0], 360)
+        self.assertEqual(debug["dominant"], "left_single")
+        self.assertEqual(failed_count, 0)
+
     def test_diagonal_lane_with_stripes_is_not_a_stopline(self):
         binary = np.zeros((480, 640), dtype=np.uint8)
         fill_rotated_rect(binary, (250.0, 285.0), (450.0, 16.0), -35.0)
