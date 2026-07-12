@@ -39,8 +39,8 @@ PID_KD_BIG = 0.002
 PID_KI = 0
 DEV_THRESHOLD = 100
 
-ROI_TOP_RATIO = 0.28
-ROI_BOTTOM_RATIO = 0.68
+ROI_TOP_RATIO = 0.24
+ROI_BOTTOM_RATIO = 0.76
 SINGLE_CENTER_FACTOR = 0.6
 
 BLACK_V_MAX = 80
@@ -627,15 +627,15 @@ class LineVision:
         fused = candidates
         dominant = None
         if follow_mode == "normal":
-            if dual_rows >= 1:
-                dominant = "dual"
-                fused = [c for c in candidates if c[3] == "dual"] or candidates
-            elif dual_rows == 0 and right_single_rows >= 2 and right_single_rows >= left_single_rows:
+            if right_single_rows >= 2 and right_single_rows > dual_rows and right_single_rows >= left_single_rows:
                 dominant = "right_single"
                 fused = [c for c in candidates if c[3] == "right_single"] or candidates
-            elif dual_rows == 0 and left_single_rows >= 2:
+            elif left_single_rows >= 2 and left_single_rows > dual_rows:
                 dominant = "left_single"
                 fused = [c for c in candidates if c[3] == "left_single"] or candidates
+            elif dual_rows >= 1:
+                dominant = "dual"
+                fused = [c for c in candidates if c[3] == "dual"] or candidates
         values = np.array([c[0] for c in fused], dtype=np.float32)
         weights = np.array([c[2] for c in fused], dtype=np.float32)
         return int(np.average(values, weights=weights)), dominant
@@ -1255,7 +1255,8 @@ class LaneFollower:
             else:
                 self.stop_hits = max(0, self.stop_hits - 1)
             entry_ready = self.stop_hits >= self.stop_stable_frames and not self.detect_only
-        effective_stop = self.last_stop if candidate else self.last_reliable_stop
+        visible_stop = candidate or tracking_visible
+        effective_stop = self.last_stop if visible_stop else self.last_reliable_stop
         bottom_ratio = 0.0
         if effective_stop is not None and frame.shape[0] > 0:
             bottom_ratio = effective_stop.get("stop_bottom_y", 0) / float(frame.shape[0])
@@ -1267,7 +1268,7 @@ class LaneFollower:
         next_state = crosswalk_next_state(
             self.state,
             entry_ready,
-            candidate,
+            visible_stop,
             bottom_ratio,
             self.align_trigger_y_ratio,
             self.crosswalk_lost_count,
@@ -1308,7 +1309,7 @@ class LaneFollower:
             self.show_views(raw_frame, lane_binary, centers)
             return
         if self.state == "ALIGN_STOPLINE":
-            angle = self.last_stop.get("stop_angle_deg") if candidate else None
+            angle = effective_stop.get("stop_angle_deg") if effective_stop is not None and visible_stop else None
             if angle is None:
                 self.align_stable_count = 0
                 angular = 0.0

@@ -247,6 +247,31 @@ class CrosswalkMisclassificationTests(unittest.TestCase):
         self.assertIn(groups[1], ignored)
         self.assertAlmostEqual(center, (groups[0][1] + groups[2][0]) * 0.5)
 
+    def test_outer_lines_are_ignored_when_inner_lane_pair_exists(self):
+        vision = line_cy.LineVision()
+        left_outer = (20, 32, 26.0, 13)
+        left_lane = (175, 187, 181.0, 13)
+        right_lane = (515, 527, 521.0, 13)
+
+        center, valid, ignored, kind, measured_width, left, right, ref_edge = vision.row_center(
+            [left_outer, left_lane, right_lane], 640, 340.0, 320.0, "normal", None
+        )
+
+        self.assertEqual(kind, "dual")
+        self.assertEqual(valid, [left_lane, right_lane])
+        self.assertIn(left_outer, ignored)
+
+        left_lane = (100, 112, 106.0, 13)
+        right_lane = (440, 452, 446.0, 13)
+        right_outer = (610, 622, 616.0, 13)
+        center, valid, ignored, kind, measured_width, left, right, ref_edge = vision.row_center(
+            [left_lane, right_lane, right_outer], 640, 340.0, 320.0, "normal", None
+        )
+
+        self.assertEqual(kind, "dual")
+        self.assertEqual(valid, [left_lane, right_lane])
+        self.assertIn(right_outer, ignored)
+
 
 class AlignmentControlTests(unittest.TestCase):
     def test_horizontal_stopline_requires_no_rotation(self):
@@ -295,6 +320,10 @@ class CrosswalkStateTests(unittest.TestCase):
 
 
 class RuntimeSafetyTests(unittest.TestCase):
+    def test_default_roi_is_expanded_for_intersection_view(self):
+        self.assertLessEqual(line_cy.ROI_TOP_RATIO, 0.24)
+        self.assertGreaterEqual(line_cy.ROI_BOTTOM_RATIO, 0.76)
+
     def test_straight_maneuver_uses_normal_follow_mode(self):
         follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
         follower.left_turn_bias = 0.12
