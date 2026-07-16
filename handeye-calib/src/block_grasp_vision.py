@@ -6,6 +6,12 @@ import cv2
 import numpy as np
 
 
+try:
+    _STRING_TYPES = (basestring,)
+except NameError:
+    _STRING_TYPES = (str,)
+
+
 class LocalizationError(RuntimeError):
     pass
 
@@ -56,10 +62,15 @@ def sample_depth_m(
     min_valid_ratio,
     max_mad_m,
 ):
+    if not isinstance(encoding, _STRING_TYPES):
+        raise LocalizationError("depth encoding must be a string")
+    encoding = encoding.upper()
     if encoding not in ("16UC1", "MONO16", "32FC1"):
         raise LocalizationError("unsupported depth encoding: %s" % encoding)
 
     center_values = _finite_vector(center, "depth patch center", 2)
+    if np.any(center_values < 0.0):
+        raise LocalizationError("depth patch center must use non-negative pixels")
     radius_value = _finite_scalar(radius, "depth patch radius")
     if radius_value < 0.0 or radius_value != math.floor(radius_value):
         raise LocalizationError("depth patch radius must be a non-negative integer")
@@ -83,8 +94,8 @@ def sample_depth_m(
     if depth.ndim != 2:
         raise LocalizationError("depth image must be a two-dimensional array")
 
-    center_x = int(round(float(center_values[0])))
-    center_y = int(round(float(center_values[1])))
+    center_x = int(math.floor(float(center_values[0]) + 0.5))
+    center_y = int(math.floor(float(center_values[1]) + 0.5))
     height, width = depth.shape
     x_start = max(0, center_x - radius_value)
     x_stop = min(width, center_x + radius_value + 1)

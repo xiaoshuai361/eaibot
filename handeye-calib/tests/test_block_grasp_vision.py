@@ -45,6 +45,32 @@ def test_sample_depth_mono16_is_millimetres():
     assert quality == {"valid_ratio": 1.0, "mad_m": 0.0}
 
 
+def test_sample_depth_accepts_ros_lowercase_mono16():
+    value, _ = sample_depth_m(
+        np.array([[1250]], dtype=np.uint16),
+        (0, 0),
+        "mono16",
+        0,
+        0.1,
+        2.0,
+        1.0,
+        0.01,
+    )
+
+    assert value == pytest.approx(1.25)
+
+
+def test_sample_depth_rounds_half_pixels_up_consistently():
+    depth = np.array(
+        [[1000, 1100, 1200], [1300, 1400, 1500], [1600, 1700, 1800]],
+        dtype=np.uint16,
+    )
+
+    value, _ = sample_depth_m(depth, (0.5, 1.5), "16uc1", 0, 0.1, 2.0, 1.0, 0.01)
+
+    assert value == pytest.approx(1.7)
+
+
 def test_sample_depth_32fc1_uses_metres_and_ignores_nonfinite():
     depth = np.array([[1.0, np.nan], [1.02, np.inf]], dtype=np.float32)
 
