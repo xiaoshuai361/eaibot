@@ -163,6 +163,15 @@ def test_find_block_selects_candidate_that_covers_detector_box():
     assert result["center"] == pytest.approx((115, 145), abs=2)
 
 
+def test_find_block_rejects_unrelated_square_only_visible_in_expanded_roi():
+    image = _localization_image(
+        [[(220, 80), (300, 80), (300, 160), (220, 160)]]
+    )
+
+    with pytest.raises(LocalizationError, match="associat"):
+        _find(image, (120, 100, 180, 160), min_area_pixels=500)
+
+
 def test_find_block_deduplicates_nearly_identical_contours(monkeypatch):
     image = _localization_image([[(70, 60), (250, 60), (250, 240), (70, 240)]])
     contour = np.array([[[70, 60]], [[250, 60]], [[250, 240]], [[70, 240]]], dtype=np.int32)

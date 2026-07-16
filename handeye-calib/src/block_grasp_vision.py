@@ -133,6 +133,35 @@ def _candidate_score(corners, center, area, rectangularity, detector_box):
     return float(score)
 
 
+def _is_candidate_associated(corners, center, detector_box):
+    x1, y1, x2, y2 = detector_box
+    detector_center = ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+    polygon = np.asarray(corners, dtype=np.float32)
+    if cv2.pointPolygonTest(polygon, detector_center, False) >= 0:
+        return True
+
+    detector_polygon = np.array(
+        [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
+    )
+    try:
+        intersection_area = float(
+            cv2.intersectConvexConvex(polygon, detector_polygon)[0]
+        )
+    except cv2.error:
+        return False
+    if not _isfinite(intersection_area) or intersection_area <= 0.0:
+        return False
+
+    corner_array = np.asarray(corners, dtype=np.float64)
+    diagonal = math.hypot(
+        float(np.ptp(corner_array[:, 0])), float(np.ptp(corner_array[:, 1]))
+    )
+    center_distance = math.hypot(
+        center[0] - detector_center[0], center[1] - detector_center[1]
+    )
+    return diagonal > 0.0 and center_distance <= 0.65 * diagonal
+
+
 def find_block_quadrilateral(
     image_bgr,
     detector_box,
@@ -186,6 +215,7 @@ def find_block_quadrilateral(
     contours = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[-2]
 
     candidates = []
+    found_unassociated_candidate = False
     offset = np.array([roi_x1, roi_y1], dtype=np.float64)
     for contour in contours:
         perimeter = float(cv2.arcLength(contour, True))
@@ -216,6 +246,9 @@ def find_block_quadrilateral(
         corners = approximated.reshape(4, 2).astype(np.float64) + offset
         center_array = np.mean(corners, axis=0)
         center = (float(center_array[0]), float(center_array[1]))
+        if not _is_candidate_associated(corners, center, box):
+            found_unassociated_candidate = True
+            continue
         score = _candidate_score(corners, center, area, rectangularity, box)
         candidate = {
             "corners": corners,
@@ -244,6 +277,8 @@ def find_block_quadrilateral(
             candidates.append(candidate)
 
     if not candidates:
+        if found_unassociated_candidate:
+            raise LocalizationError("no quadrilateral associated with detector box")
         raise LocalizationError("no reliable white quadrilateral candidate")
     candidates.sort(key=lambda item: item["score"], reverse=True)
     best = candidates[0]
