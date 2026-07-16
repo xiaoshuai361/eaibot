@@ -829,8 +829,9 @@ def compute_block_context(args, arm):
     }
     if args.tool_offset is None and args.dry_run:
         rospy.logwarn('Surface-only dry run: no tool geometry, so grasp poses are omitted.')
-        publish_debug_geometry(args.base_frame, current_pose, surface_base,
-                               None, None)
+        publish_debug_geometry(
+            args.base_frame, current_pose, None, None, None,
+            extra_pose_topics={'block_surface_base': surface_base})
         return context
     if not is_wrist_forward_reached(
             arm, args.wrist_forward_joint5, args.wrist_forward_tolerance):
@@ -841,8 +842,13 @@ def compute_block_context(args, arm):
     context.update(poses)
     rospy.loginfo(pose_to_text('block_pre_grasp', poses['pre_grasp']))
     rospy.loginfo(pose_to_text('block_grasp', poses['grasp']))
-    publish_debug_geometry(args.base_frame, current_pose, surface_base,
-                           poses['pre_grasp'], poses['grasp'])
+    publish_debug_geometry(
+        args.base_frame, current_pose, None, None, None,
+        extra_pose_topics={
+            'block_surface_base': surface_base,
+            'block_pre_grasp': poses['pre_grasp'],
+            'block_grasp': poses['grasp'],
+        })
     return context
 
 
@@ -963,15 +969,16 @@ def publish_debug_geometry(base_frame, current_pose, tag_pose, pre_grasp_pose, g
                            extra_pose_topics=None):
     pose_topics = {}
     if current_pose is not None:
-        pose_topics['current_pose'] = current_pose
+        pose_topics['current_pose'] = copy.deepcopy(current_pose)
     if tag_pose is not None:
-        pose_topics['tag_in_base'] = tag_pose
+        pose_topics['tag_in_base'] = copy.deepcopy(tag_pose)
     if pre_grasp_pose is not None:
-        pose_topics['pre_grasp'] = pre_grasp_pose
+        pose_topics['pre_grasp'] = copy.deepcopy(pre_grasp_pose)
     if grasp_pose is not None:
-        pose_topics['grasp'] = grasp_pose
+        pose_topics['grasp'] = copy.deepcopy(grasp_pose)
     if extra_pose_topics:
-        pose_topics.update(extra_pose_topics)
+        for name, pose in extra_pose_topics.items():
+            pose_topics[name] = copy.deepcopy(pose)
 
     publishers = {}
 
@@ -986,21 +993,21 @@ def publish_debug_geometry(base_frame, current_pose, tag_pose, pre_grasp_pose, g
     markers = MarkerArray()
     marker_specs = []
     if current_pose is not None:
-        marker_specs.append((0, current_pose, (0.1, 0.8, 0.1), 0.018))
+        marker_specs.append((0, pose_topics['current_pose'], (0.1, 0.8, 0.1), 0.018))
     if tag_pose is not None:
-        marker_specs.append((1, tag_pose, (0.1, 0.4, 0.9), 0.018))
+        marker_specs.append((1, pose_topics['tag_in_base'], (0.1, 0.4, 0.9), 0.018))
     if pre_grasp_pose is not None:
-        marker_specs.append((2, pre_grasp_pose, (0.95, 0.75, 0.1), 0.02))
+        marker_specs.append((2, pose_topics['pre_grasp'], (0.95, 0.75, 0.1), 0.02))
     if grasp_pose is not None:
-        marker_specs.append((3, grasp_pose, (0.95, 0.2, 0.2), 0.02))
+        marker_specs.append((3, pose_topics['grasp'], (0.95, 0.2, 0.2), 0.02))
     if extra_pose_topics:
         extra_marker_colors = {
             'pre_place': (0.8, 0.3, 0.95),
             'place': (0.25, 0.95, 0.95),
         }
         marker_id = 4
-        for name, pose in extra_pose_topics.items():
-            marker_specs.append((marker_id, pose,
+        for name in extra_pose_topics:
+            marker_specs.append((marker_id, pose_topics[name],
                                  extra_marker_colors.get(name, (0.8, 0.8, 0.8)),
                                  0.02))
             marker_id += 1

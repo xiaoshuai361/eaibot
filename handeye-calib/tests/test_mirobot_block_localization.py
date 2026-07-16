@@ -1,4 +1,5 @@
 import ast
+import copy
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -206,6 +207,92 @@ def test_subscriber_cleanup_supports_public_and_wrapped_ros_versions():
     assert wrapped_handle.calls == 1
 
 
+def test_debug_geometry_does_not_mutate_inputs_and_uses_block_extra_names():
+    publish_debug_geometry, = load_pure_script_functions("publish_debug_geometry")
+
+    class HeaderValue:
+        def __init__(self, frame_id, stamp):
+            self.frame_id = frame_id
+            self.stamp = stamp
+
+    class PoseValue:
+        def __init__(self, stamp):
+            self.header = HeaderValue("base", stamp)
+            self.pose = SimpleNamespace()
+
+    class Publisher:
+        def __init__(self, topic, *_args, **_kwargs):
+            self.topic = topic
+            self.messages = []
+            fake_rospy.publishers[topic] = self
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    fake_rospy = SimpleNamespace(
+        publishers={},
+        Publisher=Publisher,
+        sleep=lambda _duration: None,
+        Time=SimpleNamespace(now=lambda: 999.0),
+    )
+
+    class FakeMarkerArray:
+        def __init__(self):
+            self.markers = []
+
+    current = PoseValue(10.0)
+    surface = PoseValue(10.0)
+    pre = PoseValue(10.0)
+    grasp = PoseValue(10.0)
+    namespace = publish_debug_geometry.__globals__
+    namespace.update({
+        "copy": copy,
+        "rospy": fake_rospy,
+        "PoseStamped": object,
+        "MarkerArray": FakeMarkerArray,
+        "create_debug_marker": lambda *values: values,
+    })
+    publish_debug_geometry(
+        "base", current, None, None, None,
+        extra_pose_topics={
+            "block_surface_base": surface,
+            "block_pre_grasp": pre,
+            "block_grasp": grasp,
+        },
+    )
+
+    assert current.header.stamp == 10.0
+    assert surface.header.stamp == 10.0
+    assert pre.header.stamp == 10.0
+    assert grasp.header.stamp == 10.0
+    assert set(fake_rospy.publishers) >= {
+        "mirobot_pick_debug/current_pose",
+        "mirobot_pick_debug/block_surface_base",
+        "mirobot_pick_debug/block_pre_grasp",
+        "mirobot_pick_debug/block_grasp",
+    }
+    published_surface = fake_rospy.publishers[
+        "mirobot_pick_debug/block_surface_base"
+    ].messages[0]
+    assert published_surface is not surface
+    assert published_surface.header.stamp == 999.0
+
+    fake_rospy.publishers.clear()
+    old_current = PoseValue(20.0)
+    tag = PoseValue(20.0)
+    old_pre = PoseValue(20.0)
+    old_grasp = PoseValue(20.0)
+    publish_debug_geometry("base", old_current, tag, old_pre, old_grasp)
+    assert [pose.header.stamp for pose in
+            (old_current, tag, old_pre, old_grasp)] == [20.0] * 4
+    assert set(fake_rospy.publishers) >= {
+        "mirobot_pick_debug/current_pose",
+        "mirobot_pick_debug/tag_in_base",
+        "mirobot_pick_debug/pre_grasp",
+        "mirobot_pick_debug/grasp",
+    }
+
+
 def test_workspace_validates_contact_and_precontact():
     validate_workspace_points((0.20, 0.10, 0.08), (0.18, 0.10, 0.10), 0.04, 0.50)
     with pytest.raises(LocalizationError, match="contact.*minimum z"):
@@ -240,4 +327,5 @@ def test_source_adds_localization_without_dispatching_block_motion():
     assert "else:\n            do_pick_place(args, arm, pump_proxy)" not in source
     assert "BLOCK_TARGETS = ('power', 'fire', 'gas', 'support')" in source
     assert "choices=BLOCK_TARGETS" in source
-    assert "publish_debug_geometry(args.base_frame, current_pose, surface_base" in source
+    for topic_name in ("block_surface_base", "block_pre_grasp", "block_grasp"):
+        assert "'{}'".format(topic_name) in source
