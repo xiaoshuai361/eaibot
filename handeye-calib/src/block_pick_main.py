@@ -45,7 +45,7 @@ def parse_args(argv=None):
     parser.add_argument("--approach-gap", type=float, default=0.03)
     parser.add_argument("--velocity-scale", type=float, default=0.05)
     parser.add_argument("--acceleration-scale", type=float, default=0.05)
-    parser.add_argument("--debug-image")
+    parser.add_argument("--debug-image", default="/tmp/block_grasp_debug.png")
     if argv is not None:
         # argparse treats values such as ``-inf`` and ``-x`` as new options.
         # Join these option/value pairs so all documented signed values reach
@@ -297,7 +297,7 @@ def build_child_command(args, request_fd, response_fd):
         args.python2,
         args.arm_script,
         "--mode", "block_grasp",
-        "--target", args.target,
+        "--block-target", args.target,
         "--detector-request-fd", str(request_fd),
         "--detector-response-fd", str(response_fd),
         "--approach-gap", str(args.approach_gap),
@@ -307,8 +307,7 @@ def build_child_command(args, request_fd, response_fd):
     ]
     if args.tool_offset is not None:
         command += ["--tool-offset", str(args.tool_offset), "--tool-axis", args.tool_axis]
-    if args.debug_image:
-        command += ["--debug-image", args.debug_image]
+    command += ["--debug-image", args.debug_image]
     if args.dry_run:
         command.append("--dry-run")
     if args.stop_at_pre_grasp:

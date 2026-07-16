@@ -51,6 +51,7 @@ def test_defaults_and_required_target():
     assert parsed.arm_script == "/home/eaibot/handeye-calib/src/mirobot_pick_test.py"
     assert parsed.confidence == 0.25
     assert parsed.python2 == "python2"
+    assert parsed.debug_image == "/tmp/block_grasp_debug.png"
     with pytest.raises(SystemExit):
         main.parse_args([])
 
@@ -191,7 +192,7 @@ def test_build_child_command_forwards_every_setting():
     command = main.build_child_command(parsed, 11, 22)
     assert command[:4] == ["python2", parsed.arm_script, "--mode", "block_grasp"]
     for option, value in {
-        "--target": "fire", "--detector-request-fd": "11", "--detector-response-fd": "22",
+        "--block-target": "fire", "--detector-request-fd": "11", "--detector-response-fd": "22",
         "--tool-offset": "0.12", "--tool-axis": "-x", "--approach-gap": "0.04",
         "--max-tool-camera-angle-deg": "19.0", "--velocity-scale": "0.06",
         "--acceleration-scale": "0.07", "--debug-image": "/tmp/debug.jpg",
@@ -200,6 +201,12 @@ def test_build_child_command_forwards_every_setting():
         assert command[index + 1] == value
     assert "--dry-run" in command
     assert "--stop-at-pre-grasp" in command
+
+
+def test_build_child_command_always_forwards_default_debug_image():
+    command = main.build_child_command(args("--dry-run"), 11, 22)
+    index = command.index("--debug-image")
+    assert command[index + 1] == "/tmp/block_grasp_debug.png"
 
 
 class FakeChild:
@@ -220,7 +227,9 @@ class FakeChild:
         self.wait_timeouts.append(timeout)
         if self.timeout and not self.killed:
             raise subprocess.TimeoutExpired("fake", timeout)
-        return self.code if self.code is not None else 0
+        if self.code is None:
+            self.code = 0
+        return self.code
 
 
 def test_stop_child_terminates_then_kills_on_timeout():
@@ -238,10 +247,19 @@ def test_main_validates_before_loading(monkeypatch):
     assert loaded == []
 
 
-def _run_main(monkeypatch, child, serve=None):
+def _run_main(monkeypatch, child, serve=None, track_fds=False):
     monkeypatch.setattr(main, "load_model", lambda unused: object())
     monkeypatch.setattr(main, "serve_requests", serve or (lambda *unused: None))
     seen = {}
+    if track_fds:
+        real_pipe = os.pipe
+        pairs = []
+        def tracked_pipe():
+            pair = real_pipe()
+            pairs.append(pair)
+            return pair
+        monkeypatch.setattr(main.os, "pipe", tracked_pipe)
+        seen["pairs"] = pairs
     def popen(command, **kwargs):
         seen.update(command=command, kwargs=kwargs)
         return child
@@ -252,10 +270,16 @@ def _run_main(monkeypatch, child, serve=None):
 
 def test_main_passes_only_child_pipe_ends_and_normal_zero_has_timeout(monkeypatch):
     child = FakeChild(code=0)
-    result, seen = _run_main(monkeypatch, child)
+    result, seen = _run_main(monkeypatch, child, track_fds=True)
     assert result == 0
     assert seen["kwargs"]["close_fds"] is True
-    assert len(seen["kwargs"]["pass_fds"]) == 2
+    (request_read, request_write), (response_read, response_write) = seen["pairs"]
+    assert seen["kwargs"]["pass_fds"] == (request_write, response_read)
+    command = seen["command"]
+    assert command[command.index("--detector-request-fd") + 1] == str(request_write)
+    assert command[command.index("--detector-response-fd") + 1] == str(response_read)
+    assert request_read not in seen["kwargs"]["pass_fds"]
+    assert response_write not in seen["kwargs"]["pass_fds"]
     assert child.wait_timeouts == [main.NORMAL_CHILD_TIMEOUT]
 
 
@@ -267,11 +291,23 @@ def test_main_reports_immediate_nonzero_child(monkeypatch):
 @pytest.mark.parametrize("error", [KeyboardInterrupt(), BrokenPipeError("gone")])
 def test_main_stops_child_on_serve_failure(monkeypatch, error):
     child = FakeChild(code=None)
+    real_pipe = os.pipe
+    fds = []
+    def tracked_pipe():
+        pair = real_pipe()
+        fds.extend(pair)
+        return pair
+    monkeypatch.setattr(main.os, "pipe", tracked_pipe)
     def fail(*unused):
         raise error
     with pytest.raises(type(error)):
         _run_main(monkeypatch, child, fail)
     assert child.terminated
+    assert child.wait_timeouts == [main.STOP_CHILD_TIMEOUT]
+    assert child.poll() is not None
+    for fd in fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 def test_main_normal_wait_timeout_stops_child_and_reports(monkeypatch):
