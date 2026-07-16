@@ -11,11 +11,199 @@ from block_grasp_vision import (
     _finite_vector,
     compute_link_targets,
     deproject_pixel,
+    find_block_quadrilateral,
+    render_debug_image,
     rotate_vector_by_quaternion,
     sample_depth_m,
     undistort_pixel,
     validate_axis_alignment,
 )
+
+
+def _localization_image(polygons, size=(320, 420)):
+    image = np.full((size[0], size[1], 3), 25, dtype=np.uint8)
+    for corners in polygons:
+        polygon = np.asarray(corners, dtype=np.int32)
+        cv2 = block_grasp_vision.cv2
+        cv2.fillConvexPoly(image, polygon, (245, 245, 245))
+    return image
+
+
+def _find(image, box, **overrides):
+    parameters = dict(
+        image_bgr=image,
+        detector_box=box,
+        roi_margin=2.0,
+        min_area_pixels=1000,
+        max_aspect_error=0.25,
+        min_rectangularity=0.75,
+        ambiguity_ratio=0.92,
+    )
+    parameters.update(overrides)
+    return find_block_quadrilateral(**parameters)
+
+
+def test_find_block_uses_outer_white_square_when_detector_only_covers_offset_art():
+    image = _localization_image([[(70, 60), (270, 60), (270, 260), (70, 260)]])
+    block_grasp_vision.cv2.rectangle(image, (190, 100), (235, 145), (40, 40, 180), -1)
+
+    result = _find(image, (185, 95, 245, 155))
+
+    assert result["center"] == pytest.approx((170.0, 160.0), abs=2.0)
+    assert result["corners"].shape == (4, 2)
+    assert result["area"] == pytest.approx(40000, rel=0.05)
+    assert result["rectangularity"] > 0.95
+    assert np.isfinite(result["score"])
+
+
+def test_find_block_accepts_lightly_rotated_perspective_quadrilateral():
+    corners = [(90, 72), (260, 55), (280, 225), (105, 244)]
+    image = _localization_image([corners])
+
+    result = _find(image, (145, 115, 220, 180))
+
+    assert result["center"] == pytest.approx(np.mean(corners, axis=0), abs=3.0)
+
+
+def test_find_block_rejects_no_square_and_long_rectangle():
+    empty = _localization_image([])
+    rectangle = _localization_image([[(60, 110), (330, 110), (330, 190), (60, 190)]])
+
+    with pytest.raises(LocalizationError, match="candidate"):
+        _find(empty, (150, 120, 210, 180))
+    with pytest.raises(LocalizationError, match="candidate"):
+        _find(rectangle, (150, 120, 210, 180))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"detector_box": (20, 20, 20, 40)},
+        {"detector_box": (20, 20, np.nan, 40)},
+        {"roi_margin": -0.1},
+        {"roi_margin": 2.1},
+        {"min_area_pixels": 0},
+        {"max_aspect_error": -0.1},
+        {"max_aspect_error": 1.1},
+        {"min_rectangularity": 0},
+        {"min_rectangularity": 1.1},
+        {"ambiguity_ratio": 0},
+        {"ambiguity_ratio": 1.1},
+    ],
+)
+def test_find_block_rejects_invalid_parameters(overrides):
+    image = _localization_image([[(50, 50), (200, 50), (200, 200), (50, 200)]])
+    parameters = dict(
+        detector_box=(90, 90, 140, 140),
+        roi_margin=2,
+        min_area_pixels=500,
+        max_aspect_error=0.3,
+        min_rectangularity=0.7,
+        ambiguity_ratio=0.9,
+    )
+    parameters.update(overrides)
+
+    with pytest.raises(LocalizationError):
+        find_block_quadrilateral(image, **parameters)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        np.empty((0, 20, 3), dtype=np.uint8),
+        np.zeros((20, 20), dtype=np.uint8),
+        np.zeros((20, 20, 4), dtype=np.uint8),
+        np.zeros((20, 20, 3), dtype=np.float32),
+    ],
+)
+def test_find_block_rejects_invalid_image(image):
+    with pytest.raises(LocalizationError, match="image"):
+        _find(image, (1, 1, 10, 10))
+
+
+def test_find_block_clips_roi_to_image_boundary():
+    image = _localization_image([[(-15, -10), (105, 0), (100, 105), (0, 100)]], (180, 180))
+
+    result = _find(image, (-20, -20, 45, 45), min_area_pixels=500)
+
+    assert result["roi"] == (0, 0, 175, 175)
+    assert result["center"][0] < 60
+    assert result["center"][1] < 60
+
+
+def test_find_block_rejects_empty_clipped_roi():
+    image = _localization_image([])
+
+    with pytest.raises(LocalizationError, match="ROI"):
+        _find(image, (500, 500, 550, 550))
+
+
+def test_find_block_rejects_two_equally_plausible_squares_as_ambiguous():
+    image = _localization_image(
+        [
+            [(35, 80), (155, 80), (155, 200), (35, 200)],
+            [(245, 80), (365, 80), (365, 200), (245, 200)],
+        ]
+    )
+
+    with pytest.raises(LocalizationError, match="Ambiguous"):
+        _find(image, (140, 105, 260, 175), roi_margin=1.0, ambiguity_ratio=0.85)
+
+
+def test_find_block_selects_candidate_that_covers_detector_box():
+    image = _localization_image(
+        [
+            [(40, 70), (190, 70), (190, 220), (40, 220)],
+            [(270, 95), (370, 95), (370, 195), (270, 195)],
+        ]
+    )
+
+    result = _find(image, (92, 115, 145, 170), ambiguity_ratio=0.8)
+
+    assert result["center"] == pytest.approx((115, 145), abs=2)
+
+
+def test_find_block_deduplicates_nearly_identical_contours(monkeypatch):
+    image = _localization_image([[(70, 60), (250, 60), (250, 240), (70, 240)]])
+    contour = np.array([[[70, 60]], [[250, 60]], [[250, 240]], [[70, 240]]], dtype=np.int32)
+    duplicate = contour.copy()
+    duplicate[:, 0, :] += 1
+
+    monkeypatch.setattr(
+        block_grasp_vision.cv2,
+        "findContours",
+        lambda *args, **kwargs: ([contour, duplicate], None),
+    )
+
+    result = _find(image, (120, 110, 190, 180))
+
+    assert result["center"] == pytest.approx((160, 150), abs=2)
+
+
+def test_render_debug_image_draws_without_modifying_input():
+    image = _localization_image([[(70, 60), (250, 60), (250, 240), (70, 240)]])
+    localization = _find(image, (115, 100, 195, 180))
+    original = image.copy()
+
+    rendered = render_debug_image(image, (115, 100, 195, 180), localization, 6)
+
+    assert np.array_equal(image, original)
+    assert rendered.shape == image.shape
+    assert rendered.dtype == image.dtype
+    assert not np.array_equal(rendered, image)
+    assert tuple(rendered[100, 115]) == (0, 0, 255)
+
+
+@pytest.mark.parametrize("radius", [-1, 1.5, np.nan, np.inf])
+def test_render_debug_image_rejects_invalid_radius(radius):
+    image = _localization_image([])
+    localization = {
+        "corners": np.array([[1, 1], [10, 1], [10, 10], [1, 10]], dtype=float),
+        "center": (5, 5),
+    }
+
+    with pytest.raises(LocalizationError, match="radius"):
+        render_debug_image(image, (1, 1, 10, 10), localization, radius)
 
 
 def test_finite_checks_do_not_require_python3_math_isfinite(monkeypatch):
