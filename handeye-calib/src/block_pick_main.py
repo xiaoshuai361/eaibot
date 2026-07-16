@@ -355,6 +355,16 @@ def stop_child(child):
     return None
 
 
+def report_cleanup_error(error):
+    try:
+        sys.stderr.write(
+            "CRITICAL: arm child may still be running; cleanup failed: %s\n" % error
+        )
+    except Exception:
+        # Reporting failure must never hide the exception that triggered cleanup.
+        pass
+
+
 def main(argv=None):
     args = validate_runtime_args(parse_args(argv))
     model = load_model(args.model)
@@ -386,7 +396,9 @@ def main(argv=None):
             serve_requests(model, request_stream, response_stream, args.confidence)
         except BaseException:
             child_cleanup_attempted = True
-            stop_child(child)
+            cleanup_error = stop_child(child)
+            if cleanup_error is not None:
+                report_cleanup_error(cleanup_error)
             raise
 
         try:
@@ -395,6 +407,7 @@ def main(argv=None):
             child_cleanup_attempted = True
             cleanup_error = stop_child(child)
             if cleanup_error is not None:
+                report_cleanup_error(cleanup_error)
                 raise RuntimeError(
                     "Arm child could not be terminated and reaped after detector EOF"
                 ) from cleanup_error
@@ -403,6 +416,7 @@ def main(argv=None):
             raise RuntimeError("Arm child exited with status %d" % return_code)
         return 0
     finally:
+        active_exception = sys.exc_info()[0] is not None
         _close_stream_safely(request_stream)
         _close_stream_safely(response_stream)
         close_fd_safely(request_read)
@@ -410,7 +424,14 @@ def main(argv=None):
         close_fd_safely(response_read)
         close_fd_safely(response_write)
         if child is not None and not child_cleanup_attempted:
-            stop_child(child)
+            cleanup_error = stop_child(child)
+            if cleanup_error is not None:
+                if active_exception:
+                    report_cleanup_error(cleanup_error)
+                else:
+                    raise RuntimeError(
+                        "arm child may still be running after cleanup failure"
+                    ) from cleanup_error
 
 
 if __name__ == "__main__":
