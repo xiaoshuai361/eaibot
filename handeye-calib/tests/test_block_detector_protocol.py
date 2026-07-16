@@ -37,6 +37,30 @@ def _client_with_responses(*responses):
     return DetectorClient(request_stream, response_stream), request_stream
 
 
+class _TrackingReader(io.StringIO):
+    def __init__(self, initial_value):
+        io.StringIO.__init__(self, initial_value)
+        self.readline_calls = 0
+
+    def readline(self, *args, **kwargs):
+        self.readline_calls += 1
+        return io.StringIO.readline(self, *args, **kwargs)
+
+
+class _FailFirstFlushStream(object):
+    def __init__(self):
+        self.writes = []
+        self.flush_calls = 0
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def flush(self):
+        self.flush_calls += 1
+        if self.flush_calls == 1:
+            raise IOError("simulated flush failure")
+
+
 def test_unicode_message_round_trip_on_binary_stream():
     stream = io.BytesIO()
 
@@ -93,7 +117,7 @@ def test_write_message_rejects_non_object_and_unserializable_payload():
     with pytest.raises(ProtocolError):
         write_message(io.StringIO(), ["not", "an", "object"])
     with pytest.raises(ProtocolError):
-        write_message(io.StringIO(), {"raw": b"bytes"})
+        write_message(io.StringIO(), {"raw": object()})
 
 
 def test_detect_writes_request_and_returns_valid_response():
@@ -138,6 +162,76 @@ def test_detect_propagates_non_empty_server_error():
 
     with pytest.raises(ProtocolError, match="model unavailable"):
         client.detect("/tmp/image.jpg", "fire")
+
+
+def test_detect_can_continue_after_matched_business_error():
+    client, requests = _client_with_responses(
+        {"id": 1, "ok": False, "error": "model unavailable"},
+        _response(id=2),
+    )
+
+    with pytest.raises(ProtocolError, match="model unavailable"):
+        client.detect("/tmp/one.jpg", "fire")
+    assert client.detect("/tmp/two.jpg", "fire")["id"] == 2
+
+    requests.seek(0)
+    assert read_message(requests)["id"] == 1
+    assert read_message(requests)["id"] == 2
+
+
+def test_flush_failure_reserves_id_and_poisons_client_without_more_io():
+    requests = _FailFirstFlushStream()
+    responses = _TrackingReader(json.dumps(_response(id=2)) + "\n")
+    client = DetectorClient(requests, responses)
+
+    with pytest.raises(ProtocolError, match="flush"):
+        client.detect("/tmp/one.jpg", "fire")
+
+    assert client._next_request_id == 2
+    assert len(requests.writes) == 1
+    assert responses.readline_calls == 0
+
+    with pytest.raises(ProtocolError, match="unusable|poisoned"):
+        client.detect("/tmp/two.jpg", "fire")
+
+    assert client._next_request_id == 2
+    assert len(requests.writes) == 1
+    assert responses.readline_calls == 0
+
+
+@pytest.mark.parametrize("response_text", ["", "not-json\n"], ids=["eof", "invalid-json"])
+def test_read_eof_or_invalid_json_poisons_client(response_text):
+    requests = io.StringIO()
+    responses = _TrackingReader(response_text)
+    client = DetectorClient(requests, responses)
+
+    with pytest.raises((EOFError, ProtocolError)):
+        client.detect("/tmp/one.jpg", "fire")
+
+    first_request = requests.getvalue()
+    assert client._next_request_id == 2
+    assert responses.readline_calls == 1
+
+    with pytest.raises(ProtocolError, match="unusable|poisoned"):
+        client.detect("/tmp/two.jpg", "fire")
+
+    assert client._next_request_id == 2
+    assert requests.getvalue() == first_request
+    assert responses.readline_calls == 1
+
+
+def test_mismatched_response_id_poisons_client():
+    client, requests = _client_with_responses(_response(id=99), _response(id=2))
+
+    with pytest.raises(ProtocolError, match="id"):
+        client.detect("/tmp/one.jpg", "fire")
+    first_request = requests.getvalue()
+
+    with pytest.raises(ProtocolError, match="unusable|poisoned"):
+        client.detect("/tmp/two.jpg", "fire")
+
+    assert client._next_request_id == 2
+    assert requests.getvalue() == first_request
 
 
 @pytest.mark.parametrize("error", [None, "", "   "])

@@ -117,21 +117,50 @@ class DetectorClient(object):
         self._request_stream = request_stream
         self._response_stream = response_stream
         self._next_request_id = 1
+        self._poisoned = False
 
     def detect(self, image_path, target):
+        if self._poisoned:
+            raise ProtocolError("Detector client is poisoned and unusable")
         if not _is_non_empty_text(image_path):
             raise ProtocolError("image_path must be non-empty text")
         if not _is_non_empty_text(target):
             raise ProtocolError("target must be non-empty text")
 
         request_id = self._next_request_id
-        write_message(
-            self._request_stream,
-            {"id": request_id, "image_path": image_path, "target": target},
-        )
         self._next_request_id += 1
 
-        response = read_message(self._response_stream)
+        try:
+            write_message(
+                self._request_stream,
+                {"id": request_id, "image_path": image_path, "target": target},
+            )
+            response = read_message(self._response_stream)
+            self._validate_response_identity(response, request_id)
+
+            ok = response.get("ok")
+            if not isinstance(ok, bool):
+                raise ProtocolError("Response ok must be a boolean")
+            if not ok:
+                error = response.get("error")
+                if not _is_non_empty_text(error):
+                    raise ProtocolError(
+                        "Failed response must contain a non-empty error"
+                    )
+            else:
+                self._validate_success_response(response, target)
+        except (EOFError, ProtocolError):
+            self._poisoned = True
+            raise
+
+        # A matched, well-formed business error leaves the stream synchronized.
+        if not ok:
+            raise ProtocolError(error)
+
+        return response
+
+    @staticmethod
+    def _validate_response_identity(response, request_id):
         response_id = response.get("id")
         if (
             isinstance(response_id, bool)
@@ -140,15 +169,8 @@ class DetectorClient(object):
         ):
             raise ProtocolError("Response id does not match request id")
 
-        ok = response.get("ok")
-        if not isinstance(ok, bool):
-            raise ProtocolError("Response ok must be a boolean")
-        if not ok:
-            error = response.get("error")
-            if not _is_non_empty_text(error):
-                raise ProtocolError("Failed response must contain a non-empty error")
-            raise ProtocolError(error)
-
+    @staticmethod
+    def _validate_success_response(response, target):
         class_id = response.get("class_id")
         if (
             isinstance(class_id, bool)
@@ -180,5 +202,3 @@ class DetectorClient(object):
         response_target = response.get("target")
         if not _is_non_empty_text(response_target) or response_target != target:
             raise ProtocolError("Response target does not match request target")
-
-        return response
