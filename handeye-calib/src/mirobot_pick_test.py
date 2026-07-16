@@ -29,6 +29,7 @@ from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 from block_detector_protocol import DetectorClient
+from block_grasp_sequence import run_block_sequence
 from block_grasp_vision import (
     LocalizationError,
     compute_link_targets,
@@ -1240,6 +1241,59 @@ def do_grasp(args, arm, pump_proxy):
         set_pump(pump_proxy, False)
 
 
+def do_block_grasp(args, arm, pump_proxy):
+    """Localize once and execute the guarded front-suction sequence."""
+    context = compute_block_context(args, arm)
+
+    # compute_block_context already logs and publishes the exact stamped
+    # localization/poses.  Do not publish them a second time here.
+    if args.dry_run:
+        rospy.logwarn('Dry run: no wrist, pump, or arm motion executed.')
+        if args.debug_hold_seconds > 0.0:
+            rospy.loginfo(
+                'Holding block debug pose topics for %.1f seconds.',
+                args.debug_hold_seconds)
+            rospy.sleep(args.debug_hold_seconds)
+        return 'dry_run'
+
+    pre_grasp_pose = context['pre_grasp']
+    grasp_pose = context['grasp']
+    if pre_grasp_pose is None or grasp_pose is None:
+        raise RuntimeError('Real block motion requires measured tool geometry.')
+    if not args.stop_at_pre_grasp and pump_proxy is None:
+        raise RuntimeError(
+            'Full block grasp requires a confirmed pump service proxy before motion.')
+
+    def move_pre():
+        execute_pose(arm, pre_grasp_pose, 'block_pre_grasp')
+        rospy.sleep(0.5)
+
+    def confirm_pump_off():
+        set_pump(pump_proxy, False)
+        rospy.sleep(0.5)
+
+    def move_contact():
+        execute_cartesian_pose(arm, grasp_pose, 'block_grasp_contact')
+        rospy.sleep(0.5)
+
+    def pump_on():
+        set_pump(pump_proxy, True)
+        rospy.sleep(0.8)
+
+    def retreat():
+        execute_cartesian_pose(arm, pre_grasp_pose, 'block_grasp_retreat')
+
+    return run_block_sequence(
+        dry_run=False,
+        stop_at_pre_grasp=args.stop_at_pre_grasp,
+        confirm_pump_off=confirm_pump_off,
+        move_pre=move_pre,
+        move_contact=move_contact,
+        pump_on=pump_on,
+        retreat=retreat,
+        log=rospy.logerr)
+
+
 def do_place(args, arm, pump_proxy):
     current_pose = arm.get_current_pose()
     pre_place_pose, place_pose = build_place_targets(args, args.base_frame,
@@ -1353,7 +1407,10 @@ def main():
     args = parse_args(sys.argv)
     rospy.init_node('mirobot_pick_test', anonymous=False)
     moveit_commander.roscpp_initialize(sys.argv)
-    args.tag_id = resolve_tag_id(args)
+    if args.mode == 'block_grasp':
+        require_block_args(args)
+    else:
+        args.tag_id = resolve_tag_id(args)
     if args.mode in ('grasp', 'pick_place', 'pick_lift_place'):
         resolve_grasp_offsets(args)
 
@@ -1361,12 +1418,17 @@ def main():
     pump_proxy = None
 
     try:
-        if args.mode in ('home', 'grasp', 'place', 'pick_place', 'pick_lift_place', 'current_pose', 'wrist_forward'):
+        if args.mode in ('home', 'grasp', 'place', 'pick_place', 'pick_lift_place',
+                         'current_pose', 'wrist_forward', 'block_grasp'):
             arm = build_move_group(args.group, args.base_frame, args.velocity_scale,
                                    args.acceleration_scale, args.planning_time,
                                    not args.disable_replanning)
 
-        if args.mode == 'pump' or (args.mode in ('grasp', 'place', 'pick_place', 'pick_lift_place') and not args.dry_run):
+        if (args.mode == 'pump' or
+                (args.mode in ('grasp', 'place', 'pick_place', 'pick_lift_place')
+                 and not args.dry_run) or
+                (args.mode == 'block_grasp' and not args.dry_run
+                 and not args.stop_at_pre_grasp)):
             pump_proxy = get_pump_proxy()
 
         if args.mode == 'home':
@@ -1385,9 +1447,10 @@ def main():
             do_current_pose(args, arm)
         elif args.mode == 'pick_place':
             do_pick_place(args, arm, pump_proxy)
+        elif args.mode == 'block_grasp':
+            do_block_grasp(args, arm, pump_proxy)
         else:
-            raise RuntimeError(
-                'block_grasp localization is implemented but motion dispatch is not enabled yet.')
+            raise RuntimeError('Unsupported mode: {}'.format(args.mode))
 
         rospy.loginfo('Test finished.')
     except rospy.ROSInterruptException:

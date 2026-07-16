@@ -22,7 +22,7 @@ TARGET_CLASS_IDS = {
 
 DEFAULT_MODEL = "/home/eaibot/models/Block_yolov8n_640/Block_yolov8n_640_best.pt"
 DEFAULT_ARM_SCRIPT = "/home/eaibot/handeye-calib/src/mirobot_pick_test.py"
-NORMAL_CHILD_TIMEOUT = 30.0
+NORMAL_CHILD_TIMEOUT = 180.0
 STOP_CHILD_TIMEOUT = 3.0
 
 
@@ -47,12 +47,17 @@ def parse_args(argv=None):
     parser.add_argument("--velocity-scale", type=float, default=0.05)
     parser.add_argument("--acceleration-scale", type=float, default=0.05)
     parser.add_argument("--debug-image", default="/tmp/block_grasp_debug.png")
+    parser.add_argument(
+        "--arm-timeout", type=float, default=NORMAL_CHILD_TIMEOUT,
+        help="Seconds to wait for the arm child after detector EOF",
+    )
     # argparse treats values such as ``-inf`` and ``-x`` as new options.
     # Join these option/value pairs so both explicit argv and the real process
     # argv deliver documented signed values to their validators.
     signed_numeric_options = {
         "--confidence", "--tool-offset", "--max-tool-camera-angle-deg",
         "--approach-gap", "--velocity-scale", "--acceleration-scale",
+        "--arm-timeout",
     }
     normalized = []
     index = 0
@@ -86,6 +91,7 @@ def validate_runtime_args(args):
         (args.approach_gap, "--approach-gap"),
         (args.velocity_scale, "--velocity-scale"),
         (args.acceleration_scale, "--acceleration-scale"),
+        (args.arm_timeout, "--arm-timeout"),
     )
     if args.tool_offset is not None:
         numeric += ((args.tool_offset, "--tool-offset"),)
@@ -106,6 +112,8 @@ def validate_runtime_args(args):
         raise ValueError("--tool-offset must be in [0, 0.30]")
     if not 0.0 < args.max_tool_camera_angle_deg < 90.0:
         raise ValueError("--max-tool-camera-angle-deg must be in (0, 90)")
+    if args.arm_timeout <= 0.0:
+        raise ValueError("--arm-timeout must be positive")
 
     if (args.tool_offset is None) != (args.tool_axis is None):
         raise ValueError("--tool-offset and --tool-axis must be provided together")
@@ -402,7 +410,7 @@ def main(argv=None):
             raise
 
         try:
-            return_code = child.wait(timeout=NORMAL_CHILD_TIMEOUT)
+            return_code = child.wait(timeout=args.arm_timeout)
         except subprocess.TimeoutExpired as wait_error:
             child_cleanup_attempted = True
             cleanup_error = stop_child(child)

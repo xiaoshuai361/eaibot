@@ -360,7 +360,7 @@ def test_workspace_validates_contact_and_precontact():
         validate_workspace_points((0.20, 0.10, 0.08), (0.60, 0.10, 0.10), 0.04, 0.50)
 
 
-def test_source_adds_localization_without_dispatching_block_motion():
+def test_source_preserves_localization_contract_when_motion_is_dispatched():
     source = SCRIPT.read_text(encoding="utf-8")
     for mode in (
         "home", "pump", "grasp", "place", "pick_place", "pick_lift_place",
@@ -381,8 +381,8 @@ def test_source_adds_localization_without_dispatching_block_motion():
         "--base-max-radius",
     ):
         assert option in source
-    assert "elif args.mode == 'block_grasp'" not in source
-    assert "do_block_grasp(" not in source
+    assert "elif args.mode == 'block_grasp'" in source
+    assert "def do_block_grasp(" in source
     assert "else:\n            do_pick_place(args, arm, pump_proxy)" not in source
     assert "BLOCK_TARGETS = ('power', 'fire', 'gas', 'support')" in source
     assert "choices=BLOCK_TARGETS" in source

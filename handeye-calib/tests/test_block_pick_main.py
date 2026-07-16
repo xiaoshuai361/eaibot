@@ -1,5 +1,7 @@
 import io
+import ast
 import os
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -52,6 +54,7 @@ def test_defaults_and_required_target():
     assert parsed.confidence == 0.25
     assert parsed.python2 == "python2"
     assert parsed.debug_image == "/tmp/block_grasp_debug.png"
+    assert parsed.arm_timeout == 180.0
     with pytest.raises(SystemExit):
         main.parse_args([])
 
@@ -100,7 +103,7 @@ def test_script_real_argv_reaches_model_validation_with_negative_tool_axis(tmp_p
 
 @pytest.mark.parametrize("option", [
     "--confidence", "--tool-offset", "--max-tool-camera-angle-deg",
-    "--approach-gap", "--velocity-scale", "--acceleration-scale",
+    "--approach-gap", "--velocity-scale", "--acceleration-scale", "--arm-timeout",
 ])
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_all_numeric_cli_values_reject_nonfinite(option, value):
@@ -119,6 +122,8 @@ def test_all_numeric_cli_values_reject_nonfinite(option, value):
     ("--tool-offset", ".301", "--tool-axis", "x"),
     ("--max-tool-camera-angle-deg", "0"),
     ("--max-tool-camera-angle-deg", "90"),
+    ("--arm-timeout", "0"),
+    ("--arm-timeout", "-1"),
 ])
 def test_numeric_boundaries_rejected(extra):
     with pytest.raises(ValueError):
@@ -251,6 +256,12 @@ def test_build_child_command_always_forwards_default_debug_image():
     assert command[index + 1] == "/tmp/block_grasp_debug.png"
 
 
+def test_arm_timeout_is_parent_only_and_accepts_custom_positive_value():
+    parsed = main.validate_runtime_args(args("--dry-run", "--arm-timeout", "245.5"))
+    assert parsed.arm_timeout == 245.5
+    assert "--arm-timeout" not in main.build_child_command(parsed, 11, 22)
+
+
 class FakeChild:
     def __init__(self, code=None, timeout=False):
         self.code = code
@@ -326,7 +337,7 @@ def test_main_validates_before_loading(monkeypatch):
     assert loaded == []
 
 
-def _run_main(monkeypatch, child, serve=None, track_fds=False):
+def _run_main(monkeypatch, child, serve=None, track_fds=False, extra=None):
     monkeypatch.setattr(main, "load_model", lambda unused: object())
     monkeypatch.setattr(main, "serve_requests", serve or (lambda *unused: None))
     seen = {}
@@ -343,7 +354,7 @@ def _run_main(monkeypatch, child, serve=None, track_fds=False):
         seen.update(command=command, kwargs=kwargs)
         return child
     monkeypatch.setattr(main.subprocess, "Popen", popen)
-    result = main.main(["--target", "fire", "--dry-run"])
+    result = main.main(["--target", "fire", "--dry-run"] + list(extra or []))
     return result, seen
 
 
@@ -360,6 +371,13 @@ def test_main_passes_only_child_pipe_ends_and_normal_zero_has_timeout(monkeypatc
     assert request_read not in seen["kwargs"]["pass_fds"]
     assert response_write not in seen["kwargs"]["pass_fds"]
     assert child.wait_timeouts == [main.NORMAL_CHILD_TIMEOUT]
+
+
+def test_main_uses_configured_arm_timeout_after_detector_eof(monkeypatch):
+    child = FakeChild(code=0)
+    result, unused = _run_main(monkeypatch, child, extra=["--arm-timeout", "234"])
+    assert result == 0
+    assert child.wait_timeouts == [234.0]
 
 
 def test_main_reports_immediate_nonzero_child(monkeypatch):
@@ -458,3 +476,85 @@ def test_popen_failure_closes_every_created_fd(monkeypatch):
     for fd in fds:
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+def _function_node(source, function_name):
+    module = ast.parse(source)
+    return next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+
+
+def test_arm_script_block_grasp_delegates_actions_after_dry_run_guard():
+    source = Path("handeye-calib/src/mirobot_pick_test.py").read_text(
+        encoding="utf-8"
+    )
+    function = _function_node(source, "do_block_grasp")
+    calls = [
+        node.func.id for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert "compute_block_context" in calls
+    assert calls.count("run_block_sequence") == 1
+    assert "go_wrist_forward" not in calls
+    assert "go_home" not in calls
+    assert "publish_debug_geometry" not in calls
+
+    pump_guards = [
+        node for node in function.body if isinstance(node, ast.If)
+        and "pump_proxy" in ast.dump(node.test, include_attributes=False)
+        and "stop_at_pre_grasp" in ast.dump(node.test, include_attributes=False)
+    ]
+    assert len(pump_guards) == 1
+    assert any(isinstance(node, ast.Raise) for node in pump_guards[0].body)
+
+    dry_guard = next(
+        node for node in function.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "dry_run"
+    )
+    assert any(isinstance(node, ast.Return) for node in dry_guard.body)
+    sequence_statement_index = next(
+        index for index, statement in enumerate(function.body)
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_block_sequence"
+            for node in ast.walk(statement)
+        )
+    )
+    assert function.body.index(dry_guard) < sequence_statement_index
+
+
+def test_arm_main_block_branch_has_safe_arm_and_pump_acquisition_guards():
+    source = Path("handeye-calib/src/mirobot_pick_test.py").read_text(
+        encoding="utf-8"
+    )
+    function = _function_node(source, "main")
+    rendered = ast.dump(function, include_attributes=False)
+    assert "block_grasp" in rendered
+    assert "do_block_grasp" in rendered
+
+    build_conditions = []
+    pump_conditions = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.If):
+            continue
+        body_calls = [
+            call.func.id for call in ast.walk(ast.Module(body=node.body, type_ignores=[]))
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        ]
+        condition = ast.dump(node.test, include_attributes=False)
+        if "build_move_group" in body_calls:
+            build_conditions.append(condition)
+        if "get_pump_proxy" in body_calls:
+            pump_conditions.append(condition)
+    assert any("block_grasp" in condition for condition in build_conditions)
+    assert any(
+        "block_grasp" in condition
+        and "dry_run" in condition
+        and "stop_at_pre_grasp" in condition
+        for condition in pump_conditions
+    )
