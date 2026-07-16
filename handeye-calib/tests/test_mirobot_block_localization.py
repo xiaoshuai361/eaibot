@@ -293,6 +293,65 @@ def test_debug_geometry_does_not_mutate_inputs_and_uses_block_extra_names():
     }
 
 
+def test_block_context_warms_listener_before_capture_and_reuses_it_for_tf():
+    compute_block_context, = load_pure_script_functions("compute_block_context")
+    events = []
+    listener = object()
+    current_pose = object()
+    surface_camera = object()
+    surface_base = object()
+    localization = {
+        "rgb_header": object(),
+        "camera_xyz": (0.0, 0.0, 0.5),
+        "target": "fire",
+        "class_name": "Fire extinguishing device",
+        "confidence": 0.9,
+        "center": (10.0, 20.0),
+        "depth_m": 0.5,
+    }
+
+    class Arm:
+        def get_current_pose(self):
+            events.append("current")
+            return current_pose
+
+    args = SimpleNamespace(
+        base_frame="base", tf_timeout=5.0, tool_offset=None, dry_run=True,
+    )
+    globals_ = compute_block_context.__globals__
+    globals_.update({
+        "require_block_args": lambda _args: events.append("validate"),
+        "tf": SimpleNamespace(
+            TransformListener=lambda: (events.append("listener") or listener)
+        ),
+        "warmup_transform_listener": lambda value: (
+            events.append("warmup") if value is listener else None
+        ),
+        "capture_rgbd_once": lambda _args: (events.append("capture") or object()),
+        "localize_block": lambda _args, _capture: (
+            events.append("localize") or localization
+        ),
+        "make_camera_point_pose": lambda _header, _xyz: surface_camera,
+        "transform_pose_at_stamp": lambda value, _frame, pose, _timeout: (
+            events.append("transform") or surface_base
+            if value is listener and pose is surface_camera else None
+        ),
+        "pose_to_text": lambda *_args: "pose",
+        "publish_debug_geometry": lambda *_args, **_kwargs: events.append("debug"),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *_args: None,
+            logwarn=lambda *_args: None,
+        ),
+    })
+    result = compute_block_context(args, Arm())
+
+    assert events[:7] == [
+        "validate", "listener", "warmup", "capture", "localize", "current",
+        "transform",
+    ]
+    assert result["surface_base"] is surface_base
+
+
 def test_workspace_validates_contact_and_precontact():
     validate_workspace_points((0.20, 0.10, 0.08), (0.18, 0.10, 0.10), 0.04, 0.50)
     with pytest.raises(LocalizationError, match="contact.*minimum z"):

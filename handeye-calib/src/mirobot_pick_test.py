@@ -67,6 +67,7 @@ DEFAULT_GRASP_OFFSETS = {
 }
 
 WRIST_FORWARD_JOINT5 = -1.5709534265016345
+TF_LISTENER_WARMUP_SECONDS = 0.2
 
 TOOL_AXES = ('x', '-x', 'y', '-y', 'z', '-z')
 BLOCK_TARGETS = ('power', 'fire', 'gas', 'support')
@@ -704,6 +705,17 @@ def transform_pose_at_stamp(listener, target_frame, pose_stamped, timeout_sec):
             .format(pose_stamped.header.frame_id, target_frame, exc))
 
 
+def warmup_transform_listener(listener, seconds=TF_LISTENER_WARMUP_SECONDS):
+    if listener is None:
+        raise RuntimeError('TF listener warmup requires a listener.')
+    seconds = _require_finite(seconds, 'TF listener warmup seconds')
+    if seconds <= 0.0:
+        raise RuntimeError('TF listener warmup seconds must be positive.')
+    rospy.loginfo('Warming TF listener cache for %.3f seconds before RGB-D capture.',
+                  seconds)
+    rospy.sleep(seconds)
+
+
 def make_camera_point_pose(rgb_header, camera_xyz):
     values = []
     for index, value in enumerate(camera_xyz):
@@ -803,9 +815,10 @@ def build_block_poses(args, listener, current_pose, localization,
 def compute_block_context(args, arm):
     """Compute block localization and poses only; never moves the arm or pump."""
     require_block_args(args)
+    listener = tf.TransformListener()
+    warmup_transform_listener(listener)
     capture = capture_rgbd_once(args)
     localization = localize_block(args, capture)
-    listener = tf.TransformListener()
     current_pose = arm.get_current_pose()
     surface_camera = make_camera_point_pose(
         localization['rgb_header'], localization['camera_xyz'])
