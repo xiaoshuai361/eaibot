@@ -579,17 +579,42 @@ def validate_rgbd_metadata(
     slop = _finite_scalar(slop, "RGB-D synchronization slop")
     if slop < 0.0:
         raise LocalizationError("RGB-D synchronization slop must be non-negative")
+    info_header = getattr(camera_info, "header", None)
     try:
-        rgb_stamp = _finite_scalar(stamp_to_sec(rgb_header.stamp), "RGB stamp")
-        depth_stamp = _finite_scalar(stamp_to_sec(depth_header.stamp), "depth stamp")
-    except AttributeError:
-        raise LocalizationError("RGB and depth headers must contain timestamps")
+        stamp_values = (
+            ("RGB", stamp_to_sec(rgb_header.stamp)),
+            ("depth", stamp_to_sec(depth_header.stamp)),
+            ("CameraInfo", stamp_to_sec(info_header.stamp)),
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise LocalizationError(
+            "RGB, depth and CameraInfo headers must contain timestamps"
+        )
+    validated_stamps = {}
+    for label, value in stamp_values:
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise LocalizationError(
+                "%s timestamp must be finite and positive" % label
+            )
+        if not _isfinite(value) or value <= 0.0:
+            raise LocalizationError(
+                "%s timestamp must be finite and positive" % label
+            )
+        validated_stamps[label] = value
+    rgb_stamp = validated_stamps["RGB"]
+    depth_stamp = validated_stamps["depth"]
+    info_stamp = validated_stamps["CameraInfo"]
     if abs(rgb_stamp - depth_stamp) > slop:
         raise LocalizationError("RGB/depth timestamp delta exceeds synchronization slop")
+    if abs(rgb_stamp - info_stamp) > slop or abs(depth_stamp - info_stamp) > slop:
+        raise LocalizationError(
+            "CameraInfo timestamp delta exceeds synchronization slop"
+        )
 
     rgb_frame = getattr(rgb_header, "frame_id", "")
     depth_frame = getattr(depth_header, "frame_id", "")
-    info_header = getattr(camera_info, "header", None)
     info_frame = getattr(info_header, "frame_id", "")
     if not rgb_frame or rgb_frame != depth_frame or rgb_frame != info_frame:
         raise LocalizationError(

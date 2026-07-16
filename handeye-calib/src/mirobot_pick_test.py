@@ -69,6 +69,7 @@ DEFAULT_GRASP_OFFSETS = {
 WRIST_FORWARD_JOINT5 = -1.5709534265016345
 
 TOOL_AXES = ('x', '-x', 'y', '-y', 'z', '-z')
+BLOCK_TARGETS = ('power', 'fire', 'gas', 'support')
 
 try:
     STRING_TYPES = (basestring,)
@@ -157,7 +158,7 @@ def parse_args(argv):
                         help='抓取前先把 joint5 转到吸盘水平朝前的已验证姿态。')
     parser.add_argument('--wrist-forward-joint5', type=float, default=WRIST_FORWARD_JOINT5,
                         help='--wrist-forward / --mode wrist_forward 使用的 joint5 目标弧度。')
-    parser.add_argument('--block-target')
+    parser.add_argument('--block-target', choices=BLOCK_TARGETS)
     parser.add_argument('--detector-request-fd', type=int)
     parser.add_argument('--detector-response-fd', type=int)
     parser.add_argument('--rgb-topic', default='/camera/rgb/image_raw')
@@ -201,6 +202,8 @@ def require_block_args(args):
     """Fail closed before opening a detector pipe or touching ROS topics."""
     if not isinstance(args.block_target, STRING_TYPES) or not args.block_target.strip():
         raise RuntimeError('--block-target is required for block_grasp mode.')
+    if args.block_target not in BLOCK_TARGETS:
+        raise RuntimeError('--block-target is unsupported: {}'.format(args.block_target))
     for option in ('rgb_topic', 'registered_depth_topic', 'rgb_camera_info_topic'):
         value = getattr(args, option)
         if not isinstance(value, STRING_TYPES) or not value.strip():
@@ -826,6 +829,8 @@ def compute_block_context(args, arm):
     }
     if args.tool_offset is None and args.dry_run:
         rospy.logwarn('Surface-only dry run: no tool geometry, so grasp poses are omitted.')
+        publish_debug_geometry(args.base_frame, current_pose, surface_base,
+                               None, None)
         return context
     if not is_wrist_forward_reached(
             arm, args.wrist_forward_joint5, args.wrist_forward_tolerance):
@@ -836,6 +841,8 @@ def compute_block_context(args, arm):
     context.update(poses)
     rospy.loginfo(pose_to_text('block_pre_grasp', poses['pre_grasp']))
     rospy.loginfo(pose_to_text('block_grasp', poses['grasp']))
+    publish_debug_geometry(args.base_frame, current_pose, surface_base,
+                           poses['pre_grasp'], poses['grasp'])
     return context
 
 

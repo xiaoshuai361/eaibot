@@ -49,7 +49,12 @@ def load_pure_script_functions(*names):
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     nodes = [node for node in tree.body
              if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {"math": math, "STRING_TYPES": (str,), "TOOL_AXES": ("x", "-x", "y", "-y", "z", "-z")}
+    namespace = {
+        "math": math,
+        "STRING_TYPES": (str,),
+        "TOOL_AXES": ("x", "-x", "y", "-y", "z", "-z"),
+        "BLOCK_TARGETS": ("power", "fire", "gas", "support"),
+    }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SCRIPT), "exec"), namespace)
     return [namespace[name] for name in names]
 
@@ -119,6 +124,31 @@ def test_rgbd_metadata_rejects_bad_info_and_nonfinite_distortion():
         validate_rgbd_metadata(**capture)
 
 
+@pytest.mark.parametrize("stamp", [0.0, -1.0, float("nan"), float("inf")])
+def test_rgbd_metadata_rejects_nonpositive_or_nonfinite_stamps(stamp):
+    for field in ("rgb_header", "depth_header"):
+        capture = valid_capture()
+        capture[field] = Header(stamp=stamp)
+        with pytest.raises(LocalizationError, match="timestamp.*positive"):
+            validate_rgbd_metadata(**capture)
+
+    capture = valid_capture()
+    info = Info()
+    info.header = Header(stamp=stamp)
+    capture["camera_info"] = info
+    with pytest.raises(LocalizationError, match="timestamp.*positive"):
+        validate_rgbd_metadata(**capture)
+
+
+def test_rgbd_metadata_rejects_stale_camera_info():
+    capture = valid_capture()
+    info = Info()
+    info.header = Header(stamp=9.0)
+    capture["camera_info"] = info
+    with pytest.raises(LocalizationError, match="CameraInfo.*slop"):
+        validate_rgbd_metadata(**capture)
+
+
 def test_tool_axis_preserves_sign():
     assert tool_axis_vector("x", 0.12) == (0.12, 0.0, 0.0)
     assert tool_axis_vector("-x", 0.12) == (-0.12, 0.0, 0.0)
@@ -141,6 +171,7 @@ def test_block_arg_validation_supports_surface_only_dry_run():
         ({"stop_at_pre_grasp": True}, "required outside"),
         ({"detector_request_fd": 6}, "must differ"),
         ({"debug_image": ""}, "non-empty"),
+        ({"block_target": "unknown"}, "unsupported"),
     ],
 )
 def test_block_arg_validation_fails_closed(changes, message):
@@ -207,3 +238,6 @@ def test_source_adds_localization_without_dispatching_block_motion():
     assert "elif args.mode == 'block_grasp'" not in source
     assert "do_block_grasp(" not in source
     assert "else:\n            do_pick_place(args, arm, pump_proxy)" not in source
+    assert "BLOCK_TARGETS = ('power', 'fire', 'gas', 'support')" in source
+    assert "choices=BLOCK_TARGETS" in source
+    assert "publish_debug_geometry(args.base_frame, current_pose, surface_base" in source
