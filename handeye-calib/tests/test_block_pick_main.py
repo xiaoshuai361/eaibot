@@ -56,6 +56,48 @@ def test_defaults_and_required_target():
         main.parse_args([])
 
 
+def test_real_argv_accepts_negative_tool_axis(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "block_pick_main.py", "--target", "fire", "--dry-run",
+        "--tool-offset", "0.1", "--tool-axis", "-x",
+    ])
+    assert main.parse_args(None).tool_axis == "-x"
+
+
+def test_negative_tool_axis_equals_form_is_accepted():
+    parsed = main.parse_args([
+        "--target", "fire", "--dry-run", "--tool-offset", "0.1",
+        "--tool-axis=-x",
+    ])
+    assert parsed.tool_axis == "-x"
+
+
+def test_real_argv_rejects_unknown_negative_tool_axis(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "block_pick_main.py", "--target", "fire", "--dry-run",
+        "--tool-offset", "0.1", "--tool-axis", "-q",
+    ])
+    with pytest.raises(SystemExit):
+        main.parse_args(None)
+
+
+def test_script_real_argv_reaches_model_validation_with_negative_tool_axis(tmp_path):
+    missing_model = tmp_path / "missing.pt"
+    result = subprocess.run(
+        [
+            sys.executable, main.__file__, "--target", "fire", "--dry-run",
+            "--tool-offset", "0.1", "--tool-axis", "-x",
+            "--model", str(missing_model),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "Model file does not exist" in result.stderr
+    assert "expected one argument" not in result.stderr
+
+
 @pytest.mark.parametrize("option", [
     "--confidence", "--tool-offset", "--max-tool-camera-angle-deg",
     "--approach-gap", "--velocity-scale", "--acceleration-scale",

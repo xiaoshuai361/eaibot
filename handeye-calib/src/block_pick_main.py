@@ -31,6 +31,7 @@ class DetectionError(RuntimeError):
 
 
 def parse_args(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Detect and grasp one tagless supply block")
     parser.add_argument("--target", required=True, choices=sorted(TARGET_CLASSES))
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -46,32 +47,31 @@ def parse_args(argv=None):
     parser.add_argument("--velocity-scale", type=float, default=0.05)
     parser.add_argument("--acceleration-scale", type=float, default=0.05)
     parser.add_argument("--debug-image", default="/tmp/block_grasp_debug.png")
-    if argv is not None:
-        # argparse treats values such as ``-inf`` and ``-x`` as new options.
-        # Join these option/value pairs so all documented signed values reach
-        # the validator and tool-axis choices correctly.
-        signed_value_options = {
-            "--confidence", "--tool-offset", "--tool-axis",
-            "--max-tool-camera-angle-deg", "--approach-gap",
-            "--velocity-scale", "--acceleration-scale",
-        }
-        normalized = []
-        index = 0
-        argv = list(argv)
-        while index < len(argv):
-            token = argv[index]
-            if (
-                token in signed_value_options
-                and index + 1 < len(argv)
-                and argv[index + 1].startswith("-")
-            ):
-                normalized.append(token + "=" + argv[index + 1])
-                index += 2
-                continue
-            normalized.append(token)
-            index += 1
-        argv = normalized
-    return parser.parse_args(argv)
+    # argparse treats values such as ``-inf`` and ``-x`` as new options.
+    # Join these option/value pairs so both explicit argv and the real process
+    # argv deliver documented signed values to their validators.
+    signed_numeric_options = {
+        "--confidence", "--tool-offset", "--max-tool-camera-angle-deg",
+        "--approach-gap", "--velocity-scale", "--acceleration-scale",
+    }
+    normalized = []
+    index = 0
+    while index < len(raw_argv):
+        token = raw_argv[index]
+        next_value = raw_argv[index + 1] if index + 1 < len(raw_argv) else None
+        if (
+            next_value is not None
+            and (
+                (token in signed_numeric_options and next_value.startswith("-"))
+                or (token == "--tool-axis" and next_value in ("-x", "-y", "-z"))
+            )
+        ):
+            normalized.append(token + "=" + next_value)
+            index += 2
+            continue
+        normalized.append(token)
+        index += 1
+    return parser.parse_args(normalized)
 
 
 def _finite(value, option):
