@@ -147,7 +147,7 @@ def test_find_block_rejects_two_equally_plausible_squares_as_ambiguous():
     )
 
     with pytest.raises(LocalizationError, match="Ambiguous"):
-        _find(image, (140, 105, 260, 175), roi_margin=1.0, ambiguity_ratio=0.85)
+        _find(image, (100, 105, 300, 175), roi_margin=1.0, ambiguity_ratio=0.85)
 
 
 def test_find_block_selects_candidate_that_covers_detector_box():
@@ -170,6 +170,15 @@ def test_find_block_rejects_unrelated_square_only_visible_in_expanded_roi():
 
     with pytest.raises(LocalizationError, match="associat"):
         _find(image, (120, 100, 180, 160), min_area_pixels=500)
+
+
+def test_find_block_rejects_square_that_only_grazes_detector_box_edge():
+    image = _localization_image(
+        [[(200, 80), (300, 80), (300, 180), (200, 180)]]
+    )
+
+    with pytest.raises(LocalizationError, match="associat"):
+        _find(image, (130, 105, 205, 155), min_area_pixels=500)
 
 
 def test_find_block_deduplicates_nearly_identical_contours(monkeypatch):

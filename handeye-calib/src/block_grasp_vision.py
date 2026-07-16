@@ -149,7 +149,9 @@ def _is_candidate_associated(corners, center, detector_box):
         )
     except cv2.error:
         return False
-    if not _isfinite(intersection_area) or intersection_area <= 0.0:
+    detector_area = float((x2 - x1) * (y2 - y1))
+    detector_coverage = intersection_area / detector_area
+    if not _isfinite(detector_coverage) or detector_coverage < 0.20:
         return False
 
     corner_array = np.asarray(corners, dtype=np.float64)
