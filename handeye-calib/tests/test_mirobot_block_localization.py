@@ -391,7 +391,16 @@ def test_source_preserves_localization_contract_when_motion_is_dispatched():
 
 
 @pytest.mark.parametrize("logging_fails", [False, True])
-def test_arm_main_ros_interrupt_is_reported_and_reraised(logging_fails):
+@pytest.mark.parametrize(
+    "mode, expected_text, absent_text",
+    [
+        ("block_grasp", "pump state is UNKNOWN", "operation interrupted"),
+        ("current_pose", "operation interrupted, exiting non-zero", "UNKNOWN"),
+    ],
+)
+def test_arm_main_ros_interrupt_is_reported_and_reraised(
+    logging_fails, mode, expected_text, absent_text
+):
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     main_node = next(
         node for node in tree.body
@@ -410,7 +419,7 @@ def test_arm_main_ros_interrupt_is_reported_and_reraised(logging_fails):
             raise RuntimeError("logger unavailable")
 
     args = SimpleNamespace(
-        mode="block_grasp", group="manipulator", base_frame="base",
+        mode=mode, group="manipulator", base_frame="base",
         velocity_scale=0.05, acceleration_scale=0.05, planning_time=5.0,
         disable_replanning=False, dry_run=False, stop_at_pre_grasp=False,
     )
@@ -430,9 +439,11 @@ def test_arm_main_ros_interrupt_is_reported_and_reraised(logging_fails):
         "rospy": rospy,
         "moveit_commander": moveit,
         "require_block_args": lambda _args: events.append("validated"),
+        "resolve_tag_id": lambda _args: 0,
         "build_move_group": lambda *_args: object(),
         "get_pump_proxy": lambda: object(),
         "do_block_grasp": lambda *_args: (_ for _ in ()).throw(interrupt),
+        "do_current_pose": lambda *_args: (_ for _ in ()).throw(interrupt),
     }
     exec(compile(ast.Module(body=[main_node], type_ignores=[]), str(SCRIPT), "exec"), namespace)
 
@@ -442,5 +453,5 @@ def test_arm_main_ros_interrupt_is_reported_and_reraised(logging_fails):
     assert "shutdown" in events
     critical = [event[1] for event in events if isinstance(event, tuple)]
     assert critical
-    assert "UNKNOWN" in critical[0]
-    assert "recover manually" in critical[0]
+    assert expected_text in critical[0]
+    assert absent_text not in critical[0]
