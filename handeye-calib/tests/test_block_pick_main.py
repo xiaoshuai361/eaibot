@@ -230,6 +230,51 @@ def test_serve_success_error_then_eof(tmp_path, monkeypatch):
         read_message(responses)
 
 
+def test_serve_marks_action_phase_before_success_response_write(
+    tmp_path, monkeypatch
+):
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    requests = request_stream(
+        {"id": 1, "target": "fire", "image_path": str(image)}
+    )
+    events = []
+    monkeypatch.setattr(
+        main,
+        "infer_detections",
+        lambda *unused: [
+            {"class_id": 1, "confidence": .9, "box": [1, 2, 3, 4]}
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "write_message",
+        lambda stream, payload: events.append(("write", payload["ok"])),
+    )
+    main.serve_requests(
+        object(), requests, io.StringIO(), .25,
+        before_success_response=lambda: events.append("action_phase"),
+    )
+    assert events == ["action_phase", ("write", True)]
+
+
+def test_serve_does_not_mark_action_phase_for_error_response(monkeypatch):
+    requests = request_stream(
+        {"id": 1, "target": "unknown", "image_path": "/missing"}
+    )
+    events = []
+    monkeypatch.setattr(
+        main,
+        "write_message",
+        lambda stream, payload: events.append(("write", payload["ok"])),
+    )
+    main.serve_requests(
+        object(), requests, io.StringIO(), .25,
+        before_success_response=lambda: events.append("action_phase"),
+    )
+    assert events == [("write", False)]
+
+
 def test_build_child_command_forwards_every_setting():
     parsed = args(
         "--dry-run", "--stop-at-pre-grasp", "--tool-offset", ".12", "--tool-axis", "-x",
@@ -427,6 +472,30 @@ def test_main_stops_child_on_serve_failure(monkeypatch, error):
     for fd in fds:
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), BrokenPipeError("gone")])
+def test_main_never_kills_after_success_response_boundary(
+    monkeypatch, capsys, error
+):
+    child = FakeChild(code=None)
+    child.pid = 7654
+
+    def success_then_fail(*call_args):
+        before_success_response = call_args[4]
+        before_success_response()
+        raise error
+
+    with pytest.raises(type(error)) as raised:
+        _run_main(monkeypatch, child, success_then_fail)
+    assert raised.value is error
+    assert not child.terminated
+    assert not child.killed
+    assert child.wait_timeouts == []
+    warning = capsys.readouterr().err
+    assert "CRITICAL" in warning
+    assert "7654" in warning
+    assert "UNKNOWN" in warning
 
 
 @pytest.mark.parametrize("active_error", [KeyboardInterrupt(), BrokenPipeError("gone")])

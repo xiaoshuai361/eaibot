@@ -283,7 +283,8 @@ def _handle_request(model, payload, confidence_threshold):
     }
 
 
-def serve_requests(model, request_stream, response_stream, confidence_threshold):
+def serve_requests(model, request_stream, response_stream, confidence_threshold,
+                   before_success_response=None):
     while True:
         try:
             payload = read_message(request_stream)
@@ -296,6 +297,10 @@ def serve_requests(model, request_stream, response_stream, confidence_threshold)
                 raise
             request_id = payload.get("id") if isinstance(payload, dict) else None
             response = {"id": request_id, "ok": False, "error": str(exc)}
+        if response.get("ok") and before_success_response is not None:
+            # Move the no-signal safety boundary before the successful result
+            # can become visible to the arm child.
+            before_success_response()
         # Protocol/write failures are process-level failures and must stop service.
         write_message(response_stream, response)
 
@@ -397,6 +402,11 @@ def main(argv=None):
     child = None
     child_cleanup_attempted = False
     arm_phase_started = False
+
+    def mark_arm_phase_started():
+        nonlocal arm_phase_started
+        arm_phase_started = True
+
     try:
         request_read, request_write = os.pipe()
         response_read, response_write = os.pipe()
@@ -420,12 +430,20 @@ def main(argv=None):
         response_stream = os.fdopen(response_write, "w")
         response_write = None
         try:
-            serve_requests(model, request_stream, response_stream, args.confidence)
+            serve_requests(
+                model, request_stream, response_stream, args.confidence,
+                mark_arm_phase_started,
+            )
         except BaseException:
-            child_cleanup_attempted = True
-            cleanup_error = stop_child(child)
-            if cleanup_error is not None:
-                report_cleanup_error(cleanup_error)
+            if arm_phase_started:
+                report_action_phase_warning(
+                    child, "left detector service after a successful response"
+                )
+            else:
+                child_cleanup_attempted = True
+                cleanup_error = stop_child(child)
+                if cleanup_error is not None:
+                    report_cleanup_error(cleanup_error)
             raise
 
         # Detector EOF means Python 2 may already be planning, moving, or
