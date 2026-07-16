@@ -334,14 +334,25 @@ def _close_stream_safely(stream):
 
 
 def stop_child(child):
-    if child is None or child.poll() is not None:
-        return
-    child.terminate()
+    if child is None:
+        return None
+    try:
+        if child.poll() is not None:
+            return None
+        child.terminate()
+    except Exception as exc:
+        return exc
     try:
         child.wait(timeout=STOP_CHILD_TIMEOUT)
     except subprocess.TimeoutExpired:
-        child.kill()
-        child.wait(timeout=STOP_CHILD_TIMEOUT)
+        try:
+            child.kill()
+            child.wait(timeout=STOP_CHILD_TIMEOUT)
+        except Exception as exc:
+            return exc
+    except Exception as exc:
+        return exc
+    return None
 
 
 def main(argv=None):
@@ -351,6 +362,7 @@ def main(argv=None):
     request_read = request_write = response_read = response_write = None
     request_stream = response_stream = None
     child = None
+    child_cleanup_attempted = False
     try:
         request_read, request_write = os.pipe()
         response_read, response_write = os.pipe()
@@ -373,14 +385,20 @@ def main(argv=None):
         try:
             serve_requests(model, request_stream, response_stream, args.confidence)
         except BaseException:
+            child_cleanup_attempted = True
             stop_child(child)
             raise
 
         try:
             return_code = child.wait(timeout=NORMAL_CHILD_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            stop_child(child)
-            raise RuntimeError("Arm child timed out after detector EOF")
+        except subprocess.TimeoutExpired as wait_error:
+            child_cleanup_attempted = True
+            cleanup_error = stop_child(child)
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "Arm child could not be terminated and reaped after detector EOF"
+                ) from cleanup_error
+            raise RuntimeError("Arm child timed out after detector EOF") from wait_error
         if return_code != 0:
             raise RuntimeError("Arm child exited with status %d" % return_code)
         return 0
@@ -391,7 +409,7 @@ def main(argv=None):
         close_fd_safely(request_write)
         close_fd_safely(response_read)
         close_fd_safely(response_write)
-        if child is not None and child.poll() is None:
+        if child is not None and not child_cleanup_attempted:
             stop_child(child)
 
 
