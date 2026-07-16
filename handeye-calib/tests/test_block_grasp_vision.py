@@ -131,6 +131,11 @@ def test_deproject_pixel_uses_pinhole_equations():
     assert point == pytest.approx((0.4, 0.2, 2.0))
 
 
+def test_deproject_pixel_rejects_nonfinite_computed_coordinates():
+    with pytest.raises(LocalizationError, match="finite"):
+        deproject_pixel(1e308, 0, 1e308, 1e-308, 1, 0, 0)
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

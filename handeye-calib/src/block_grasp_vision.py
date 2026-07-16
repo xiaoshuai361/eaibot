@@ -137,7 +137,8 @@ def deproject_pixel(u, v, depth_m, fx, fy, cx, cy):
         raise LocalizationError("depth must be positive")
     if fx <= 0.0 or fy <= 0.0:
         raise LocalizationError("focal lengths must be positive")
-    return ((u - cx) * depth_m / fx, (v - cy) * depth_m / fy, depth_m)
+    point = ((u - cx) * depth_m / fx, (v - cy) * depth_m / fy, depth_m)
+    return tuple(_finite_vector(point, "deprojected point", 3).tolist())
 
 
 def undistort_pixel(u, v, camera_matrix, distortion, distortion_model):
