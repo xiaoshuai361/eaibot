@@ -1454,7 +1454,13 @@ def main():
 
         rospy.loginfo('Test finished.')
     except rospy.ROSInterruptException:
-        pass
+        try:
+            rospy.logerr(
+                'CRITICAL: block grasp may be incomplete; pump state is UNKNOWN. '
+                'Stop and recover manually.')
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         rospy.logerr(str(exc))
         raise

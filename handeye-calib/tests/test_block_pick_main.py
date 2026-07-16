@@ -301,16 +301,37 @@ class NeverReapedChild:
         raise subprocess.TimeoutExpired("never-reaped", timeout)
 
 
-class ReturnsThenCannotBeReapedChild(NeverReapedChild):
-    def __init__(self):
-        super().__init__()
-        self.returned = False
+class TimeoutThenExitChild(FakeChild):
+    pid = 4321
+
     def wait(self, timeout=None):
         self.wait_timeouts.append(timeout)
-        if not self.returned and timeout == main.NORMAL_CHILD_TIMEOUT:
-            self.returned = True
-            return 0
-        raise subprocess.TimeoutExpired("never-reaped", timeout)
+        if len(self.wait_timeouts) == 1:
+            raise subprocess.TimeoutExpired("slow-arm", timeout)
+        self.code = 0
+        return self.code
+
+
+class ActionPhaseFailureChild(FakeChild):
+    pid = 5432
+
+    def __init__(self, error):
+        super().__init__(code=None)
+        self.error = error
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        raise self.error
+
+
+class TimeoutThenActionPhaseFailureChild(ActionPhaseFailureChild):
+    pid = 6543
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if len(self.wait_timeouts) == 1:
+            raise subprocess.TimeoutExpired("slow-arm", timeout)
+        raise self.error
 
 
 def test_stop_child_terminates_then_kills_on_timeout():
@@ -363,6 +384,7 @@ def test_main_passes_only_child_pipe_ends_and_normal_zero_has_timeout(monkeypatc
     result, seen = _run_main(monkeypatch, child, track_fds=True)
     assert result == 0
     assert seen["kwargs"]["close_fds"] is True
+    assert seen["kwargs"]["start_new_session"] is True
     (request_read, request_write), (response_read, response_write) = seen["pairs"]
     assert seen["kwargs"]["pass_fds"] == (request_write, response_read)
     command = seen["command"]
@@ -426,39 +448,55 @@ def test_main_preserves_active_error_when_child_cannot_be_reaped(
     assert "never-reaped" in stderr
 
 
-def test_main_normal_wait_timeout_stops_child_and_reports(monkeypatch):
-    child = FakeChild(code=None, timeout=True)
-    with pytest.raises(RuntimeError, match="timed out"):
+def test_action_timeout_warns_then_waits_without_terminating_child(
+    monkeypatch, capsys
+):
+    child = TimeoutThenExitChild()
+    result, unused = _run_main(monkeypatch, child)
+    assert result == 0
+    assert child.wait_timeouts == [main.NORMAL_CHILD_TIMEOUT, None]
+    assert not child.terminated
+    assert not child.killed
+    warning = capsys.readouterr().err
+    assert "CRITICAL" in warning
+    assert "4321" in warning
+    assert "still be moving" in warning
+    assert "UNKNOWN" in warning
+    assert "emergency stop" in warning
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), RuntimeError("wait failed")])
+def test_action_phase_failure_never_kills_child_and_preserves_error(
+    monkeypatch, capsys, error
+):
+    child = ActionPhaseFailureChild(error)
+    with pytest.raises(type(error)) as raised:
         _run_main(monkeypatch, child)
-    assert child.terminated and child.killed
+    assert raised.value is error
+    assert not child.terminated
+    assert not child.killed
+    assert child.wait_timeouts == [main.NORMAL_CHILD_TIMEOUT]
+    warning = capsys.readouterr().err
+    assert "CRITICAL" in warning
+    assert "5432" in warning
+    assert "UNKNOWN" in warning
 
 
-def test_main_reports_reap_failure_after_normal_detector_eof(monkeypatch):
-    child = NeverReapedChild()
-    with pytest.raises(RuntimeError, match=r"(?i)child.*(reap|terminat)") as raised:
+def test_interrupt_after_action_warning_still_never_kills_and_reports_running(
+    monkeypatch, capsys
+):
+    error = KeyboardInterrupt()
+    child = TimeoutThenActionPhaseFailureChild(error)
+    with pytest.raises(KeyboardInterrupt) as raised:
         _run_main(monkeypatch, child)
-    assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
-    assert child.terminate_calls == 1
-    assert child.kill_calls == 1
-    assert child.wait_timeouts == [
-        main.NORMAL_CHILD_TIMEOUT,
-        main.STOP_CHILD_TIMEOUT,
-        main.STOP_CHILD_TIMEOUT,
-    ]
-
-
-def test_main_raises_when_finally_cannot_reap_child(monkeypatch):
-    child = ReturnsThenCannotBeReapedChild()
-    with pytest.raises(RuntimeError, match="arm child may still be running") as raised:
-        _run_main(monkeypatch, child)
-    assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
-    assert child.terminate_calls == 1
-    assert child.kill_calls == 1
-    assert child.wait_timeouts == [
-        main.NORMAL_CHILD_TIMEOUT,
-        main.STOP_CHILD_TIMEOUT,
-        main.STOP_CHILD_TIMEOUT,
-    ]
+    assert raised.value is error
+    assert not child.terminated
+    assert not child.killed
+    assert child.wait_timeouts == [main.NORMAL_CHILD_TIMEOUT, None]
+    warning = capsys.readouterr().err
+    assert warning.count("CRITICAL") == 2
+    assert "6543" in warning
+    assert "UNKNOWN" in warning
 
 
 def test_popen_failure_closes_every_created_fd(monkeypatch):

@@ -49,7 +49,7 @@ def parse_args(argv=None):
     parser.add_argument("--debug-image", default="/tmp/block_grasp_debug.png")
     parser.add_argument(
         "--arm-timeout", type=float, default=NORMAL_CHILD_TIMEOUT,
-        help="Seconds to wait for the arm child after detector EOF",
+        help="Seconds before warning that the arm child is still in its action phase",
     )
     # argparse treats values such as ``-inf`` and ``-x`` as new options.
     # Join these option/value pairs so both explicit argv and the real process
@@ -373,6 +373,21 @@ def report_cleanup_error(error):
         pass
 
 
+def report_action_phase_warning(child, reason):
+    """Report an uncertain hardware state without signalling the arm child."""
+    try:
+        pid = getattr(child, "pid", "unknown")
+        sys.stderr.write(
+            "CRITICAL: arm child PID %s %s. The arm may still be moving and "
+            "the pump state is UNKNOWN. Do not terminate the child as a "
+            "software recovery; use the hardware emergency stop if needed "
+            "and recover manually.\n" % (pid, reason)
+        )
+    except Exception:
+        # Warning failures must not replace an active child/wait exception.
+        pass
+
+
 def main(argv=None):
     args = validate_runtime_args(parse_args(argv))
     model = load_model(args.model)
@@ -381,6 +396,7 @@ def main(argv=None):
     request_stream = response_stream = None
     child = None
     child_cleanup_attempted = False
+    arm_phase_started = False
     try:
         request_read, request_write = os.pipe()
         response_read, response_write = os.pipe()
@@ -389,6 +405,9 @@ def main(argv=None):
             command,
             pass_fds=(request_write, response_read),
             close_fds=True,
+            # Keep Ctrl-C in the Python 3 operator process from implicitly
+            # signalling the action-phase child through the terminal group.
+            start_new_session=True,
         )
 
         close_fd_safely(request_write)
@@ -409,17 +428,19 @@ def main(argv=None):
                 report_cleanup_error(cleanup_error)
             raise
 
+        # Detector EOF means Python 2 may already be planning, moving, or
+        # controlling the pump.  From this point onward it is unsafe to send
+        # SIGTERM/SIGKILL without a hardware-aware stop handshake.
+        arm_phase_started = True
         try:
             return_code = child.wait(timeout=args.arm_timeout)
-        except subprocess.TimeoutExpired as wait_error:
-            child_cleanup_attempted = True
-            cleanup_error = stop_child(child)
-            if cleanup_error is not None:
-                report_cleanup_error(cleanup_error)
-                raise RuntimeError(
-                    "Arm child could not be terminated and reaped after detector EOF"
-                ) from cleanup_error
-            raise RuntimeError("Arm child timed out after detector EOF") from wait_error
+        except subprocess.TimeoutExpired:
+            report_action_phase_warning(
+                child, "exceeded the configured action warning threshold"
+            )
+            # Continue waiting without a timeout.  Killing the Python 2
+            # process could leave MoveIt motion active or the pump uncertain.
+            return_code = child.wait()
         if return_code != 0:
             raise RuntimeError("Arm child exited with status %d" % return_code)
         return 0
@@ -432,14 +453,24 @@ def main(argv=None):
         close_fd_safely(response_read)
         close_fd_safely(response_write)
         if child is not None and not child_cleanup_attempted:
-            cleanup_error = stop_child(child)
-            if cleanup_error is not None:
-                if active_exception:
-                    report_cleanup_error(cleanup_error)
-                else:
-                    raise RuntimeError(
-                        "arm child may still be running after cleanup failure"
-                    ) from cleanup_error
+            if arm_phase_started:
+                try:
+                    child_still_running = child.poll() is None
+                except Exception:
+                    child_still_running = True
+                if child_still_running:
+                    report_action_phase_warning(
+                        child, "did not complete before the parent stopped waiting"
+                    )
+            else:
+                cleanup_error = stop_child(child)
+                if cleanup_error is not None:
+                    if active_exception:
+                        report_cleanup_error(cleanup_error)
+                    else:
+                        raise RuntimeError(
+                            "arm child may still be running after cleanup failure"
+                        ) from cleanup_error
 
 
 if __name__ == "__main__":

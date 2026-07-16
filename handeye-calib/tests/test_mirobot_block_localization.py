@@ -388,3 +388,59 @@ def test_source_preserves_localization_contract_when_motion_is_dispatched():
     assert "choices=BLOCK_TARGETS" in source
     for topic_name in ("block_surface_base", "block_pre_grasp", "block_grasp"):
         assert "'{}'".format(topic_name) in source
+
+
+@pytest.mark.parametrize("logging_fails", [False, True])
+def test_arm_main_ros_interrupt_is_reported_and_reraised(logging_fails):
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    main_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+
+    class RosInterrupt(Exception):
+        pass
+
+    interrupt = RosInterrupt("shutdown during block grasp")
+    events = []
+
+    def logerr(message):
+        events.append(("critical", message))
+        if logging_fails:
+            raise RuntimeError("logger unavailable")
+
+    args = SimpleNamespace(
+        mode="block_grasp", group="manipulator", base_frame="base",
+        velocity_scale=0.05, acceleration_scale=0.05, planning_time=5.0,
+        disable_replanning=False, dry_run=False, stop_at_pre_grasp=False,
+    )
+    rospy = SimpleNamespace(
+        ROSInterruptException=RosInterrupt,
+        init_node=lambda *_args, **_kwargs: events.append("init"),
+        loginfo=lambda *_args, **_kwargs: None,
+        logerr=logerr,
+    )
+    moveit = SimpleNamespace(
+        roscpp_initialize=lambda *_args: events.append("moveit_init"),
+        roscpp_shutdown=lambda: events.append("shutdown"),
+    )
+    namespace = {
+        "sys": SimpleNamespace(argv=["mirobot_pick_test.py"]),
+        "parse_args": lambda _argv: args,
+        "rospy": rospy,
+        "moveit_commander": moveit,
+        "require_block_args": lambda _args: events.append("validated"),
+        "build_move_group": lambda *_args: object(),
+        "get_pump_proxy": lambda: object(),
+        "do_block_grasp": lambda *_args: (_ for _ in ()).throw(interrupt),
+    }
+    exec(compile(ast.Module(body=[main_node], type_ignores=[]), str(SCRIPT), "exec"), namespace)
+
+    with pytest.raises(RosInterrupt) as raised:
+        namespace["main"]()
+    assert raised.value is interrupt
+    assert "shutdown" in events
+    critical = [event[1] for event in events if isinstance(event, tuple)]
+    assert critical
+    assert "UNKNOWN" in critical[0]
+    assert "recover manually" in critical[0]
