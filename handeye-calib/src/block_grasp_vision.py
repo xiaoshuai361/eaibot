@@ -499,6 +499,130 @@ def compute_link_targets(surface_base, tcp_vector_base, approach_gap_m):
     return tuple(contact.tolist()), tuple(precontact.tolist())
 
 
+def tool_axis_vector(axis_name, length_m):
+    """Return the signed Link6-to-TCP vector expressed in Link6 coordinates."""
+    if not isinstance(axis_name, _STRING_TYPES):
+        raise LocalizationError("tool axis must be a string")
+    length_m = _finite_scalar(length_m, "tool offset")
+    if length_m < 0.0 or length_m > 0.30:
+        raise LocalizationError("tool offset must be in [0, 0.30] m")
+    axes = {
+        "x": (1.0, 0.0, 0.0),
+        "-x": (-1.0, 0.0, 0.0),
+        "y": (0.0, 1.0, 0.0),
+        "-y": (0.0, -1.0, 0.0),
+        "z": (0.0, 0.0, 1.0),
+        "-z": (0.0, 0.0, -1.0),
+    }
+    if axis_name not in axes:
+        raise LocalizationError("unsupported tool axis: %s" % axis_name)
+    return tuple(component * length_m for component in axes[axis_name])
+
+
+def validate_workspace_points(contact, precontact, minimum_z_m, maximum_radius_m):
+    minimum_z_m = _finite_scalar(minimum_z_m, "minimum base z")
+    maximum_radius_m = _finite_scalar(maximum_radius_m, "maximum base radius")
+    if minimum_z_m < 0.0:
+        raise LocalizationError("minimum base z must be non-negative")
+    if maximum_radius_m <= 0.0:
+        raise LocalizationError("maximum base radius must be positive")
+
+    validated = []
+    for label, point in (("contact", contact), ("precontact", precontact)):
+        point = _finite_vector(point, "%s point" % label, 3)
+        if point[2] < minimum_z_m:
+            raise LocalizationError("%s point is below minimum z" % label)
+        if math.hypot(float(point[0]), float(point[1])) > maximum_radius_m:
+            raise LocalizationError("%s point exceeds maximum radius" % label)
+        validated.append(tuple(point.tolist()))
+    return tuple(validated)
+
+
+def validate_rgbd_metadata(
+    rgb,
+    depth,
+    rgb_header,
+    depth_header,
+    camera_info,
+    depth_encoding,
+    slop,
+    stamp_to_sec,
+):
+    """Validate that one RGB/depth pair is truly registered and calibrated."""
+    rgb = np.asarray(rgb)
+    depth = np.asarray(depth)
+    if (
+        rgb.dtype != np.uint8
+        or rgb.ndim != 3
+        or rgb.shape[2] != 3
+        or rgb.shape[0] <= 0
+        or rgb.shape[1] <= 0
+    ):
+        raise LocalizationError("RGB image must be a non-empty HWC BGR uint8 array")
+    if depth.ndim != 2 or depth.shape[0] <= 0 or depth.shape[1] <= 0:
+        raise LocalizationError("depth image must be a non-empty single-channel array")
+    if depth.shape != rgb.shape[:2]:
+        raise LocalizationError("registered depth and RGB dimensions must match")
+
+    if not isinstance(depth_encoding, _STRING_TYPES):
+        raise LocalizationError("depth encoding must be text")
+    encoding = depth_encoding.upper()
+    if encoding in ("16UC1", "MONO16"):
+        if depth.dtype != np.uint16:
+            raise LocalizationError("16UC1/mono16 depth must use uint16 dtype")
+    elif encoding == "32FC1":
+        if depth.dtype != np.float32:
+            raise LocalizationError("32FC1 depth must use float32 dtype")
+    else:
+        raise LocalizationError("unsupported depth encoding: %s" % depth_encoding)
+
+    slop = _finite_scalar(slop, "RGB-D synchronization slop")
+    if slop < 0.0:
+        raise LocalizationError("RGB-D synchronization slop must be non-negative")
+    try:
+        rgb_stamp = _finite_scalar(stamp_to_sec(rgb_header.stamp), "RGB stamp")
+        depth_stamp = _finite_scalar(stamp_to_sec(depth_header.stamp), "depth stamp")
+    except AttributeError:
+        raise LocalizationError("RGB and depth headers must contain timestamps")
+    if abs(rgb_stamp - depth_stamp) > slop:
+        raise LocalizationError("RGB/depth timestamp delta exceeds synchronization slop")
+
+    rgb_frame = getattr(rgb_header, "frame_id", "")
+    depth_frame = getattr(depth_header, "frame_id", "")
+    info_header = getattr(camera_info, "header", None)
+    info_frame = getattr(info_header, "frame_id", "")
+    if not rgb_frame or rgb_frame != depth_frame or rgb_frame != info_frame:
+        raise LocalizationError(
+            "registered RGB, depth and CameraInfo must use the same frame; "
+            "verify the real camera driver publishes registered depth"
+        )
+
+    try:
+        info_width = int(camera_info.width)
+        info_height = int(camera_info.height)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise LocalizationError("CameraInfo dimensions are invalid")
+    if info_width != rgb.shape[1] or info_height != rgb.shape[0]:
+        raise LocalizationError("CameraInfo dimensions must match RGB/depth")
+
+    matrix = _finite_vector(getattr(camera_info, "K", []), "camera matrix", 9)
+    distortion = _finite_vector(
+        getattr(camera_info, "D", []), "camera distortion"
+    )
+    if matrix[0] <= 0.0 or matrix[4] <= 0.0:
+        raise LocalizationError("camera focal lengths must be positive")
+    return {
+        "fx": float(matrix[0]),
+        "fy": float(matrix[4]),
+        "cx": float(matrix[2]),
+        "cy": float(matrix[5]),
+        "K": tuple(matrix.tolist()),
+        "D": tuple(distortion.tolist()),
+        "distortion_model": getattr(camera_info, "distortion_model", ""),
+        "encoding": encoding,
+    }
+
+
 def validate_axis_alignment(
     suction_axis_base, camera_forward_base, max_angle_deg
 ):
