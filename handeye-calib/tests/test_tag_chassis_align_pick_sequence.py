@@ -158,18 +158,11 @@ def test_left_to_right_order_sorts_available_tag_ids_by_x_center():
                                min_confidence=0.5) == [1, 2, 4]
 
 
-def test_left_to_right_resolve_waits_for_all_requested_tags_before_freezing_order():
+def test_left_to_right_selects_next_visible_tag_without_waiting_for_all_requested_tags():
     ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
 
     partial = {
         "detections": [
-            {"tag_id": 1, "confidence": 0.8, "box": [10, 0, 50, 40]},
-            {"tag_id": 2, "confidence": 0.8, "box": [80, 0, 120, 40]},
-        ],
-    }
-    full = {
-        "detections": [
-            {"tag_id": 4, "confidence": 0.8, "box": [300, 0, 340, 40]},
             {"tag_id": 1, "confidence": 0.8, "box": [10, 0, 50, 40]},
             {"tag_id": 2, "confidence": 0.8, "box": [80, 0, 120, 40]},
             {"tag_id": 3, "confidence": 0.8, "box": [160, 0, 200, 40]},
@@ -185,12 +178,12 @@ def test_left_to_right_resolve_waits_for_all_requested_tags_before_freezing_orde
                 max_align_seconds=1.0,
                 control_hz=5.0,
             )
-            self.messages = [partial, full]
+            self.messages = [partial]
 
         def wait_for_detections(self, timeout):
             return self.messages.pop(0)
 
-    assert FakeSequence().resolve_order() == [1, 2, 3, 4]
+    assert FakeSequence().select_next_tag([1, 2, 3, 4]) == 1
 
 
 def test_pick_command_leaves_startup_homing_to_chassis_sequence():
@@ -223,6 +216,15 @@ def test_pick_command_leaves_startup_homing_to_chassis_sequence():
     assert command[command.index("--acceleration-scale") + 1] == "0.2"
 
 
+def test_pick_failure_is_missing_tf_detects_child_tf_error():
+    pick_failure_is_missing_tf, = load_symbols("pick_failure_is_missing_tf")
+
+    assert pick_failure_is_missing_tf(
+        "RuntimeError: TF for tag_2 was not found.", 2) is True
+    assert pick_failure_is_missing_tf(
+        "RuntimeError: MoveIt failed during taught_grasp.", 2) is False
+
+
 def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
     parse_args, = load_symbols("parse_args")
 
@@ -253,13 +255,14 @@ def test_run_calls_controller_startup_home_after_each_successful_pick():
     class FakeSequence(ChassisAlignPickSequence):
         def __init__(self):
             self.args = SimpleNamespace(
+                sequence=[1, 2],
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=False,
             )
 
-        def resolve_order(self):
-            return [1, 2]
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
 
         def align_tag(self, tag_id):
             calls.append(("align", tag_id))
@@ -299,14 +302,15 @@ def test_run_waits_for_key_between_tags_when_enabled():
     class FakeSequence(ChassisAlignPickSequence):
         def __init__(self):
             self.args = SimpleNamespace(
+                sequence=[1, 2, 3],
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=True,
                 skip_startup_home=True,
             )
 
-        def resolve_order(self):
-            return [1, 2, 3]
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
 
         def align_tag(self, tag_id):
             calls.append(("align", tag_id))
@@ -345,14 +349,15 @@ def test_run_does_not_wait_between_tags_by_default():
     class FakeSequence(ChassisAlignPickSequence):
         def __init__(self):
             self.args = SimpleNamespace(
+                sequence=[1, 2],
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=False,
                 skip_startup_home=True,
             )
 
-        def resolve_order(self):
-            return [1, 2]
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
 
         def align_tag(self, tag_id):
             calls.append(("align", tag_id))
@@ -387,14 +392,15 @@ def test_run_skips_pick_when_tag_tf_does_not_stabilize():
     class FakeSequence(ChassisAlignPickSequence):
         def __init__(self):
             self.args = SimpleNamespace(
+                sequence=[1, 2],
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=False,
                 skip_startup_home=True,
             )
 
-        def resolve_order(self):
-            return [1, 2]
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
 
         def align_tag(self, tag_id):
             calls.append(("align", tag_id))
@@ -421,6 +427,54 @@ def test_run_skips_pick_when_tag_tf_does_not_stabilize():
     ]
 
 
+def test_run_continues_when_child_pick_loses_tag_tf_before_motion():
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    calls = []
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2],
+                align_only=False,
+                dry_run=False,
+                wait_key_between_tags=False,
+                skip_startup_home=False,
+            )
+
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
+
+        def align_tag(self, tag_id):
+            calls.append(("align", tag_id))
+
+        def wait_for_tag_tf_before_pick(self, tag_id):
+            calls.append(("tf", tag_id))
+            return True
+
+        def run_pick(self, tag_id):
+            calls.append(("pick", tag_id))
+            return tag_id != 1
+
+        def run_startup_home(self, tag_id):
+            calls.append(("startup_home", tag_id))
+
+        def stop_chassis(self):
+            calls.append(("stop",))
+
+    FakeSequence().run()
+
+    assert calls == [
+        ("align", 1),
+        ("tf", 1),
+        ("pick", 1),
+        ("align", 2),
+        ("tf", 2),
+        ("pick", 2),
+        ("startup_home", 2),
+        ("stop",),
+    ]
+
+
 def test_run_does_not_require_tag_tf_for_align_only():
     ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
     calls = []
@@ -428,13 +482,14 @@ def test_run_does_not_require_tag_tf_for_align_only():
     class FakeSequence(ChassisAlignPickSequence):
         def __init__(self):
             self.args = SimpleNamespace(
+                sequence=[1],
                 align_only=True,
                 dry_run=False,
                 wait_key_between_tags=False,
             )
 
-        def resolve_order(self):
-            return [1]
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
 
         def align_tag(self, tag_id):
             calls.append(("align", tag_id))

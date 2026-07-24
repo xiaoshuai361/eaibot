@@ -179,6 +179,40 @@ def build_pick_command(args, tag_id):
     return command
 
 
+def pick_failure_is_missing_tf(output, tag_id):
+    marker = 'TF for tag_%d was not found' % int(tag_id)
+    return marker in output
+
+
+def run_pick_command(command, tag_id):
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True)
+    output_lines = []
+    while True:
+        line = process.stdout.readline()
+        if line:
+            output_lines.append(line)
+            sys.stdout.write(line)
+            if hasattr(sys.stdout, 'flush'):
+                sys.stdout.flush()
+            continue
+        if process.poll() is not None:
+            break
+    return_code = process.wait()
+    output = ''.join(output_lines)
+    if return_code == 0:
+        return True
+    if pick_failure_is_missing_tf(output, tag_id):
+        rospy.logwarn(
+            'Pick for ID%d skipped because tag TF disappeared before motion.',
+            tag_id)
+        return False
+    raise subprocess.CalledProcessError(return_code, command)
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description='Slow chassis alignment helper before taught AprilTag picking.')
@@ -319,13 +353,14 @@ class ChassisAlignPickSequence(object):
             rate.sleep()
         raise RuntimeError('Timed out waiting for YOLO detections JSON.')
 
-    def resolve_order(self):
+    def select_next_tag(self, remaining_tags):
+        remaining_tags = list(remaining_tags)
+        if not remaining_tags:
+            raise RuntimeError('No remaining tag IDs to process.')
         if self.args.order == 'sequence':
-            return list(self.args.sequence)
+            return remaining_tags[0]
         deadline = rospy.Time.now() + rospy.Duration(self.args.max_align_seconds)
         rate = rospy.Rate(self.args.control_hz)
-        best_order = []
-        missing = list(self.args.sequence)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             try:
                 message = self.wait_for_detections(0.3)
@@ -333,26 +368,20 @@ class ChassisAlignPickSequence(object):
                 rate.sleep()
                 continue
             order = left_to_right_order(
-                message, self.args.sequence, self.args.min_confidence)
-            if len(order) > len(best_order):
-                best_order = order
-            present = set(order)
-            missing = [tag_id for tag_id in self.args.sequence
-                       if tag_id not in present]
-            if not missing:
-                rospy.loginfo('Left-to-right tag order: %s', order)
-                return order
+                message, remaining_tags, self.args.min_confidence)
+            if order:
+                rospy.loginfo(
+                    'Visible remaining tags left-to-right: %s. Next ID%d.',
+                    order, order[0])
+                return order[0]
             rospy.logwarn_throttle(
                 2.0,
-                'Waiting for all requested tags before freezing order. visible=%s missing=%s',
-                order, missing)
+                'Waiting for at least one remaining requested tag. remaining=%s',
+                remaining_tags)
             rate.sleep()
-        if best_order:
-            rospy.logwarn(
-                'Only these requested tags were visible before timeout: %s. Missing: %s.',
-                best_order, missing)
-            return best_order
-        raise RuntimeError('No requested tag IDs are visible for left-to-right ordering.')
+        raise RuntimeError(
+            'No remaining requested tag IDs are visible for left-to-right ordering: %s.'
+            % remaining_tags)
 
     def align_tag(self, tag_id):
         stable = 0
@@ -405,7 +434,7 @@ class ChassisAlignPickSequence(object):
             return
         command = build_pick_command(self.args, tag_id)
         rospy.loginfo('Starting taught pick for ID%d.', tag_id)
-        subprocess.check_call(command)
+        return run_pick_command(command, tag_id)
 
     def run_startup_home(self, tag_id):
         if (self.args.align_only or self.args.dry_run or
@@ -479,20 +508,30 @@ class ChassisAlignPickSequence(object):
 
     def run(self):
         try:
-            order = self.resolve_order()
-            total = len(order)
-            for index, tag_id in enumerate(order, start=1):
+            remaining_tags = list(self.args.sequence)
+            total = len(remaining_tags)
+            processed = 0
+            while remaining_tags:
+                tag_id = self.select_next_tag(remaining_tags)
+                processed += 1
                 rospy.loginfo('Aligning ID%d into target ROI.', tag_id)
                 self.align_tag(tag_id)
                 needs_pick_tf = not self.args.align_only and not self.args.dry_run
                 if needs_pick_tf and not self.wait_for_tag_tf_before_pick(tag_id):
-                    if self.args.wait_key_between_tags and index < total:
-                        self.wait_between_tags(tag_id, index, total)
+                    remaining_tags.remove(tag_id)
+                    if self.args.wait_key_between_tags and processed < total:
+                        self.wait_between_tags(tag_id, processed, total)
                     continue
-                self.run_pick(tag_id)
+                pick_completed = self.run_pick(tag_id)
+                if pick_completed is False:
+                    remaining_tags.remove(tag_id)
+                    if self.args.wait_key_between_tags and processed < total:
+                        self.wait_between_tags(tag_id, processed, total)
+                    continue
                 self.run_startup_home(tag_id)
-                if self.args.wait_key_between_tags and index < total:
-                    self.wait_between_tags(tag_id, index, total)
+                remaining_tags.remove(tag_id)
+                if self.args.wait_key_between_tags and processed < total:
+                    self.wait_between_tags(tag_id, processed, total)
         finally:
             self.stop_chassis()
 

@@ -251,7 +251,7 @@ namespace
 		double joint_values[7];
 		double cart_values[6];
 		if (!parseValues(pose_info, angle_start + 15, joint_values, 7) ||
-		    !parseValues(pose_info, cart_start + 31, cart_values, 6))
+			!parseValues(pose_info, cart_start + 31, cart_values, 6))
 		{
 			return false;
 		}
@@ -404,7 +404,7 @@ namespace
 			}
 
 			if (attempt + 1 < g_post_motion_state_attempts &&
-			    g_post_motion_state_retry_delay_seconds > 0.0)
+				g_post_motion_state_retry_delay_seconds > 0.0)
 			{
 				ros::Duration(g_post_motion_state_retry_delay_seconds).sleep();
 			}
@@ -412,7 +412,7 @@ namespace
 
 		markPoseQueryMiss();
 		ROS_WARN("Trajectory finished, but measured joint state was not updated from serial after %d attempt(s).",
-		         g_post_motion_state_attempts);
+				 g_post_motion_state_attempts);
 		return false;
 	}
 
@@ -481,8 +481,8 @@ namespace
 }
 
 void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goalPtr,
-                      Server *moveit_server,
-                      ros::Publisher *joint_pub)
+					  Server *moveit_server,
+					  ros::Publisher *joint_pub)
 {
 	if (goalPtr->trajectory.points.empty())
 	{
@@ -569,7 +569,7 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 }
 
 bool toggle_pump(mirobot_urdf_2::mirobotPump::Request &req,
-                 mirobot_urdf_2::mirobotPump::Response &res)
+				 mirobot_urdf_2::mirobotPump::Response &res)
 {
 	std::string pump_response;
 	const std::string &pump_command = req.Status ? kPumpOnCommand : kPumpOffCommand;
@@ -585,7 +585,7 @@ bool toggle_pump(mirobot_urdf_2::mirobotPump::Request &req,
 }
 
 bool trigger_startup_home(std_srvs::Trigger::Request &req,
-                          std_srvs::Trigger::Response &res)
+						  std_srvs::Trigger::Response &res)
 {
 	(void)req;
 	if (isExecutingTrajectory())
@@ -664,13 +664,13 @@ int main(int argc, char *argv[])
 	if (g_publish_joint_states)
 	{
 		joint_state_timer = nh.createTimer(
-		    ros::Duration(1.0 / g_joint_state_publish_hz),
-		    boost::bind(&measuredJointStateTimer, _1, &joint_pub));
+			ros::Duration(1.0 / g_joint_state_publish_hz),
+			boost::bind(&measuredJointStateTimer, _1, &joint_pub));
 	}
 	runStartupMotion();
 
 	Server moveit_server(nh, "mirobot_arm_controller/follow_joint_trajectory",
-	                     boost::bind(&execute_callback, _1, &moveit_server, &joint_pub), false);
+						 boost::bind(&execute_callback, _1, &moveit_server, &joint_pub), false);
 	moveit_server.start();
 	ros::ServiceServer service = nh.advertiseService("switch_pump_status", toggle_pump);
 	ros::ServiceServer startup_home_service = nh.advertiseService("mirobot_startup_home", trigger_startup_home);
