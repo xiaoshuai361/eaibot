@@ -11,16 +11,19 @@ import subprocess
 import sys
 
 import rospy
+import tf
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 
 DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_PICK_SCRIPT = '/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py'
 DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.24,1.00'
+DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
 
 try:
     STRING_TYPES = (basestring,)
@@ -165,10 +168,11 @@ def build_pick_command(args, tag_id):
         '--mode', 'run_taught_sequence',
         '--sequence', str(int(tag_id)),
         '--preset-file', args.preset_file,
+        '--base-frame', args.base_frame,
+        '--tf-timeout', str(args.tag_tf_wait_seconds),
         '--velocity-scale', str(args.pick_velocity_scale),
         '--acceleration-scale', str(args.pick_acceleration_scale),
         '--motion-settle-seconds', str(args.pick_motion_settle_seconds),
-        '--home-after-idle',
     ]
     if args.disable_replanning:
         command.append('--disable-replanning')
@@ -192,10 +196,17 @@ def parse_args(argv):
     parser.add_argument('--max-align-seconds', type=float, default=25.0)
     parser.add_argument('--control-hz', type=float, default=5.0)
     parser.add_argument('--min-confidence', type=float, default=0.1)
+    parser.add_argument('--base-frame', default='base')
+    parser.add_argument('--tag-tf-wait-seconds', type=float, default=10.0,
+                        help='Wait this long for base->tag_N TF to stabilize before picking.')
+    parser.add_argument('--tag-tf-stable-frames', type=int, default=3,
+                        help='Required consecutive successful TF reads before picking.')
     parser.add_argument('--target-right-motion', choices=['forward', 'backward'],
                         default='forward')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--align-only', action='store_true')
+    parser.add_argument('--wait-key-between-tags', action='store_true',
+                        help='After each tag is aligned and handled, wait for Enter before continuing.')
     parser.add_argument('--python2', default=sys.executable)
     parser.add_argument('--pick-script', default=DEFAULT_PICK_SCRIPT)
     parser.add_argument('--preset-file', default=DEFAULT_PRESET_FILE)
@@ -203,6 +214,13 @@ def parse_args(argv):
     parser.add_argument('--pick-acceleration-scale', type=float, default=0.1)
     parser.add_argument('--pick-motion-settle-seconds', type=float, default=0.25)
     parser.add_argument('--disable-replanning', action='store_true')
+    parser.add_argument('--startup-home-service', default=DEFAULT_STARTUP_HOME_SERVICE,
+                        help='Trigger service that sends the same $H homing command as mirobot.launch startup.')
+    parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
+    parser.add_argument('--startup-home-settle-seconds', type=float, default=3.0,
+                        help='Wait after startup homing before the next chassis/tag step.')
+    parser.add_argument('--skip-startup-home', action='store_true',
+                        help='Skip controller startup homing after each successful pick.')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     args.target_roi_ratio = parse_roi_ratio(args.target_roi_ratio)
@@ -216,6 +234,14 @@ def parse_args(argv):
         raise RuntimeError('--max-align-seconds must be positive.')
     if args.control_hz <= 0.0:
         raise RuntimeError('--control-hz must be positive.')
+    if args.tag_tf_wait_seconds < 0.0:
+        raise RuntimeError('--tag-tf-wait-seconds must be non-negative.')
+    if args.tag_tf_stable_frames <= 0:
+        raise RuntimeError('--tag-tf-stable-frames must be positive.')
+    if args.startup_home_wait_seconds <= 0.0:
+        raise RuntimeError('--startup-home-wait-seconds must be positive.')
+    if args.startup_home_settle_seconds < 0.0:
+        raise RuntimeError('--startup-home-settle-seconds must be non-negative.')
     return args
 
 
@@ -238,6 +264,9 @@ class ChassisAlignPickSequence(object):
             args.detections_topic, String, self.detections_callback, queue_size=1)
         self.image_sub = rospy.Subscriber(
             args.debug_image_input_topic, Image, self.image_callback, queue_size=1)
+        self.tf_listener = None
+        if not args.align_only and not args.dry_run:
+            self.tf_listener = tf.TransformListener()
 
     def detections_callback(self, message):
         try:
@@ -293,13 +322,37 @@ class ChassisAlignPickSequence(object):
     def resolve_order(self):
         if self.args.order == 'sequence':
             return list(self.args.sequence)
-        message = self.wait_for_detections(self.args.max_align_seconds)
-        order = left_to_right_order(
-            message, self.args.sequence, self.args.min_confidence)
-        if not order:
-            raise RuntimeError('No requested tag IDs are visible for left-to-right ordering.')
-        rospy.loginfo('Left-to-right tag order: %s', order)
-        return order
+        deadline = rospy.Time.now() + rospy.Duration(self.args.max_align_seconds)
+        rate = rospy.Rate(self.args.control_hz)
+        best_order = []
+        missing = list(self.args.sequence)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            try:
+                message = self.wait_for_detections(0.3)
+            except RuntimeError:
+                rate.sleep()
+                continue
+            order = left_to_right_order(
+                message, self.args.sequence, self.args.min_confidence)
+            if len(order) > len(best_order):
+                best_order = order
+            present = set(order)
+            missing = [tag_id for tag_id in self.args.sequence
+                       if tag_id not in present]
+            if not missing:
+                rospy.loginfo('Left-to-right tag order: %s', order)
+                return order
+            rospy.logwarn_throttle(
+                2.0,
+                'Waiting for all requested tags before freezing order. visible=%s missing=%s',
+                order, missing)
+            rate.sleep()
+        if best_order:
+            rospy.logwarn(
+                'Only these requested tags were visible before timeout: %s. Missing: %s.',
+                best_order, missing)
+            return best_order
+        raise RuntimeError('No requested tag IDs are visible for left-to-right ordering.')
 
     def align_tag(self, tag_id):
         stable = 0
@@ -354,13 +407,92 @@ class ChassisAlignPickSequence(object):
         rospy.loginfo('Starting taught pick for ID%d.', tag_id)
         subprocess.check_call(command)
 
+    def run_startup_home(self, tag_id):
+        if (self.args.align_only or self.args.dry_run or
+                getattr(self.args, 'skip_startup_home', False)):
+            return
+        rospy.loginfo(
+            'Running startup homing after ID%d through %s.',
+            tag_id, self.args.startup_home_service)
+        rospy.wait_for_service(
+            self.args.startup_home_service,
+            timeout=self.args.startup_home_wait_seconds)
+        response = rospy.ServiceProxy(self.args.startup_home_service, Trigger)()
+        if not response.success:
+            raise RuntimeError(
+                'Startup homing service failed after ID%d: %s'
+                % (tag_id, response.message))
+        rospy.sleep(self.args.startup_home_settle_seconds)
+
+    def tag_tf_is_available(self, tag_id):
+        if self.tf_listener is None:
+            self.tf_listener = tf.TransformListener()
+        tag_frame = 'tag_%d' % int(tag_id)
+        try:
+            now = rospy.Time(0)
+            self.tf_listener.waitForTransform(
+                self.args.base_frame, tag_frame, now, rospy.Duration(0.1))
+            self.tf_listener.lookupTransform(self.args.base_frame, tag_frame, now)
+            return True
+        except (tf.Exception, tf.LookupException, tf.ConnectivityException,
+                tf.ExtrapolationException):
+            return False
+
+    def wait_for_tag_tf_before_pick(self, tag_id):
+        if self.args.align_only or self.args.dry_run:
+            return True
+        if self.args.tag_tf_wait_seconds <= 0.0:
+            return True
+        stable = 0
+        deadline = rospy.Time.now() + rospy.Duration(self.args.tag_tf_wait_seconds)
+        rate = rospy.Rate(self.args.control_hz)
+        rospy.loginfo(
+            'Waiting up to %.1fs for tag_%d TF to stabilize before pick.',
+            self.args.tag_tf_wait_seconds, tag_id)
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if self.tag_tf_is_available(tag_id):
+                stable += 1
+                if stable >= self.args.tag_tf_stable_frames:
+                    rospy.loginfo(
+                        'tag_%d TF is stable for %d consecutive reads.',
+                        tag_id, stable)
+                    return True
+            else:
+                stable = 0
+            rate.sleep()
+        self.stop_chassis()
+        rospy.logwarn(
+            'Skipping ID%d because tag_%d TF did not stabilize within %.1fs.',
+            tag_id, tag_id, self.args.tag_tf_wait_seconds)
+        return False
+
+    def wait_between_tags(self, tag_id, index, total):
+        self.stop_chassis()
+        print('')
+        print('ID%d 已完成对准/处理（%d/%d）。' % (tag_id, index, total))
+        print('请确认现场状态，把下一个 tag 准备好后按 Enter 继续；输入 q 再回车退出。')
+        if hasattr(sys.stdout, 'flush'):
+            sys.stdout.flush()
+        line = sys.stdin.readline()
+        if line.strip().lower() in ('q', 'quit', 'exit'):
+            raise RuntimeError('User aborted after ID%d.' % tag_id)
+
     def run(self):
         try:
             order = self.resolve_order()
-            for tag_id in order:
+            total = len(order)
+            for index, tag_id in enumerate(order, start=1):
                 rospy.loginfo('Aligning ID%d into target ROI.', tag_id)
                 self.align_tag(tag_id)
+                needs_pick_tf = not self.args.align_only and not self.args.dry_run
+                if needs_pick_tf and not self.wait_for_tag_tf_before_pick(tag_id):
+                    if self.args.wait_key_between_tags and index < total:
+                        self.wait_between_tags(tag_id, index, total)
+                    continue
                 self.run_pick(tag_id)
+                self.run_startup_home(tag_id)
+                if self.args.wait_key_between_tags and index < total:
+                    self.wait_between_tags(tag_id, index, total)
         finally:
             self.stop_chassis()
 

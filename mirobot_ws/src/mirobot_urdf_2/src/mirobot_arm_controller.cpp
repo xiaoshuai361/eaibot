@@ -8,6 +8,7 @@
 #include <std_msgs/Empty.h>
 #include <std_msgs/UInt16.h>
 #include <std_msgs/Float32.h>
+#include <std_srvs/Trigger.h>
 #include <moveit_msgs/RobotTrajectory.h>
 #include <mirobot_urdf_2/mirobotPump.h>
 #include <sensor_msgs/JointState.h>
@@ -379,6 +380,12 @@ namespace
 		g_next_pose_query_time = ros::Time(0);
 	}
 
+	void forgetLastMeasuredPose()
+	{
+		boost::mutex::scoped_lock lock(g_last_measured_pose_mutex);
+		g_have_last_measured_pose = false;
+	}
+
 	bool waitForMeasuredJointState(const ros::Publisher &joint_pub)
 	{
 		if (!g_publish_joint_states)
@@ -459,6 +466,7 @@ namespace
 		{
 			ROS_INFO_STREAM("Auto homing on startup is enabled.");
 			_serial.write("$H\n");
+			forgetLastMeasuredPose();
 		}
 		else if (g_move_to_zero_pose_on_start)
 		{
@@ -576,6 +584,33 @@ bool toggle_pump(mirobot_urdf_2::mirobotPump::Request &req,
 	return true;
 }
 
+bool trigger_startup_home(std_srvs::Trigger::Request &req,
+                          std_srvs::Trigger::Response &res)
+{
+	(void)req;
+	if (isExecutingTrajectory())
+	{
+		res.success = false;
+		res.message = "Arm is executing a trajectory; startup homing was not sent.";
+		return true;
+	}
+
+	boost::mutex::scoped_lock lock(g_arm_serial_mutex);
+	if (!ensureSerialOpen())
+	{
+		res.success = false;
+		res.message = "Could not open arm serial port.";
+		return true;
+	}
+
+	ROS_INFO_STREAM("Startup homing service requested.");
+	_serial.write("$H\n");
+	forgetLastMeasuredPose();
+	res.success = true;
+	res.message = "Sent startup homing command $H.";
+	return true;
+}
+
 int main(int argc, char *argv[])
 {
 	ros::init(argc, argv, "moveit_action_server");
@@ -638,6 +673,7 @@ int main(int argc, char *argv[])
 	                     boost::bind(&execute_callback, _1, &moveit_server, &joint_pub), false);
 	moveit_server.start();
 	ros::ServiceServer service = nh.advertiseService("switch_pump_status", toggle_pump);
+	ros::ServiceServer startup_home_service = nh.advertiseService("mirobot_startup_home", trigger_startup_home);
 
 	ros::AsyncSpinner spinner(2);
 	spinner.start();

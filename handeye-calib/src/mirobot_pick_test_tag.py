@@ -37,6 +37,7 @@ POSE_DONE_POSITION_TOLERANCE = 0.015
 POSE_DONE_ORIENTATION_TOLERANCE_RAD = 0.35
 PLACE_ALIGN_JOINT_TOLERANCE = 0.03
 DEFAULT_GRASP_ALIGN_JOINTS = '6'
+DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
 MOTION_SETTLE_SECONDS = DEFAULT_MOTION_SETTLE_SECONDS
 
 try:
@@ -159,7 +160,11 @@ def parse_args(argv):
     parser.add_argument('--motion-settle-seconds', type=float,
                         default=DEFAULT_MOTION_SETTLE_SECONDS)
     parser.add_argument('--home-after-idle', action='store_true',
-                        help='After each successful tag, move to taught idle first and then MoveIt named target home.')
+                        help='After each successful tag, move to taught idle first and then run the controller startup homing service.')
+    parser.add_argument('--startup-home-service',
+                        default=DEFAULT_STARTUP_HOME_SERVICE)
+    parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
+    parser.add_argument('--startup-home-settle-seconds', type=float, default=3.0)
     parser.add_argument('--grasp-align-joints',
                         default=DEFAULT_GRASP_ALIGN_JOINTS,
                         help='Comma separated 1-based joint indices to align to taught grasp values before moving to pre-grasp. Default 6. Use 0 to disable.')
@@ -174,6 +179,9 @@ def parse_args(argv):
     _positive(args.assist_front_gap, '--assist-front-gap')
     _nonnegative(args.teach_settle_seconds, '--teach-settle-seconds')
     _nonnegative(args.motion_settle_seconds, '--motion-settle-seconds')
+    _positive(args.startup_home_wait_seconds, '--startup-home-wait-seconds')
+    _nonnegative(args.startup_home_settle_seconds,
+                 '--startup-home-settle-seconds')
     args.assist_orientation_xyzw = parse_quaternion_text(
         args.assist_orientation_xyzw, '--assist-orientation-xyzw')
     if args.debug_hold_seconds < 0.0:
@@ -705,6 +713,29 @@ def get_pump_proxy():
     return rospy.ServiceProxy('switch_pump_status', get_mirobot_pump_type())
 
 
+def get_startup_home_type():
+    try:
+        from std_srvs.srv import Trigger
+        return Trigger
+    except ImportError:
+        raise RuntimeError(
+            'std_srvs/Trigger is unavailable. Source the ROS workspaces first.')
+
+
+def run_startup_home(args):
+    service_name = getattr(
+        args, 'startup_home_service', DEFAULT_STARTUP_HOME_SERVICE)
+    wait_seconds = getattr(args, 'startup_home_wait_seconds', 8.0)
+    settle_seconds = getattr(args, 'startup_home_settle_seconds', 3.0)
+    rospy.loginfo('Running startup homing through %s.', service_name)
+    rospy.wait_for_service(service_name, timeout=wait_seconds)
+    response = rospy.ServiceProxy(service_name, get_startup_home_type())()
+    if not response.success:
+        raise RuntimeError(
+            'Startup homing service failed: %s' % response.message)
+    rospy.sleep(settle_seconds)
+
+
 def set_pump(pump_proxy, enabled):
     rospy.loginfo('Pump %s', 'ON' if enabled else 'OFF')
     response = pump_proxy(enabled)
@@ -881,25 +912,6 @@ def execute_joint_values(arm, joint_values, label):
     for attempt in range(2):
         arm.set_start_state_to_current_state()
         arm.set_joint_value_target(target_values)
-        success = arm.go(wait=True)
-        arm.stop()
-        arm.clear_pose_targets()
-        if success:
-            settle_after_motion()
-            return
-        if attempt == 0:
-            rospy.logwarn(
-                'MoveIt failed during %s. Waiting for joint state to settle and retrying once.',
-                label)
-            rospy.sleep(0.5)
-    raise RuntimeError('MoveIt failed during %s.' % label)
-
-
-def execute_named_target(arm, target_name, label):
-    rospy.loginfo('Executing %s named_target=%s', label, target_name)
-    for attempt in range(2):
-        arm.set_start_state_to_current_state()
-        arm.set_named_target(target_name)
         success = arm.go(wait=True)
         arm.stop()
         arm.clear_pose_targets()
@@ -1184,8 +1196,7 @@ def run_taught_sequence(args, arm, pump_proxy):
                 execute_joint_values(arm, preset['idle_joint_values'], 'idle')
                 rospy.sleep(0.5)
             if args.home_after_idle:
-                execute_named_target(arm, 'home', 'home')
-                rospy.sleep(0.5)
+                run_startup_home(args)
         except Exception:
             if holding_object:
                 try:

@@ -926,7 +926,7 @@ def test_run_taught_sequence_turns_pump_off_if_failure_happens_after_pickup():
     assert pump_events == [True, False]
 
 
-def test_run_taught_sequence_can_home_after_idle_when_requested():
+def test_run_taught_sequence_can_run_startup_home_after_idle_when_requested():
     run_taught_sequence, = load_module_symbols("run_taught_sequence")
     args = SimpleNamespace(
         sequence=[1],
@@ -965,7 +965,7 @@ def test_run_taught_sequence_can_home_after_idle_when_requested():
         "execute_pose": lambda *items: events.append("pose"),
         "execute_cartesian_pose": lambda *items, **kwargs: events.append("cartesian"),
         "execute_joint_values": lambda arm, values, label: events.append(label),
-        "execute_named_target": lambda arm, name, label: events.append((label, name)),
+        "run_startup_home": lambda args: events.append("startup_home"),
         "set_pump": lambda *items: events.append("pump"),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
         "rospy": SimpleNamespace(
@@ -978,8 +978,8 @@ def test_run_taught_sequence_can_home_after_idle_when_requested():
     run_taught_sequence(args, object(), object())
 
     assert "idle" in events
-    assert ("home", "home") in events
-    assert events.index("idle") < events.index(("home", "home"))
+    assert "startup_home" in events
+    assert events.index("idle") < events.index("startup_home")
 
 
 def test_source_contract_removes_old_tuning_modes_and_parameters():

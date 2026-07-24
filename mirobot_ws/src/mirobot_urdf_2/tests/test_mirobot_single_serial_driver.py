@@ -91,3 +91,12 @@ def test_controller_retries_post_motion_measured_state_before_reporting_success(
     assert '<arg name="post_motion_state_retry_delay_seconds" default="0.20" />' in launch
     assert '<param name="post_motion_state_attempts" value="$(arg post_motion_state_attempts)" />' in launch
     assert '<param name="post_motion_state_retry_delay_seconds" value="$(arg post_motion_state_retry_delay_seconds)" />' in launch
+
+
+def test_controller_exposes_startup_homing_service_that_sends_grbl_home():
+    source = CONTROLLER.read_text()
+
+    assert "#include <std_srvs/Trigger.h>" in source
+    assert "trigger_startup_home" in source
+    assert 'nh.advertiseService("mirobot_startup_home", trigger_startup_home)' in source
+    assert '_serial.write("$H\\n")' in source
