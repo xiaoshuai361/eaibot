@@ -23,6 +23,13 @@ DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_PICK_SCRIPT = '/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py'
 DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.24,1.00'
+DEFAULT_TARGET_Y_RATIO_RANGE = '0.25,0.75'
+DEFAULT_BOX_WIDTH_RATIO_RANGE = '0.03,0.15'
+DEFAULT_BOX_HEIGHT_RATIO_RANGE = '0.04,0.20'
+DEFAULT_BOX_ASPECT_RATIO_RANGE = '0.60,1.60'
+DEFAULT_TAG_WORKSPACE_X_RANGE = '0.15,0.32'
+DEFAULT_TAG_WORKSPACE_Y_RANGE = '0.03,0.20'
+DEFAULT_TAG_WORKSPACE_Z_RANGE = '0.07,0.16'
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
 
 try:
@@ -83,6 +90,18 @@ def parse_roi_ratio(text):
     return values
 
 
+def parse_range(text, option):
+    if not isinstance(text, STRING_TYPES):
+        raise RuntimeError('%s must be min,max.' % option)
+    parts = [part.strip() for part in text.split(',')]
+    if len(parts) != 2:
+        raise RuntimeError('%s must be min,max.' % option)
+    values = [finite(part, option) for part in parts]
+    if values[0] < 0.0 or values[1] <= values[0]:
+        raise RuntimeError('%s must satisfy 0 <= min < max.' % option)
+    return values
+
+
 def roi_ratio_to_pixels(ratio, image_width, image_height):
     if len(ratio) != 4:
         raise RuntimeError('target ROI must contain four values.')
@@ -110,6 +129,85 @@ def normalize_box(box):
 def box_center_x(box):
     values = normalize_box(box)
     return (values[0] + values[2]) / 2.0
+
+
+def inference_key(message):
+    if not isinstance(message, dict):
+        return None
+    stamp = message.get('inference_stamp') or {}
+    try:
+        return (
+            int(message.get('inference_seq')),
+            int(stamp.get('secs')),
+            int(stamp.get('nsecs')),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def update_alignment_stability(stable, last_key, message, aligned):
+    if not isinstance(message, dict):
+        return stable, last_key, False
+    key = inference_key(message)
+    if (not message.get('refresh_yolo') or
+            key is None or key == last_key):
+        return stable, last_key, False
+    return (stable + 1 if aligned else 0), key, True
+
+
+def inference_age_seconds(message, now_seconds):
+    stamp = message.get('inference_stamp') if isinstance(message, dict) else None
+    if not isinstance(stamp, dict):
+        return float('inf')
+    try:
+        stamp_seconds = (
+            float(stamp.get('secs')) +
+            float(stamp.get('nsecs')) * 1e-9)
+    except (TypeError, ValueError):
+        return float('inf')
+    return max(0.0, float(now_seconds) - stamp_seconds)
+
+
+def ros_time_to_seconds(stamp):
+    if hasattr(stamp, 'to_sec'):
+        return float(stamp.to_sec())
+    return float(getattr(stamp, 'seconds'))
+
+
+def validate_detection_geometry(detection, message, args):
+    box = normalize_box(detection.get('box'))
+    width = finite(message.get('image_width'), 'image_width')
+    height = finite(message.get('image_height'), 'image_height')
+    box_width = box[2] - box[0]
+    box_height = box[3] - box[1]
+    metrics = {
+        'center_y_ratio': ((box[1] + box[3]) / 2.0) / height,
+        'width_ratio': box_width / width,
+        'height_ratio': box_height / height,
+        'aspect_ratio': box_width / box_height,
+    }
+    checks = [
+        ('center_y_ratio', args.target_y_ratio_range),
+        ('width_ratio', args.box_width_ratio_range),
+        ('height_ratio', args.box_height_ratio_range),
+        ('aspect_ratio', args.box_aspect_ratio_range),
+    ]
+    for name, allowed in checks:
+        if not (float(allowed[0]) <= metrics[name] <= float(allowed[1])):
+            return False, (
+                '%s %.3f outside [%.3f, %.3f]'
+                % (name, metrics[name], allowed[0], allowed[1])), metrics
+    return True, '', metrics
+
+
+def position_within_workspace(position, x_range, y_range, z_range):
+    for name, value, allowed in zip(
+            ('x', 'y', 'z'), position, (x_range, y_range, z_range)):
+        if not (float(allowed[0]) <= float(value) <= float(allowed[1])):
+            return False, (
+                'Tag %s %.4f outside [%.4f, %.4f]'
+                % (name, value, allowed[0], allowed[1]))
+    return True, ''
 
 
 def select_detection_for_tag(message, tag_id, min_confidence):
@@ -224,6 +322,16 @@ def parse_args(argv):
     parser.add_argument('--debug-image-input-topic', default='/tag_detections_image')
     parser.add_argument('--debug-image-topic', default='/tag_chassis_align/debug_image')
     parser.add_argument('--target-roi-ratio', default=DEFAULT_TARGET_ROI_RATIO)
+    parser.add_argument('--target-y-ratio-range',
+                        default=DEFAULT_TARGET_Y_RATIO_RANGE)
+    parser.add_argument('--box-width-ratio-range',
+                        default=DEFAULT_BOX_WIDTH_RATIO_RANGE)
+    parser.add_argument('--box-height-ratio-range',
+                        default=DEFAULT_BOX_HEIGHT_RATIO_RANGE)
+    parser.add_argument('--box-aspect-ratio-range',
+                        default=DEFAULT_BOX_ASPECT_RATIO_RANGE)
+    parser.add_argument('--max-detection-age-seconds', type=float, default=1.5)
+    parser.add_argument('--chassis-settle-seconds', type=float, default=0.8)
     parser.add_argument('--drive-speed', type=float, default=0.02)
     parser.add_argument('--align-tolerance-px', type=float, default=12.0)
     parser.add_argument('--stable-frames', type=int, default=2)
@@ -235,6 +343,14 @@ def parse_args(argv):
                         help='Wait this long for base->tag_N TF to stabilize before picking.')
     parser.add_argument('--tag-tf-stable-frames', type=int, default=3,
                         help='Required consecutive successful TF reads before picking.')
+    parser.add_argument('--tag-tf-max-range-m', type=float, default=0.005,
+                        help='Maximum xyz range across fresh TF gate samples.')
+    parser.add_argument('--tag-workspace-x-range',
+                        default=DEFAULT_TAG_WORKSPACE_X_RANGE)
+    parser.add_argument('--tag-workspace-y-range',
+                        default=DEFAULT_TAG_WORKSPACE_Y_RANGE)
+    parser.add_argument('--tag-workspace-z-range',
+                        default=DEFAULT_TAG_WORKSPACE_Z_RANGE)
     parser.add_argument('--target-right-motion', choices=['forward', 'backward'],
                         default='forward')
     parser.add_argument('--dry-run', action='store_true')
@@ -258,6 +374,20 @@ def parse_args(argv):
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     args.target_roi_ratio = parse_roi_ratio(args.target_roi_ratio)
+    args.target_y_ratio_range = parse_range(
+        args.target_y_ratio_range, '--target-y-ratio-range')
+    args.box_width_ratio_range = parse_range(
+        args.box_width_ratio_range, '--box-width-ratio-range')
+    args.box_height_ratio_range = parse_range(
+        args.box_height_ratio_range, '--box-height-ratio-range')
+    args.box_aspect_ratio_range = parse_range(
+        args.box_aspect_ratio_range, '--box-aspect-ratio-range')
+    args.tag_workspace_x_range = parse_range(
+        args.tag_workspace_x_range, '--tag-workspace-x-range')
+    args.tag_workspace_y_range = parse_range(
+        args.tag_workspace_y_range, '--tag-workspace-y-range')
+    args.tag_workspace_z_range = parse_range(
+        args.tag_workspace_z_range, '--tag-workspace-z-range')
     if args.drive_speed <= 0.0:
         raise RuntimeError('--drive-speed must be positive.')
     if args.align_tolerance_px < 0.0:
@@ -268,10 +398,16 @@ def parse_args(argv):
         raise RuntimeError('--max-align-seconds must be positive.')
     if args.control_hz <= 0.0:
         raise RuntimeError('--control-hz must be positive.')
+    if args.max_detection_age_seconds <= 0.0:
+        raise RuntimeError('--max-detection-age-seconds must be positive.')
+    if args.chassis_settle_seconds < 0.0:
+        raise RuntimeError('--chassis-settle-seconds must be non-negative.')
     if args.tag_tf_wait_seconds < 0.0:
         raise RuntimeError('--tag-tf-wait-seconds must be non-negative.')
     if args.tag_tf_stable_frames <= 0:
         raise RuntimeError('--tag-tf-stable-frames must be positive.')
+    if args.tag_tf_max_range_m <= 0.0:
+        raise RuntimeError('--tag-tf-max-range-m must be positive.')
     if args.startup_home_wait_seconds <= 0.0:
         raise RuntimeError('--startup-home-wait-seconds must be positive.')
     if args.startup_home_settle_seconds < 0.0:
@@ -318,6 +454,14 @@ class ChassisAlignPickSequence(object):
             roi = roi_ratio_to_pixels(self.args.target_roi_ratio, width, height)
             x1, y1, x2, y2 = [int(round(value)) for value in roi]
             cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            gate_y1 = int(round(
+                self.args.target_y_ratio_range[0] * height))
+            gate_y2 = int(round(
+                self.args.target_y_ratio_range[1] * height))
+            cv2.line(image, (0, gate_y1), (width - 1, gate_y1),
+                     (0, 255, 255), 1)
+            cv2.line(image, (0, gate_y2), (width - 1, gate_y2),
+                     (0, 255, 255), 1)
             for detection in self.latest_detections.get('detections', []):
                 box = normalize_box(detection.get('box'))
                 bx1, by1, bx2, by2 = [int(round(value)) for value in box]
@@ -385,6 +529,8 @@ class ChassisAlignPickSequence(object):
 
     def align_tag(self, tag_id):
         stable = 0
+        last_inference_key = None
+        confirmation_required = False
         deadline = rospy.Time.now() + rospy.Duration(self.args.max_align_seconds)
         rate = rospy.Rate(self.args.control_hz)
         target_right_forward = self.args.target_right_motion == 'forward'
@@ -392,6 +538,18 @@ class ChassisAlignPickSequence(object):
             message = self.latest_detections
             if message is None:
                 self.publish_velocity(0.0)
+                rate.sleep()
+                continue
+            age = inference_age_seconds(
+                message, ros_time_to_seconds(rospy.Time.now()))
+            if age > self.args.max_detection_age_seconds:
+                stable = 0
+                confirmation_required = False
+                self.publish_velocity(0.0)
+                rospy.logwarn_throttle(
+                    2.0,
+                    'Stopping chassis: latest YOLO inference is %.2fs old.',
+                    age)
                 rate.sleep()
                 continue
             detection = select_detection_for_tag(
@@ -403,6 +561,19 @@ class ChassisAlignPickSequence(object):
                     2.0, 'Waiting for YOLO ID%d before chassis alignment.', tag_id)
                 rate.sleep()
                 continue
+            geometry_ok, geometry_reason, metrics = (
+                validate_detection_geometry(
+                    detection, message, self.args))
+            if not geometry_ok:
+                stable = 0
+                confirmation_required = False
+                self.publish_velocity(0.0)
+                rospy.logwarn_throttle(
+                    2.0,
+                    'ID%d rejected by distance/height gate: %s',
+                    tag_id, geometry_reason)
+                rate.sleep()
+                continue
             roi = roi_ratio_to_pixels(
                 self.args.target_roi_ratio,
                 message.get('image_width'),
@@ -410,17 +581,36 @@ class ChassisAlignPickSequence(object):
             result = compute_drive_command(
                 detection, roi, self.args.drive_speed,
                 self.args.align_tolerance_px, target_right_forward)
+            next_stable, next_key, accepted = update_alignment_stability(
+                stable, last_inference_key, message, result.aligned)
+            if not accepted:
+                rate.sleep()
+                continue
+            stable = next_stable
+            last_inference_key = next_key
             self.publish_velocity(result.linear_x)
             if result.aligned:
-                stable += 1
+                if confirmation_required:
+                    self.stop_chassis()
+                    rospy.loginfo(
+                        'ID%d alignment confirmed after chassis settle. '
+                        'center_x=%.1f y_ratio=%.3f width_ratio=%.3f',
+                        tag_id, result.center_x,
+                        metrics['center_y_ratio'],
+                        metrics['width_ratio'])
+                    return
                 if stable >= self.args.stable_frames:
                     self.stop_chassis()
                     rospy.loginfo(
-                        'ID%d aligned in target ROI. center_x=%.1f range=[%.1f, %.1f]',
-                        tag_id, result.center_x, result.left, result.right)
-                    return
+                        'ID%d entered target ROI; waiting %.2fs for chassis settle '
+                        'and one new YOLO inference.',
+                        tag_id, self.args.chassis_settle_seconds)
+                    rospy.sleep(self.args.chassis_settle_seconds)
+                    stable = 0
+                    confirmation_required = True
             else:
                 stable = 0
+                confirmation_required = False
             rate.sleep()
         self.stop_chassis()
         raise RuntimeError('Timed out aligning ID%d into target ROI.' % tag_id)
@@ -453,41 +643,70 @@ class ChassisAlignPickSequence(object):
                 % (tag_id, response.message))
         rospy.sleep(self.args.startup_home_settle_seconds)
 
-    def tag_tf_is_available(self, tag_id):
+    def read_tag_tf_sample(self, tag_id):
         if self.tf_listener is None:
             self.tf_listener = tf.TransformListener()
         tag_frame = 'tag_%d' % int(tag_id)
         try:
-            now = rospy.Time(0)
-            self.tf_listener.waitForTransform(
-                self.args.base_frame, tag_frame, now, rospy.Duration(0.1))
-            self.tf_listener.lookupTransform(self.args.base_frame, tag_frame, now)
-            return True
+            common_time = self.tf_listener.getLatestCommonTime(
+                self.args.base_frame, tag_frame)
+            translation, _ = self.tf_listener.lookupTransform(
+                self.args.base_frame, tag_frame, common_time)
+            return int(common_time.to_nsec()), [
+                float(value) for value in translation
+            ]
         except (tf.Exception, tf.LookupException, tf.ConnectivityException,
                 tf.ExtrapolationException):
-            return False
+            return None
+
+    def tag_tf_is_available(self, tag_id):
+        return self.read_tag_tf_sample(tag_id) is not None
 
     def wait_for_tag_tf_before_pick(self, tag_id):
         if self.args.align_only or self.args.dry_run:
             return True
         if self.args.tag_tf_wait_seconds <= 0.0:
             return True
-        stable = 0
+        samples = []
+        seen_stamps = set()
         deadline = rospy.Time.now() + rospy.Duration(self.args.tag_tf_wait_seconds)
         rate = rospy.Rate(self.args.control_hz)
         rospy.loginfo(
             'Waiting up to %.1fs for tag_%d TF to stabilize before pick.',
             self.args.tag_tf_wait_seconds, tag_id)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            if self.tag_tf_is_available(tag_id):
-                stable += 1
-                if stable >= self.args.tag_tf_stable_frames:
+            sample = self.read_tag_tf_sample(tag_id)
+            if sample is not None and sample[0] not in seen_stamps:
+                stamp_ns, position = sample
+                workspace_ok, reason = position_within_workspace(
+                    position,
+                    self.args.tag_workspace_x_range,
+                    self.args.tag_workspace_y_range,
+                    self.args.tag_workspace_z_range)
+                if not workspace_ok:
+                    self.stop_chassis()
+                    rospy.logwarn(
+                        'Skipping ID%d outside calibrated pickup workspace: %s',
+                        tag_id, reason)
+                    return False
+                seen_stamps.add(stamp_ns)
+                samples.append(position)
+                samples = samples[-self.args.tag_tf_stable_frames:]
+                if len(samples) >= self.args.tag_tf_stable_frames:
+                    axes = list(zip(*samples))
+                    ranges = [max(axis) - min(axis) for axis in axes]
+                    if max(ranges) > self.args.tag_tf_max_range_m:
+                        rospy.logwarn_throttle(
+                            2.0,
+                            'tag_%d TF range is unstable: %s m',
+                            tag_id, [round(value, 5) for value in ranges])
+                        rate.sleep()
+                        continue
                     rospy.loginfo(
-                        'tag_%d TF is stable for %d consecutive reads.',
-                        tag_id, stable)
+                        'tag_%d TF gate passed with %d unique frames; range_mm=%s.',
+                        tag_id, len(samples),
+                        [round(value * 1000.0, 2) for value in ranges])
                     return True
-            else:
-                stable = 0
             rate.sleep()
         self.stop_chassis()
         rospy.logwarn(

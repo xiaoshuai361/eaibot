@@ -144,6 +144,69 @@ def test_compute_drive_command_moves_forward_when_target_is_right_of_roi():
     assert inside.aligned is True
 
 
+def test_alignment_stability_counts_only_new_yolo_inferences():
+    update_stability, = load_symbols("update_alignment_stability")
+    first = {
+        "refresh_yolo": True,
+        "inference_seq": 10,
+        "inference_stamp": {"secs": 100, "nsecs": 0},
+    }
+    cached = {
+        "refresh_yolo": False,
+        "inference_seq": 10,
+        "inference_stamp": {"secs": 100, "nsecs": 0},
+    }
+    second = {
+        "refresh_yolo": True,
+        "inference_seq": 11,
+        "inference_stamp": {"secs": 101, "nsecs": 0},
+    }
+
+    stable, key, accepted = update_stability(0, None, first, aligned=True)
+    assert (stable, accepted) == (1, True)
+    stable, key, accepted = update_stability(stable, key, cached, aligned=True)
+    assert (stable, accepted) == (1, False)
+    stable, key, accepted = update_stability(stable, key, second, aligned=True)
+    assert (stable, accepted) == (2, True)
+
+
+def test_detection_geometry_gate_checks_y_size_and_aspect():
+    validate_geometry, = load_symbols("validate_detection_geometry")
+    args = SimpleNamespace(
+        target_y_ratio_range=[0.25, 0.75],
+        box_width_ratio_range=[0.03, 0.15],
+        box_height_ratio_range=[0.04, 0.20],
+        box_aspect_ratio_range=[0.6, 1.6],
+    )
+    message = {"image_width": 640, "image_height": 480}
+
+    valid, reason, metrics = validate_geometry(
+        {"box": [80, 180, 125, 225]}, message, args)
+    assert valid is True
+    assert reason == ""
+    assert metrics["center_y_ratio"] == pytest.approx(202.5 / 480.0)
+
+    valid, reason, _ = validate_geometry(
+        {"box": [80, 10, 125, 55]}, message, args)
+    assert valid is False
+    assert "center_y_ratio" in reason
+
+    valid, reason, _ = validate_geometry(
+        {"box": [80, 180, 90, 225]}, message, args)
+    assert valid is False
+    assert "width_ratio" in reason
+
+
+def test_tag_workspace_gate_rejects_uncalibrated_pick_area():
+    within_workspace, = load_symbols("position_within_workspace")
+    ranges = ([0.15, 0.32], [0.03, 0.20], [0.07, 0.16])
+
+    assert within_workspace([0.24, 0.10, 0.11], *ranges)[0] is True
+    valid, reason = within_workspace([0.40, 0.10, 0.11], *ranges)
+    assert valid is False
+    assert "x" in reason
+
+
 def test_left_to_right_order_sorts_available_tag_ids_by_x_center():
     left_to_right_order, = load_symbols("left_to_right_order")
     message = {
@@ -237,6 +300,16 @@ def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
         "--base-frame", "base",
         "--startup-home-service", "/mirobot_startup_home",
         "--skip-startup-home",
+        "--target-y-ratio-range", "0.25,0.75",
+        "--box-width-ratio-range", "0.03,0.15",
+        "--box-height-ratio-range", "0.04,0.20",
+        "--box-aspect-ratio-range", "0.6,1.6",
+        "--max-detection-age-seconds", "1.5",
+        "--chassis-settle-seconds", "0.8",
+        "--tag-workspace-x-range", "0.15,0.32",
+        "--tag-workspace-y-range", "0.03,0.20",
+        "--tag-workspace-z-range", "0.07,0.16",
+        "--tag-tf-max-range-m", "0.005",
     ])
 
     assert args.sequence == [1, 2]
@@ -246,6 +319,12 @@ def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
     assert args.base_frame == "base"
     assert args.startup_home_service == "/mirobot_startup_home"
     assert args.skip_startup_home is True
+    assert args.target_y_ratio_range == pytest.approx([0.25, 0.75])
+    assert args.box_width_ratio_range == pytest.approx([0.03, 0.15])
+    assert args.max_detection_age_seconds == pytest.approx(1.5)
+    assert args.chassis_settle_seconds == pytest.approx(0.8)
+    assert args.tag_workspace_x_range == pytest.approx([0.15, 0.32])
+    assert args.tag_tf_max_range_m == pytest.approx(0.005)
 
 
 def test_run_calls_controller_startup_home_after_each_successful_pick():
