@@ -139,6 +139,172 @@ class CrosswalkMisclassificationTests(unittest.TestCase):
         self.assertFalse(result["candidate"])
         self.assertEqual(len(result["stripe_polygons"]), 5)
 
+    def test_standalone_near_stopline_tracks_alignment_without_triggering_entry(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        fill_rotated_rect(binary, (320.0, 370.0), (420.0, 20.0), -3.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
+        self.assertIsNotNone(result["tracking_stop_polygon"])
+        self.assertGreaterEqual(result["tracking_confidence"], line_cy.CROSSWALK_TRACK_CONFIDENCE)
+        self.assertGreater(result["tracking_stop_bottom_y"], 0)
+
+    def test_steep_but_not_vertical_stopline_can_still_track_alignment(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        angle = max(1.0, line_cy.STOP_MAX_ANGLE_DEG - 5.0)
+        fill_rotated_rect(binary, (320.0, 370.0), (420.0, 20.0), angle)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
+        self.assertIsNotNone(result["tracking_stop_polygon"])
+        self.assertLessEqual(abs(result["tracking_stop_angle_deg"]), line_cy.STOP_MAX_ANGLE_DEG)
+
+    def test_tracking_only_stopline_does_not_get_masked_in_normal_follow(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        polygon = fill_rotated_rect(binary, (320.0, 370.0), (420.0, 20.0), -3.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        cleaned = follower.suppress_crosswalk_regions(binary, result)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
+        self.assertIsNotNone(result["tracking_stop_polygon"])
+        self.assertEqual(int(cleaned[370, 320]), 255)
+        self.assertTrue(np.any(cleaned[polygon[:, 1], polygon[:, 0]] == 255))
+
+    def test_rejected_stop_group_does_not_mask_lane_like_horizontal_edge(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        edge_polygon = fill_rotated_rect(binary, (320.0, 110.0), (390.0, 20.0), 0.0)
+        for x in [190, 255, 320, 385, 450]:
+            fill_rotated_rect(binary, (float(x), 180.0), (28.0, 100.0), 0.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        cleaned = follower.suppress_crosswalk_regions(binary, result)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
+        self.assertIsNotNone(result["tracking_stop_polygon"])
+        self.assertEqual(int(cleaned[110, 320]), 255)
+        self.assertTrue(np.any(cleaned[edge_polygon[:, 1], edge_polygon[:, 0]] == 255))
+
+    def test_curved_outer_lane_edge_is_not_tracked_as_stopline(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        points = []
+        for t in np.linspace(0.0, 1.0, 80):
+            x = 80.0 + 420.0 * t
+            y = 90.0 + 30.0 * (2.0 * t - 1.0) ** 2
+            points.append([int(round(x)), int(round(y))])
+        cv2.polylines(binary, [np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)], False, 255, 14)
+        for x in [190, 255, 320, 385, 450]:
+            fill_rotated_rect(binary, (float(x), 220.0), (28.0, 100.0), 0.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
+        self.assertIsNone(result.get("tracking_stop_polygon"))
+
+    def test_lane_lock_prevents_previous_lane_edge_from_becoming_stopline(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        fill_rotated_rect(binary, (320.0, 260.0), (390.0, 20.0), 0.0)
+        for x in [190, 255, 320, 385, 450]:
+            fill_rotated_rect(binary, (float(x), 180.0), (28.0, 100.0), 0.0)
+        lock_mask = np.zeros_like(binary)
+        cv2.line(lock_mask, (125, 260), (515, 260), 255, 35)
+
+        unlocked = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+        locked = line_cy.LineVision().detect_stopline_before_crosswalk(binary, lock_mask)
+
+        self.assertTrue(unlocked["candidate"])
+        self.assertFalse(locked["candidate"])
+        self.assertIsNone(locked["stop_polygon"])
+        self.assertIsNone(locked.get("tracking_stop_polygon"))
+
+    def test_stopline_crossing_two_locked_lane_edges_is_still_detected(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        fill_rotated_rect(binary, (320.0, 300.0), (390.0, 20.0), 0.0)
+        for x in [190, 255, 320, 385, 450]:
+            fill_rotated_rect(binary, (float(x), 210.0), (28.0, 100.0), 0.0)
+
+        lock_mask = np.zeros_like(binary)
+        cv2.line(lock_mask, (150, 430), (245, 100), 255, 70)
+        cv2.line(lock_mask, (490, 430), (395, 100), 255, 70)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary, lock_mask)
+
+        self.assertTrue(result["candidate"])
+        self.assertIsNotNone(result["stop_polygon"])
+
+    def test_stopline_connected_to_lane_edge_is_extracted_below_crosswalk(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        for x in [220, 285, 350, 415, 480]:
+            fill_rotated_rect(binary, (float(x), 175.0), (30.0, 92.0), 8.0)
+        cv2.line(binary, (145, 285), (520, 345), 255, 18)
+        cv2.line(binary, (145, 285), (25, 455), 255, 18)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        cleaned = follower.suppress_crosswalk_regions(binary, result)
+
+        self.assertTrue(result["candidate"])
+        self.assertIsNotNone(result["stop_polygon"])
+        self.assertEqual(int(cleaned[315, 330]), 0)
+
+    def test_first_visible_stripe_with_connected_stopline_triggers_early_entry(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        stripe = fill_rotated_rect(binary, (360.0, 180.0), (32.0, 100.0), 8.0)
+        cv2.line(binary, (135, 285), (525, 340), 255, 18)
+        cv2.line(binary, (135, 285), (25, 455), 255, 18)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertTrue(result["candidate"])
+        self.assertIsNotNone(result["stop_polygon"])
+        self.assertEqual(len(result["stripe_polygons"]), 1)
+        self.assertTrue(np.any(np.asarray(result["stripe_polygons"]) == stripe[0, 0]))
+
+    def test_partial_stopline_below_near_stripes_is_detected_without_crossing_group_center(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        for x in [90, 170, 470, 550]:
+            fill_rotated_rect(binary, (float(x), 190.0), (34.0, 105.0), 8.0)
+        cv2.line(binary, (405, 275), (635, 405), 255, 18)
+        cv2.line(binary, (635, 405), (620, 470), 255, 18)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertTrue(result["candidate"])
+        self.assertIsNotNone(result["stop_polygon"])
+        self.assertGreaterEqual(len(result["stripe_polygons"]), 3)
+
+    def test_three_matched_stripes_are_not_rejected_by_weighted_confidence(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        for x in [410, 470, 530]:
+            fill_rotated_rect(binary, (float(x), 190.0), (34.0, 105.0), 8.0)
+        cv2.line(binary, (350, 275), (635, 439), 255, 18)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertTrue(result["candidate"])
+        self.assertGreaterEqual(result["confidence"], line_cy.STOP_CONFIDENCE_MIN)
+        self.assertIsNotNone(result["stop_polygon"])
+
+    def test_near_vertical_lane_edge_is_not_a_stopline(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        fill_rotated_rect(binary, (310.0, 300.0), (420.0, 18.0), 82.0)
+        for x in [210, 275, 340, 405, 470]:
+            fill_rotated_rect(binary, (float(x), 210.0), (32.0, 95.0), 4.0)
+
+        result = line_cy.LineVision().detect_stopline_before_crosswalk(binary)
+
+        self.assertFalse(result["candidate"])
+        self.assertIsNone(result["stop_polygon"])
+
     def test_perspective_crosswalk_group_keeps_right_side_bars(self):
         binary = np.zeros((480, 640), dtype=np.uint8)
         bars = [
@@ -272,6 +438,55 @@ class CrosswalkMisclassificationTests(unittest.TestCase):
         self.assertEqual(valid, [left_lane, right_lane])
         self.assertIn(right_outer, ignored)
 
+    def test_outer_frame_side_lane_pair_is_not_downgraded_to_virtual_line(self):
+        vision = line_cy.LineVision()
+        entries = [
+            {"center": 360.0, "y": 360, "weight": 2.5, "kind": "dual", "left_edge": 195.0, "right_edge": 620.0,
+             "single_left": None, "single_right": None},
+            {"center": 345.0, "y": 310, "weight": 2.0, "kind": "dual", "left_edge": 205.0, "right_edge": 520.0,
+             "single_left": None, "single_right": None},
+            {"center": 365.0, "y": 260, "weight": 1.5, "kind": "dual", "left_edge": 215.0, "right_edge": 635.0,
+             "single_left": None, "single_right": None},
+        ]
+        candidates = [(item["center"], item["y"], item["weight"], item["kind"]) for item in entries]
+
+        fixed_candidates, fixed_entries = vision._fix_discontinuous_pairs(candidates, entries, 640, 320.0)
+
+        self.assertTrue(all(item["kind"] == "dual" for item in fixed_entries))
+        self.assertTrue(all(item[3] == "dual" for item in fixed_candidates))
+
+    def test_left_only_mode_ignores_other_intersection_lines(self):
+        vision = line_cy.LineVision()
+        left_lane = (85, 99, 92.0, 15)
+        branch_line = (290, 306, 298.0, 17)
+        right_line = (520, 536, 528.0, 17)
+
+        center, valid, ignored, kind, measured_width, left, right, ref_edge = vision.row_center(
+            [left_lane, branch_line, right_line], 640, 330.0, 320.0, "left_only", None
+        )
+
+        self.assertEqual(kind, "left_ref_single")
+        self.assertEqual(valid, [left_lane])
+        self.assertIn(branch_line, ignored)
+        self.assertIn(right_line, ignored)
+        self.assertAlmostEqual(center, left_lane[1] + 330.0 * line_cy.SINGLE_CENTER_FACTOR)
+
+    def test_right_only_mode_ignores_other_intersection_lines(self):
+        vision = line_cy.LineVision()
+        left_line = (70, 86, 78.0, 17)
+        branch_line = (310, 326, 318.0, 17)
+        right_lane = (545, 559, 552.0, 15)
+
+        center, valid, ignored, kind, measured_width, left, right, ref_edge = vision.row_center(
+            [left_line, branch_line, right_lane], 640, 330.0, 320.0, "right_only", None
+        )
+
+        self.assertEqual(kind, "right_ref_single")
+        self.assertEqual(valid, [right_lane])
+        self.assertIn(left_line, ignored)
+        self.assertIn(branch_line, ignored)
+        self.assertAlmostEqual(center, right_lane[0] - 330.0 * line_cy.SINGLE_CENTER_FACTOR)
+
 
 class AlignmentControlTests(unittest.TestCase):
     def test_horizontal_stopline_requires_no_rotation(self):
@@ -288,6 +503,13 @@ class AlignmentControlTests(unittest.TestCase):
         large = line_cy.alignment_angular(40.0, 0.025, 0.08, 0.35, 1.0)
         self.assertAlmostEqual(abs(small), 0.08)
         self.assertAlmostEqual(abs(large), 0.35)
+
+    def test_pid_gain_changes_smoothly_at_curve_threshold(self):
+        before = line_cy.blended_pid_gains(99, 0.0028, 0.0008, 0.03, 0.002, 100, 80)
+        after = line_cy.blended_pid_gains(100, 0.0028, 0.0008, 0.03, 0.002, 100, 80)
+
+        self.assertLess(abs(after[0] - before[0]), 0.001)
+        self.assertGreater(after[0], before[0])
 
     def test_direction_sign_can_be_reversed_on_real_vehicle(self):
         normal = line_cy.alignment_angular(8.0, 0.025, 0.08, 0.35, 1.0)
@@ -350,6 +572,111 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(mode, "normal")
         self.assertEqual(bias, 0.0)
         self.assertFalse(allow_single)
+
+    def test_strict_maneuver_locks_commanded_turn_side_after_entry_segment(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.enter_intersection_straight_time = 0.6
+        follower.maneuver_straight_follow_side = "auto"
+
+        self.assertEqual(follower.locked_maneuver_mode("left", 0.7, None, "left"), "left_only")
+        self.assertEqual(follower.locked_maneuver_mode("right", 0.7, None, "right"), "right_only")
+        self.assertEqual(follower.locked_maneuver_mode("left", 0.2, None, "left"), "normal")
+
+    def test_strict_maneuver_stays_normal_until_track_is_acquired(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.enter_intersection_straight_time = 0.6
+
+        self.assertEqual(follower.locked_maneuver_mode("straight", 0.7, None, None), "normal")
+
+    def test_straight_maneuver_can_choose_visible_locked_side(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.vision = line_cy.LineVision()
+        follower.maneuver_straight_follow_side = "auto"
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (520, 430), (600, 130), 255, 14)
+
+        self.assertEqual(follower.locked_maneuver_side("straight", binary), "right")
+
+        follower.maneuver_straight_follow_side = "left"
+        self.assertEqual(follower.locked_maneuver_side("straight", binary), "left")
+
+    def test_maneuver_track_locks_only_the_remaining_continuous_side(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.vision = line_cy.LineVision()
+        follower.maneuver_strict_band_ratio = 0.14
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (520, 430), (600, 130), 255, 14)
+        cv2.line(binary, (80, 430), (80, 360), 255, 14)
+
+        side, points = follower.acquire_maneuver_track(binary)
+
+        self.assertEqual(side, "right")
+        self.assertGreaterEqual(len(points), 3)
+
+    def test_maneuver_track_mask_removes_everything_outside_locked_band(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.vision = line_cy.LineVision()
+        follower.maneuver_strict_band_ratio = 0.14
+        clean = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(clean, (520, 430), (600, 130), 255, 14)
+        side, points = follower.acquire_maneuver_track(clean)
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (520, 430), (600, 130), 255, 14)
+        cv2.line(binary, (80, 420), (300, 120), 255, 18)
+        cv2.line(binary, (100, 250), (500, 250), 255, 18)
+
+        filtered, _ = follower.filter_maneuver_track(binary, side, points)
+
+        self.assertEqual(side, "right")
+        self.assertEqual(int(filtered[250, 200]), 0)
+        self.assertGreater(np.count_nonzero(filtered[:, 480:]), 0)
+
+    def test_maneuver_track_waits_when_both_sides_are_continuous(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.vision = line_cy.LineVision()
+        follower.maneuver_strict_band_ratio = 0.14
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (120, 430), (40, 130), 255, 14)
+        cv2.line(binary, (520, 430), (600, 130), 255, 14)
+
+        side, points = follower.acquire_maneuver_track(binary)
+
+        self.assertIsNone(side)
+        self.assertEqual(points, [])
+
+    def test_maneuver_track_requires_three_same_side_frames_to_lock(self):
+        pending, hits, locked = line_cy.confirm_maneuver_side(None, 0, None, "right", 3)
+        pending, hits, locked = line_cy.confirm_maneuver_side(pending, hits, locked, "right", 3)
+        self.assertIsNone(locked)
+
+        pending, hits, locked = line_cy.confirm_maneuver_side(pending, hits, locked, "right", 3)
+        self.assertEqual(locked, "right")
+
+        _, _, still_locked = line_cy.confirm_maneuver_side("left", 9, locked, "left", 3)
+        self.assertEqual(still_locked, "right")
+
+    def test_exit_crosswalk_counts_only_after_entry_has_cleared(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+
+        self.assertEqual(follower.update_exit_crosswalk_hits(False, 0, True), 0)
+        self.assertEqual(follower.update_exit_crosswalk_hits(True, 0, True), 1)
+        self.assertEqual(follower.update_exit_crosswalk_hits(True, 1, True), 2)
+        self.assertEqual(follower.update_exit_crosswalk_hits(True, 2, False), 1)
+
+    def test_exit_crosswalk_requires_a_near_horizontal_bar(self):
+        follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)
+        follower.crosswalk_track_confidence = 0.52
+        follower.exit_crosswalk_y_ratio = 0.68
+        far = {
+            "candidate": True,
+            "stop_bottom_y": 220,
+            "tracking_confidence": 0.9,
+            "tracking_stop_bottom_y": 220,
+        }
+        near = dict(far, stop_bottom_y=350)
+
+        self.assertFalse(follower.maneuver_exit_visible(far, 480))
+        self.assertTrue(follower.maneuver_exit_visible(near, 480))
 
     def test_crosswalk_mask_result_combines_memory_and_current_loose_stripes(self):
         follower = line_cy.LaneFollower.__new__(line_cy.LaneFollower)

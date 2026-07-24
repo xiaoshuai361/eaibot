@@ -1,0 +1,42 @@
+<launch>
+	<arg name="serial_port" default="/dev/serial/by-path/pci-0000:00:14.0-usb-0:6.1:1.0-port0" />
+	<arg name="pump_serial_port" default="/dev/serial/by-path/pci-0000:00:14.0-usb-0:6.2:1.0-port0" />
+	<arg name="pump_response_wait_ms" default="200" />
+	<arg name="single_arm_serial" default="true" />
+	<arg name="joint_state_publish_hz" default="5.0" />
+	<arg name="pose_query_timeout_seconds" default="0.40" />
+	<arg name="post_motion_state_timeout_seconds" default="1.0" />
+	<arg name="post_motion_state_attempts" default="3" />
+	<arg name="post_motion_state_retry_delay_seconds" default="0.20" />
+	<arg name="measured_state_hold_seconds" default="1.5" />
+	<arg name="pose_query_failure_cooldown_seconds" default="0.6" />
+	<arg name="auto_home_on_start" default="true" />
+	<arg name="move_to_zero_pose_on_start" default="false" />
+	<arg name="start_rviz" default="true" />
+	<param name="/use_sim_time" value="false" />
+	<node name="mirobot_Pub_node" pkg="mirobot_urdf_2" type="mirobot_Pub_node" respawn="true" unless="$(arg single_arm_serial)" >
+		<param name="serial_port" value="$(arg serial_port)" />
+		<param name="auto_home_on_start" value="$(arg auto_home_on_start)" />
+		<param name="move_to_zero_pose_on_start" value="$(arg move_to_zero_pose_on_start)" />
+	</node>
+	<node name="mirobot_arm_controller_node" pkg="mirobot_urdf_2" type="mirobot_arm_controller_node" respawn="true" >
+		<param name="serial_port" value="$(arg serial_port)" />
+		<param name="pump_serial_port" value="$(arg pump_serial_port)" />
+		<param name="pump_response_wait_ms" value="$(arg pump_response_wait_ms)" />
+		<param name="publish_joint_states" value="$(arg single_arm_serial)" />
+		<param name="joint_state_publish_hz" value="$(arg joint_state_publish_hz)" />
+		<param name="pose_query_timeout_seconds" value="$(arg pose_query_timeout_seconds)" />
+		<param name="post_motion_state_timeout_seconds" value="$(arg post_motion_state_timeout_seconds)" />
+		<param name="post_motion_state_attempts" value="$(arg post_motion_state_attempts)" />
+		<param name="post_motion_state_retry_delay_seconds" value="$(arg post_motion_state_retry_delay_seconds)" />
+		<param name="measured_state_hold_seconds" value="$(arg measured_state_hold_seconds)" />
+		<param name="pose_query_failure_cooldown_seconds" value="$(arg pose_query_failure_cooldown_seconds)" />
+		<param name="auto_home_on_start" value="$(arg auto_home_on_start)" />
+		<param name="move_to_zero_pose_on_start" value="$(arg move_to_zero_pose_on_start)" />
+	</node>
+        <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" respawn="true" output="screen" />
+        <include file = "$(find mirobot_moveit_config)/launch/mirobot_moveit.launch">
+		<arg name="start_rviz" value="$(arg start_rviz)" />
+	</include>
+
+</launch>

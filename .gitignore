@@ -1,13 +1,55 @@
-*
-!.gitignore
-!robocom_ws/
-robocom_ws/*
-!robocom_ws/src/
-robocom_ws/src/*
-!robocom_ws/src/line_cy.py
-!robocom_ws/src/test_line_cy_crosswalk.py
-!zcy/
-zcy/*
-!zcy/循迹操作.md
-!zcy/循迹斑马线对齐设计.md
-!zcy/循迹单文件精简与斑马线误判修正设计.md
+# Build and runtime output
+build/
+devel/
+install/
+log/
+logs/
+*.log
+
+# Python cache and test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Editor and local tool state
+.vscode/
+.idea/
+.superpowers/
+.worktrees/
+
+# ROS generated artifacts inside workspaces
+**/build/
+**/devel/
+**/install/
+**/log/
+**/logs/
+**/.catkin_tools/
+
+# Large binary model/video/data artifacts. Keep these backed up separately.
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+*.mp4
+*.avi
+*.mov
+*.bag
+
+# Generated vision debug datasets
+zcy/tag_full_frame_eval/
+zcy/tag_roi_eval/
+robocom_ws/src/saved_fire_images/
+robocom_ws/src/saved_people_images/
+robocom_ws/src/saved_rubbish_images/
+robocom_ws/src/people/
+
+# Nested upstream repositories are managed by their own Git repos.
+handeye-calib/src/aruco_ros/
+handeye-calib/src/easy_handeye/
+handeye-calib/src/vision_visp/
+mirobot_ws/src/apriltag_ros/
+mirobot_ws/src/astra_camera/
+robocom_ws/src/astra_camera/
+robocom_ws/src/backward_ros/

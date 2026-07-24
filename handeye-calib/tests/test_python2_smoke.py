@@ -10,4 +10,4 @@ def test_python2_smoke_runs_without_ros():
     output = subprocess.check_output([sys.executable, script], stderr=subprocess.STDOUT)
     if not isinstance(output, str):
         output = output.decode("utf-8")
-    assert output.startswith("OK: Python 2/3 protocol")
+    assert output.startswith("OK: Python 2/3 monocular block geometry")

@@ -1,0 +1,11 @@
+<node name="xnode_comm" pkg="xpkg_comm" type="xnode_comm"> <!-- 其他现有参数 -->
+</node>
+<launch>
+  	<node name="xnode_comm" pkg="xpkg_comm" type="xnode_comm" output="screen" >
+	<param name="com_enable" value="1"/>
+	<param name="tcp_enable" value="0"/>
+        <param name="dev_msg" value="false"/>
+	<param name="com_device" value="/dev/ttyUSB1" />  <!-- 强制指定设备 -->
+	</node>
+        
+</launch>

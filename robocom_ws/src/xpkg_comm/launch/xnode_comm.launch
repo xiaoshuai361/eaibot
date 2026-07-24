@@ -1,0 +1,8 @@
+<launch>
+    <node name="xnode_comm" pkg="xpkg_comm" type="xnode_comm" output="screen">
+        <param name="com_enable" value="1"/>
+        <param name="tcp_enable" value="0"/>
+        <param name="dev_msg" value="false"/>
+        <param name="com_device" value="/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"/>
+    </node>
+</launch>

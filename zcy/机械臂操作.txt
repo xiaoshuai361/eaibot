@@ -467,12 +467,14 @@ roslaunch apriltag_ros continuous_detection.launch
    block_detector_protocol.py
    block_grasp_vision.py
    block_grasp_sequence.py
+   block_yolo_preview.py
    mirobot_pick_test.py
    mirobot_pick_test.py.bak_20260716_before_block_grasp
 4. 另外把 handeye-calib/tests/python2_smoke.py 同步到真机 /home/eaibot/handeye-calib/tests/python2_smoke.py。
 5. 备份 mirobot_pick_test.py.bak_20260716_before_block_grasp 必须与 mirobot_pick_test.py 放在同一个 src 目录，不要改名或放到别处。
-6. 还要把 WSL 模型目录 /home/zcy/models/Block_yolov8n_640 完整同步到真机 /home/eaibot/models/Block_yolov8n_640。默认权重必须存在于：
-   /home/eaibot/models/Block_yolov8n_640/Block_yolov8n_640_best.pt
+6. 真机模型统一放在 /home/eaibot/handeye-calib/src/model，至少确认下面的 PT 权重存在；如果要测试 ONNX，再同时放入 ONNX 文件：
+   /home/eaibot/handeye-calib/src/model/Block_yolov8n_640_best.pt
+   /home/eaibot/handeye-calib/src/model/Block_yolov8n_640_best.onnx
 
 8.2 所有真机终端的环境顺序
 每个相关终端都按下列顺序 source，不要调换：
@@ -480,33 +482,6 @@ source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
 
-source 完成后，在启动 dry-run 之前先执行下列真机软件门槛：
-
-python2 - <<'PY'
-import cv2
-import numpy
-import rospy
-import tf
-import moveit_commander
-import message_filters
-from cv_bridge import CvBridge
-from mirobot_urdf_2.srv import mirobotPump
-print('python2 block-grasp dependencies: OK')
-PY
-
-python2 -m py_compile \
-  /home/eaibot/handeye-calib/src/block_grasp_vision.py \
-  /home/eaibot/handeye-calib/src/block_detector_protocol.py \
-  /home/eaibot/handeye-calib/src/block_grasp_sequence.py \
-  /home/eaibot/handeye-calib/src/mirobot_pick_test.py
-
-python2 /home/eaibot/handeye-calib/tests/python2_smoke.py
-
-python3 - <<'PY'
-from ultralytics import YOLO
-YOLO('/home/eaibot/models/Block_yolov8n_640/Block_yolov8n_640_best.pt')
-print('python3 YOLO model: OK')
-PY
 
 Python 2 依赖检查、python2_smoke.py 和 Python 3 YOLO 加载都必须打印 OK，py_compile 必须静默成功。任何 import、编译、pipe/JSON、OpenCV/NumPy 几何或模型加载失败，都要阻断 dry-run，先在真机修好环境；不要为了绕过失败去改 WSL 的 ROS/Python 版本。
 
@@ -552,6 +527,28 @@ support -> Structural support device（结构支撑）
 
 程序要求指定类别在当前画面中只有一个合格检测结果。没有检测到或同类检测到多个时，程序会停止，不会随便选一个抓。
 
+8.5.1 只看 YOLO 识别结果和实时 FPS
+这个测试只运行 Python 3 YOLO，不启动机械臂、不调用吸泵，也不需要 MoveIt。画面会显示检测框、类别、置信度、实时处理 FPS 和单帧推理耗时；按 q 或 Esc 退出，退出时最后一帧默认保存到 /tmp/block_yolo_preview.jpg。
+
+如果直接打开相机 0：
+python3 /home/eaibot/handeye-calib/src/block_yolo_preview.py \
+  --source 0 \
+  --model /home/eaibot/handeye-calib/src/model/Block_yolov8n_640_best.pt \
+  --output /home/eaibot/zcy/block_yolo_preview.jpg
+
+注意：block_yolo_preview.py 使用 OpenCV 直接打开 /dev/video 设备。如果 astra_camera 已经占用了同一个设备，要先关闭 Astra ROS 节点再运行预览；如果相机不是 0，用 v4l2-ctl --list-devices 查看后把 --source 0 改成实际编号，例如 --source 2。
+
+也可以不占用摄像头，直接测试一张图片：
+python3 /home/eaibot/handeye-calib/src/block_yolo_preview.py \
+  --source /home/eaibot/zcy/test_block.jpg \
+  --model /home/eaibot/handeye-calib/src/model/Block_yolov8n_640_best.pt \
+  --output /home/eaibot/zcy/block_yolo_preview.jpg
+
+PT 是正式抓取的默认模型，兼容性更稳。真机只有 CPU、并且 PT 预览速度不够时，可以把上面命令的模型改成：
+/home/eaibot/handeye-calib/src/model/Block_yolov8n_640_best.onnx
+
+在当前 WSL CPU 的 9 张测试图逐张测试中，PT 实际处理约 29.2 FPS，ONNX 约 34.9 FPS；这是 WSL 参考值，真机应以预览窗口左下角显示的 FPS 为准。
+
 8.6 第一步只做 Python 3 dry-run
 无 Tag 抓取的操作员唯一入口是 block_pick_main.py，不要手动直接调用 Python 2 子脚本的 block_grasp 模式。主脚本会自动启动内部 Python 2 机械臂子进程。
 
@@ -586,25 +583,3 @@ python3 /home/eaibot/handeye-calib/src/block_pick_main.py \
   --velocity-scale 0.05 \
   --acceleration-scale 0.05 \
   --stop-at-pre-grasp
-
-MEASURED_METERS 和 VERIFIED_LINK6_AXIS 是要求操作员实测后替换的占位符，不是软件默认值。
-
---stop-at-pre-grasp 只允许机械臂到达预抓取点，不下发吸泵命令，不前进到接触点。运行后必须从多个角度确认吸盘方向、中心、间隙和机械臂可达性；任何一项不对就停止。
-
-第二阶段：只有 pre-grasp 验收合格后，才能重复同一条命令并删掉 --stop-at-pre-grasp。首次接触仍保持 --velocity-scale 0.05 和 --acceleration-scale 0.05。完整流程在接触前会先要求吸泵关闭命令得到确认，然后低速正面接触、开泵、退回 pre-grasp。此阶段只验证“抓起”，不使用未指定的放置点。
-
-8.9 吸泵 UNKNOWN 的人工恢复
-1. 如果关泵确认、开泵或退回阶段报错/超时，不得根据终端报错假设吸泵已关闭；此时吸泵状态是 UNKNOWN，并且可能仍然开启。
-2. 立即停止后续自动抓取，人员避开机械臂、吸盘和可能掉落的物块。
-3. 按现场安全流程直接查看吸泵/串口控制器状态，人工确认或关闭吸泵；在状态重新明确之前，不要继续移动机械臂，不要盲目重跑命令。
-4. 若吸盘上已有物块，要先防止物块突然掉落，再处理吸泵供电或串口故障。
-
-8.10 识别成功后的超时、Ctrl-C 和急停
-1. YOLO 识别成功、机械臂子进程进入动作阶段后，Python 3 父进程遇到超时或 Ctrl-C 时不会再软件强杀子进程，因为强杀无法证明 MoveIt 已停止，也无法证明吸泵已关闭。
-2. 如果终端出现 CRITICAL 和机械臂子进程 PID，不要把关终端、kill 进程或等待当成机械臂已停止。
-3. 人员立即远离机械臂和可能掉落的物块，使用现场硬件急停停止动作，然后按 8.9 节人工确认和恢复吸泵状态。
-
-8.11 抓起后的安全释放
-1. 完整无 Tag 抓取退回 pre-grasp 后，吸泵会保持开启；本阶段没有自动放置点，不会自动关泵。
-2. 只有物块已到安全位置并由台面或可靠支撑物完全承重后，才能发送已验证的 switch_pump_status(False) 关泵操作；也可以在确认“先开后关”的自动循环对当前场景安全时，使用现有 --mode pump 测试释放。
-3. 严禁在物块悬空、人员手扶物块或物块下方有人/设备时关泵。
