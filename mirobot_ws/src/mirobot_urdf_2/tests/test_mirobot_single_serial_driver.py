@@ -102,26 +102,34 @@ def test_driver_feedrate_is_parameterized_and_moveit_limits_are_conservative():
     assert limits.count("max_acceleration: 0.5") == 6
 
 
-def test_joint6_uses_nearest_equivalent_angle_without_hard_path_constraint():
+def test_joint6_trajectory_is_not_rewritten_and_excess_travel_is_rejected():
     source = CONTROLLER.read_text()
     math_source = MOTION_MATH.read_text()
+    launch = LAUNCH.read_text()
 
     assert '#include "mirobot_motion_math.h"' in source
-    assert "nearestEquivalentAngleWithinLimits" in source
-    assert "joint6" in math_source
+    assert "nearestEquivalentAngleWithinLimits" not in source
+    assert "adjusted_positions" not in source
+    assert "accumulatedJointTravel" in source
+    assert "g_joint6_max_trajectory_travel_rad" in source
+    assert "accumulatedJointTravel" in math_source
+    assert '<arg name="joint6_max_trajectory_travel_rad" default="3.0" />' in launch
     assert "JointConstraint" not in source
 
 
-def test_joint6_equivalent_angle_math_avoids_full_turn(tmp_path):
+def test_joint6_travel_math_measures_the_original_path(tmp_path):
     source = tmp_path / "motion_math_test.cpp"
     binary = tmp_path / "motion_math_test"
     source.write_text(
         '#include "mirobot_motion_math.h"\n'
-        '#include <cmath>\n'
+        '#include <vector>\n'
         'int main() {\n'
-        '  const double result = nearestEquivalentAngleWithinLimits(\n'
-        '      -3.10, 3.10, -2.0 * M_PI, 2.0 * M_PI);\n'
-        '  return std::fabs(result - 3.183185307179586) < 1e-6 ? 0 : 1;\n'
+        '  std::vector<double> path;\n'
+        '  path.push_back(0.0);\n'
+        '  path.push_back(0.4);\n'
+        '  path.push_back(-0.1);\n'
+        '  const double result = accumulatedJointTravel(path, 0.0);\n'
+        '  return std::fabs(result - 0.9) < 1e-6 ? 0 : 1;\n'
         '}\n')
 
     subprocess.check_call([

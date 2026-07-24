@@ -85,7 +85,7 @@ def test_load_or_create_preset_preserves_existing_tags(tmp_path):
     save_preset(str(path), preset, overwrite=existed)
 
     reloaded = load_preset(str(path))
-    assert reloaded["version"] == 2
+    assert reloaded["version"] == 3
     assert "1" in reloaded["tags"]
     assert "2" in reloaded["tags"]
     assert "place_ee_in_base" in reloaded["tags"]["2"]
@@ -126,8 +126,8 @@ def test_record_tag_grasp_preserves_existing_place_point():
     )
 
     assert preset["tags"]["1"]["place_ee_in_base"]["position"] == pytest.approx([0.4, 0.0, 0.1])
-    assert preset["tags"]["1"]["grasp_offset_xy_base"] == pytest.approx([0.1, 0.2])
-    assert preset["pickup_model"]["contact_z_base"] == pytest.approx(0.8)
+    assert preset["tags"]["1"]["grasp_offset_xyz_base"] == pytest.approx(
+        [0.1, 0.2, 0.3])
     assert preset["pickup_model"]["approach_axis_xyz_base"] == pytest.approx(
         [-1.0, 0.0, 0.0])
 
@@ -137,14 +137,15 @@ def test_record_tag_place_preserves_existing_grasp_point():
     preset = {
         "tags": {
             "1": {
-                "grasp_offset_xy_base": [0.1, 0.2],
+                "grasp_offset_xyz_base": [0.1, 0.2, 0.3],
             },
         },
     }
 
     record_tag_place_in_preset(preset, 1, make_pose(0.4, -0.1, 0.2))
 
-    assert preset["tags"]["1"]["grasp_offset_xy_base"] == pytest.approx([0.1, 0.2])
+    assert preset["tags"]["1"]["grasp_offset_xyz_base"] == pytest.approx(
+        [0.1, 0.2, 0.3])
     assert preset["tags"]["1"]["place_ee_in_base"]["position"] == pytest.approx([0.4, -0.1, 0.2])
 
 
@@ -178,7 +179,7 @@ def test_prompt_and_record_place_waits_for_teach_pose_to_settle_before_sampling(
     prompt_and_record_place, = load_module_symbols("prompt_and_record_place")
     events = []
     args = SimpleNamespace(teach_settle_seconds=0.8)
-    preset = {"tags": {"1": {"grasp_offset_xy_base": [0, 0]}}}
+    preset = {"tags": {"1": {"grasp_offset_xyz_base": [0, 0, 0]}}}
 
     class FakeArm:
         def get_current_pose(self):

@@ -9,6 +9,7 @@
 	<arg name="trajectory_completion_timeout_seconds" default="15.0" />
 	<arg name="trajectory_completion_poll_seconds" default="0.15" />
 	<arg name="trajectory_goal_tolerance_rad" default="0.05" />
+	<arg name="joint6_max_trajectory_travel_rad" default="3.0" />
 	<arg name="pose_query_failure_cooldown_seconds" default="0.6" />
 	<arg name="auto_home_on_start" default="true" />
 	<arg name="move_to_zero_pose_on_start" default="false" />
@@ -30,6 +31,7 @@
 		<param name="trajectory_completion_timeout_seconds" value="$(arg trajectory_completion_timeout_seconds)" />
 		<param name="trajectory_completion_poll_seconds" value="$(arg trajectory_completion_poll_seconds)" />
 		<param name="trajectory_goal_tolerance_rad" value="$(arg trajectory_goal_tolerance_rad)" />
+		<param name="joint6_max_trajectory_travel_rad" value="$(arg joint6_max_trajectory_travel_rad)" />
 		<param name="pose_query_failure_cooldown_seconds" value="$(arg pose_query_failure_cooldown_seconds)" />
 		<param name="auto_home_on_start" value="$(arg auto_home_on_start)" />
 		<param name="move_to_zero_pose_on_start" value="$(arg move_to_zero_pose_on_start)" />

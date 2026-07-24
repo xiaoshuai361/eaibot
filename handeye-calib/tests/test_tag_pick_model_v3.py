@@ -11,19 +11,18 @@ from test_mirobot_pick_test_tag_taught_sequence import (
 )
 
 
-def v2_preset():
+def v3_preset():
     return {
-        "version": 2,
+        "version": 3,
         "base_frame": "base",
         "camera_frame": "camera_rgb_optical_frame",
         "pickup_model": {
             "orientation_xyzw_base": [0.1, -0.2, 0.3, 0.9],
             "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
-            "contact_z_base": 0.108,
         },
         "tags": {
             "1": {
-                "grasp_offset_xy_base": [-0.027, 0.004],
+                "grasp_offset_xyz_base": [-0.027, 0.004, -0.012],
                 "place_ee_in_base": {
                     "position": [0.12, -0.14, 0.05],
                     "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -41,7 +40,7 @@ def test_old_preset_is_rejected_for_runtime(tmp_path):
         "tags": {"1": {"grasp_ee_in_tag": {}, "place_ee_in_base": {}}},
     }), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="version 2"):
+    with pytest.raises(RuntimeError, match="version 3"):
         load_preset(str(path))
 
 
@@ -65,17 +64,33 @@ def test_legacy_migration_preserves_places_but_requires_new_grasp_teaching():
 
     migrated = migrate(legacy)
 
-    assert migrated["version"] == 2
+    assert migrated["version"] == 3
     assert migrated["idle_joint_values"] == [0.1, 0.2]
     assert migrated["tags"]["1"]["place_ee_in_base"] == (
         legacy["tags"]["1"]["place_ee_in_base"])
     assert "grasp_ee_in_tag" not in migrated["tags"]["1"]
-    assert "grasp_offset_xy_base" not in migrated["tags"]["1"]
+    assert "grasp_offset_xyz_base" not in migrated["tags"]["1"]
 
 
-def test_v2_grasp_uses_tag_xy_but_fixed_z_and_orientation():
-    compute, = load_module_symbols("compute_v2_grasp_pose")
-    preset = v2_preset()
+def test_version_2_migration_discards_fixed_z_grasp_but_preserves_place():
+    migrate, = load_module_symbols("migrate_legacy_preset_for_teach")
+    legacy = v3_preset()
+    legacy["version"] = 2
+    legacy["pickup_model"]["contact_z_base"] = 0.108
+    legacy["tags"]["1"]["grasp_offset_xy_base"] = [-0.027, 0.004]
+
+    migrated = migrate(legacy)
+
+    assert migrated["version"] == 3
+    assert "pickup_model" not in migrated
+    assert "grasp_offset_xyz_base" not in migrated["tags"]["1"]
+    assert migrated["tags"]["1"]["place_ee_in_base"] == (
+        legacy["tags"]["1"]["place_ee_in_base"])
+
+
+def test_constrained_grasp_uses_tag_xyz_but_fixed_orientation():
+    compute, = load_module_symbols("compute_constrained_grasp_pose")
+    preset = v3_preset()
     root_half = 2 ** 0.5 / 2.0
     noisy_rotated_tag = make_pose(
         0.25, 0.10, 0.22,
@@ -87,7 +102,7 @@ def test_v2_grasp_uses_tag_xy_but_fixed_z_and_orientation():
 
     assert grasp.pose.position.x == pytest.approx(0.223)
     assert grasp.pose.position.y == pytest.approx(0.104)
-    assert grasp.pose.position.z == pytest.approx(0.108)
+    assert grasp.pose.position.z == pytest.approx(0.208)
     norm = (0.1 ** 2 + 0.2 ** 2 + 0.3 ** 2 + 0.9 ** 2) ** 0.5
     assert [
         grasp.pose.orientation.x,
@@ -97,10 +112,11 @@ def test_v2_grasp_uses_tag_xy_but_fixed_z_and_orientation():
     ] == pytest.approx([0.1 / norm, -0.2 / norm, 0.3 / norm, 0.9 / norm])
 
 
-def test_v2_pregrasp_uses_fixed_base_approach_axis():
+def test_constrained_pregrasp_uses_fixed_base_approach_axis():
     compute, build_pre = load_module_symbols(
-        "compute_v2_grasp_pose", "build_v2_pre_grasp_pose")
-    preset = v2_preset()
+        "compute_constrained_grasp_pose",
+        "build_constrained_pre_grasp_pose")
+    preset = v3_preset()
     grasp = compute(
         make_pose(0.25, 0.10, 0.2),
         preset["pickup_model"], preset["tags"]["1"], "base")
@@ -112,6 +128,24 @@ def test_v2_pregrasp_uses_fixed_base_approach_axis():
     assert pre.pose.position.x == pytest.approx(grasp.pose.position.x - 0.03)
     assert pre.pose.position.y == pytest.approx(grasp.pose.position.y)
     assert pre.pose.position.z == pytest.approx(grasp.pose.position.z)
+
+
+def test_tag_z_translation_moves_grasp_z_by_same_amount():
+    compute, = load_module_symbols("compute_constrained_grasp_pose")
+    preset = v3_preset()
+
+    low = compute(
+        make_pose(0.25, 0.10, 0.10),
+        preset["pickup_model"], preset["tags"]["1"], "base")
+    high = compute(
+        make_pose(0.25, 0.10, 0.13),
+        preset["pickup_model"], preset["tags"]["1"], "base")
+
+    assert high.pose.position.z - low.pose.position.z == pytest.approx(0.03)
+    assert high.pose.orientation.x == pytest.approx(low.pose.orientation.x)
+    assert high.pose.orientation.y == pytest.approx(low.pose.orientation.y)
+    assert high.pose.orientation.z == pytest.approx(low.pose.orientation.z)
+    assert high.pose.orientation.w == pytest.approx(low.pose.orientation.w)
 
 
 def test_tag_filter_deduplicates_timestamps_and_rejects_outlier():

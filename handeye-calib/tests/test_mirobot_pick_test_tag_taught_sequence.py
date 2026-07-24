@@ -61,21 +61,20 @@ def make_pose(x=0.0, y=0.0, z=0.0, q=None, frame="base"):
     return pose
 
 
-def make_v2_preset(tag_ids=(1,), idle_joint_values=None):
+def make_v3_preset(tag_ids=(1,), idle_joint_values=None):
     preset = {
-        "version": 2,
+        "version": 3,
         "base_frame": "base",
         "camera_frame": "camera",
         "pickup_model": {
             "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
             "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
-            "contact_z_base": 0.1,
         },
         "tags": {},
     }
     for tag_id in tag_ids:
         preset["tags"][str(tag_id)] = {
-            "grasp_offset_xy_base": [-0.03, 0.0],
+            "grasp_offset_xyz_base": [-0.03, 0.0, 0.0],
             "place_ee_in_base": {
                 "position": [0.4, 0.0, 0.1],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -158,7 +157,7 @@ def test_teach_assist_pose_rejects_non_horizontal_tag_normal():
 def test_preset_roundtrip_and_overwrite_rules(tmp_path):
     save_preset, load_preset = load_module_symbols("save_preset", "load_preset")
     path = tmp_path / "preset.json"
-    preset = make_v2_preset()
+    preset = make_v3_preset()
 
     save_preset(str(path), preset, overwrite=False)
     assert load_preset(str(path)) == preset
@@ -245,7 +244,7 @@ def test_run_taught_sequence_dry_run_does_not_move_or_pump():
         debug_hold_seconds=0.0,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = make_v2_preset(idle_joint_values=[0.0, 0.1, 0.2])
+    preset = make_v3_preset(idle_joint_values=[0.0, 0.1, 0.2])
     events = []
 
     run_taught_sequence.__globals__.update({
@@ -289,7 +288,7 @@ def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next
         home_after_idle=False,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = make_v2_preset(
+    preset = make_v3_preset(
         tag_ids=(1, 2), idle_joint_values=[0.0, 0.1, 0.2])
     events = []
 
@@ -333,7 +332,7 @@ def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
         home_after_idle=False,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = make_v2_preset()
+    preset = make_v3_preset()
     preset["tags"]["1"]["place_joint_values"] = [
         0.0, 0.1, 0.2, 0.3, 0.4, 1.5]
     events = []
@@ -643,7 +642,7 @@ def test_run_taught_sequence_turns_pump_off_if_failure_happens_after_pickup():
         home_after_idle=False,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = make_v2_preset()
+    preset = make_v3_preset()
     pump_events = []
 
     def fake_cartesian(arm, pose, label, *args, **kwargs):
@@ -687,7 +686,7 @@ def test_run_taught_sequence_can_run_startup_home_after_idle_when_requested():
         home_after_idle=True,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = make_v2_preset(idle_joint_values=[0.0, 0.1, 0.2])
+    preset = make_v3_preset(idle_joint_values=[0.0, 0.1, 0.2])
     events = []
 
     run_taught_sequence.__globals__.update({

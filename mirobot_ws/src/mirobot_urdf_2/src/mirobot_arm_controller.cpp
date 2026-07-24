@@ -46,6 +46,7 @@ namespace
 	double g_trajectory_completion_timeout_seconds = 15.0;
 	double g_trajectory_completion_poll_seconds = 0.15;
 	double g_trajectory_goal_tolerance_rad = 0.05;
+	double g_joint6_max_trajectory_travel_rad = 3.0;
 	double g_pose_query_failure_cooldown_seconds = 0.6;
 	const std::string kPumpOnCommand("1");
 	const std::string kPumpOffCommand("2");
@@ -498,17 +499,44 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 	std::vector<double> target_positions(6, 0.0);
 
 	const size_t n_tra_points = goalPtr->trajectory.points.size();
-	double previous_joint6 = goalPtr->trajectory.points[0].positions.size() >= 6
-		? goalPtr->trajectory.points[0].positions[5] : 0.0;
 	Pose initial_pose;
+	bool have_initial_pose = false;
 	if (queryCurrentPoseUnlocked(&initial_pose, g_pose_query_timeout_seconds))
 	{
-		previous_joint6 = initial_pose.jointAngle[5] * pi / 180.0;
+		have_initial_pose = true;
 		if (g_publish_joint_states)
 		{
 			publishMeasuredJointState(initial_pose, *joint_pub);
 		}
 	}
+	std::vector<double> joint6_positions;
+	joint6_positions.reserve(n_tra_points);
+	for (size_t index = 0; index < n_tra_points; ++index)
+	{
+		const trajectory_msgs::JointTrajectoryPoint &point =
+			goalPtr->trajectory.points[index];
+		if (point.positions.size() < 6)
+		{
+			ROS_ERROR("Trajectory point has fewer than 6 joint positions; aborting.");
+			moveit_server->setAborted();
+			return;
+		}
+		joint6_positions.push_back(point.positions[5]);
+	}
+	const double joint6_start = have_initial_pose
+		? initial_pose.jointAngle[5] * pi / 180.0
+		: joint6_positions.front();
+	const double joint6_travel = accumulatedJointTravel(
+		joint6_positions, joint6_start);
+	if (joint6_travel > g_joint6_max_trajectory_travel_rad)
+	{
+		ROS_ERROR(
+			"Rejecting trajectory before execution: joint6 travel %.3f rad exceeds %.3f rad.",
+			joint6_travel, g_joint6_max_trajectory_travel_rad);
+		moveit_server->setAborted();
+		return;
+	}
+
 	for (size_t index = 0; index < n_tra_points; ++index)
 	{
 		if (index == 0 && n_tra_points > 1)
@@ -525,25 +553,16 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 		}
 
 		const trajectory_msgs::JointTrajectoryPoint &point = goalPtr->trajectory.points[index];
-		if (point.positions.size() < 6)
-		{
-			ROS_ERROR("Trajectory point has fewer than 6 joint positions; aborting.");
-			moveit_server->setAborted();
-			return;
-		}
-		std::vector<double> adjusted_positions(
+		std::vector<double> commanded_positions(
 			point.positions.begin(), point.positions.begin() + 6);
-		adjusted_positions[5] = nearestEquivalentAngleWithinLimits(
-			adjusted_positions[5], previous_joint6, -2.0 * pi, 2.0 * pi);
-		previous_joint6 = adjusted_positions[5];
-		target_positions = adjusted_positions;
+		target_positions = commanded_positions;
 
-		sprintf(angle0, "%.2f", adjusted_positions[0] * 57.296);
-		sprintf(angle1, "%.2f", adjusted_positions[1] * 57.296);
-		sprintf(angle2, "%.2f", adjusted_positions[2] * 57.296);
-		sprintf(angle3, "%.2f", adjusted_positions[3] * 57.296);
-		sprintf(angle4, "%.2f", adjusted_positions[4] * 57.296);
-		sprintf(angle5, "%.2f", adjusted_positions[5] * 57.296);
+		sprintf(angle0, "%.2f", commanded_positions[0] * 57.296);
+		sprintf(angle1, "%.2f", commanded_positions[1] * 57.296);
+		sprintf(angle2, "%.2f", commanded_positions[2] * 57.296);
+		sprintf(angle3, "%.2f", commanded_positions[3] * 57.296);
+		sprintf(angle4, "%.2f", commanded_positions[4] * 57.296);
+		sprintf(angle5, "%.2f", commanded_positions[5] * 57.296);
 		Gcode = (std::string) "M50 G0 X" + angle0 + " Y" + angle1 + " Z" + angle2 + " A" + angle3 + "B" + angle4 + "C" + angle5 + " F" + feedrate + "\r\n";
 		ROS_DEBUG_STREAM("Arm GCode: " << Gcode);
 		_serial.write(Gcode.c_str());
@@ -639,6 +658,7 @@ int main(int argc, char *argv[])
 	private_nh.param("trajectory_completion_timeout_seconds", g_trajectory_completion_timeout_seconds, 15.0);
 	private_nh.param("trajectory_completion_poll_seconds", g_trajectory_completion_poll_seconds, 0.15);
 	private_nh.param("trajectory_goal_tolerance_rad", g_trajectory_goal_tolerance_rad, 0.05);
+	private_nh.param("joint6_max_trajectory_travel_rad", g_joint6_max_trajectory_travel_rad, 3.0);
 	private_nh.param("pose_query_failure_cooldown_seconds", g_pose_query_failure_cooldown_seconds, 0.6);
 
 	if (g_joint_state_publish_hz <= 0.0)
@@ -664,6 +684,10 @@ int main(int argc, char *argv[])
 	if (g_trajectory_goal_tolerance_rad <= 0.0)
 	{
 		g_trajectory_goal_tolerance_rad = 0.05;
+	}
+	if (g_joint6_max_trajectory_travel_rad <= 0.0)
+	{
+		g_joint6_max_trajectory_travel_rad = 3.0;
 	}
 	if (g_pose_query_failure_cooldown_seconds < 0.0)
 	{

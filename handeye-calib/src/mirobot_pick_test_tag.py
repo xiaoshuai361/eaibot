@@ -26,7 +26,7 @@ from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 
-PRESET_VERSION = 2
+PRESET_VERSION = 3
 DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_ASSIST_FRONT_GAP = 0.03
@@ -350,8 +350,9 @@ def pose_to_transform(pose_stamped):
     }
 
 
-def compute_v2_grasp_pose(tag_base_pose, pickup_model, entry, base_frame):
-    offset = entry['grasp_offset_xy_base']
+def compute_constrained_grasp_pose(tag_base_pose, pickup_model, entry,
+                                   base_frame):
+    offset = entry['grasp_offset_xyz_base']
     orientation = normalize_quaternion(
         pickup_model['orientation_xyzw_base'])
     pose = PoseStamped()
@@ -361,7 +362,8 @@ def compute_v2_grasp_pose(tag_base_pose, pickup_model, entry, base_frame):
         float(tag_base_pose.pose.position.x) + float(offset[0]))
     pose.pose.position.y = (
         float(tag_base_pose.pose.position.y) + float(offset[1]))
-    pose.pose.position.z = float(pickup_model['contact_z_base'])
+    pose.pose.position.z = (
+        float(tag_base_pose.pose.position.z) + float(offset[2]))
     pose.pose.orientation.x = orientation[0]
     pose.pose.orientation.y = orientation[1]
     pose.pose.orientation.z = orientation[2]
@@ -369,8 +371,8 @@ def compute_v2_grasp_pose(tag_base_pose, pickup_model, entry, base_frame):
     return pose
 
 
-def build_v2_pre_grasp_pose(grasp_pose, pickup_model,
-                            approach_gap, base_frame):
+def build_constrained_pre_grasp_pose(grasp_pose, pickup_model,
+                                     approach_gap, base_frame):
     axis = normalize_axis(pickup_model['approach_axis_xyz_base'])
     pre_grasp = copy.deepcopy(grasp_pose)
     pre_grasp.header.frame_id = base_frame
@@ -548,7 +550,7 @@ def load_preset(path):
     preset = read_preset_json(path)
     if preset.get('version') != PRESET_VERSION:
         raise RuntimeError(
-            'Preset version 2 is required for robust pickup; found version %r. '
+            'Preset version 3 is required for robust pickup; found version %r. '
             'Re-teach tag grasps to migrate while preserving place points.'
             % preset.get('version'))
     return preset
@@ -557,7 +559,7 @@ def load_preset(path):
 def migrate_legacy_preset_for_teach(preset):
     if preset.get('version') == PRESET_VERSION:
         return copy.deepcopy(preset)
-    if preset.get('version') != 1:
+    if preset.get('version') not in (1, 2):
         raise RuntimeError(
             'Cannot migrate unsupported preset version: %r.'
             % preset.get('version'))
@@ -642,23 +644,21 @@ def require_preset_tags(preset, sequence):
             raise RuntimeError('Preset file is missing tag %d.' % tag_id)
 
 
-def require_v2_pickup_model(preset):
+def require_pickup_model(preset):
     model = preset.get('pickup_model')
     if not isinstance(model, dict):
         raise RuntimeError(
-            'Preset version 2 is missing pickup_model. Re-teach at least '
+            'Preset version 3 is missing pickup_model. Re-teach at least '
             'one tag grasp before running.')
     for field in (
             'orientation_xyzw_base',
-            'approach_axis_xyz_base',
-            'contact_z_base'):
+            'approach_axis_xyz_base'):
         if field not in model:
             raise RuntimeError(
                 'Preset pickup_model is missing %s. Re-teach tag grasps.'
                 % field)
     normalize_quaternion(model['orientation_xyzw_base'])
     normalize_axis(model['approach_axis_xyz_base'])
-    float(model['contact_z_base'])
     return model
 
 
@@ -694,9 +694,10 @@ def require_field_overwrite(preset, sequence, field, overwrite):
 def record_tag_grasp_in_preset(preset, tag_id, tag_pose, grasp_pose,
                                approach_axis_base=None):
     entry = preset.setdefault('tags', {}).setdefault(str(tag_id), {})
-    entry['grasp_offset_xy_base'] = [
+    entry['grasp_offset_xyz_base'] = [
         float(grasp_pose.pose.position.x - tag_pose.pose.position.x),
         float(grasp_pose.pose.position.y - tag_pose.pose.position.y),
+        float(grasp_pose.pose.position.z - tag_pose.pose.position.z),
     ]
     if 'pickup_model' not in preset:
         preset['pickup_model'] = {
@@ -704,16 +705,16 @@ def record_tag_grasp_in_preset(preset, tag_id, tag_pose, grasp_pose,
                 quaternion_msg_to_list(grasp_pose.pose.orientation)),
             'approach_axis_xyz_base': normalize_axis(
                 approach_axis_base or [-1.0, 0.0, 0.0]),
-            'contact_z_base': float(grasp_pose.pose.position.z),
         }
     for legacy_field in (
             'grasp_ee_in_tag',
             'grasp_position_offset_in_base',
             'grasp_orientation_in_base',
             'grasp_approach_axis_in_base',
-            'grasp_joint_values'):
+            'grasp_joint_values',
+            'grasp_offset_xy_base'):
         entry.pop(legacy_field, None)
-    return entry['grasp_offset_xy_base']
+    return entry['grasp_offset_xyz_base']
 
 
 def record_tag_place_in_preset(preset, tag_id, place_pose):
@@ -1183,7 +1184,7 @@ def teach_tag_sequence(args, arm):
 
 def teach_tag_grasp(args, arm):
     preset = load_preset_for_grasp_teach(args.preset_file)
-    require_field_overwrite(preset, args.sequence, 'grasp_offset_xy_base',
+    require_field_overwrite(preset, args.sequence, 'grasp_offset_xyz_base',
                             args.overwrite)
     for tag_id in args.sequence:
         require_tag_fields(preset, tag_id, ['place_ee_in_base'],
@@ -1206,9 +1207,9 @@ def teach_tag_place(args, arm):
     require_field_overwrite(preset, args.sequence, 'place_ee_in_base',
                             args.overwrite)
     for tag_id in args.sequence:
-        require_tag_fields(preset, tag_id, ['grasp_offset_xy_base'],
+        require_tag_fields(preset, tag_id, ['grasp_offset_xyz_base'],
                            'teach_tag_place')
-    require_v2_pickup_model(preset)
+    require_pickup_model(preset)
     total_tags = len(args.sequence)
     for index, tag_id in enumerate(args.sequence, 1):
         rospy.loginfo('准备重采 tag_%d 放置点（当前第 %d/%d 个），抓取姿态会保留。',
@@ -1236,19 +1237,19 @@ def teach_idle(args, arm):
 def run_taught_sequence(args, arm, pump_proxy):
     preset = load_preset(args.preset_file)
     require_preset_tags(preset, args.sequence)
-    pickup_model = require_v2_pickup_model(preset)
+    pickup_model = require_pickup_model(preset)
     listener = tf.TransformListener()
     rospy.sleep(0.5)
     for tag_id in args.sequence:
         entry = preset['tags'][str(tag_id)]
         require_tag_fields(
             preset, tag_id,
-            ['grasp_offset_xy_base', 'place_ee_in_base'],
+            ['grasp_offset_xyz_base', 'place_ee_in_base'],
             'run_taught_sequence')
         tag_pose = wait_for_tag_pose_in_base(listener, args, tag_id)
-        grasp_pose = compute_v2_grasp_pose(
+        grasp_pose = compute_constrained_grasp_pose(
             tag_pose, pickup_model, entry, args.base_frame)
-        pre_grasp_pose = build_v2_pre_grasp_pose(
+        pre_grasp_pose = build_constrained_pre_grasp_pose(
             grasp_pose, pickup_model,
             args.approach_gap, args.base_frame)
         place_pose = transform_to_pose(args.base_frame, entry['place_ee_in_base'])

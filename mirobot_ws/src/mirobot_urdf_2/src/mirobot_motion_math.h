@@ -2,7 +2,7 @@
 #define MIROBOT_MOTION_MATH_H
 
 #include <cmath>
-#include <limits>
+#include <vector>
 
 inline double shortestAngularDistance(double from, double to)
 {
@@ -19,28 +19,17 @@ inline double shortestAngularDistance(double from, double to)
 	return delta;
 }
 
-// Select the joint6 equivalent angle nearest to its preceding trajectory point.
-inline double nearestEquivalentAngleWithinLimits(
-	double target, double reference, double lower, double upper)
+inline double accumulatedJointTravel(
+	const std::vector<double> &positions, double start)
 {
-	const double two_pi = 2.0 * M_PI;
-	double best = target;
-	double best_distance = std::numeric_limits<double>::infinity();
-	for (int turns = -2; turns <= 2; ++turns)
+	double travel = 0.0;
+	double previous = start;
+	for (size_t index = 0; index < positions.size(); ++index)
 	{
-		const double candidate = target + turns * two_pi;
-		if (candidate < lower || candidate > upper)
-		{
-			continue;
-		}
-		const double distance = std::fabs(candidate - reference);
-		if (distance < best_distance)
-		{
-			best = candidate;
-			best_distance = distance;
-		}
+		travel += std::fabs(positions[index] - previous);
+		previous = positions[index];
 	}
-	return best;
+	return travel;
 }
 
 #endif
