@@ -156,7 +156,7 @@ python3 -m py_compile /home/zcy/eaibot/handeye-calib/src/mirobot_pick_test.py �
 当前配置：
 
 ```yaml
-tag_family: 'tag16h5'
+tag_family: "tag16h5"
 ```
 
 `tags.yaml` 中只允许真实比赛 ID 1-4。不要把误识别出来的 `15、26、12、18` 映射成 `tag_1` 到 `tag_4`，否则会把错误识别合法化。看到这些 ID 时，应处理图像质量、距离、光照、分辨率或重新打印更清晰的 tag16h5 1-4。
