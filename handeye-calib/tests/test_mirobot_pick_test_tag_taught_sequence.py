@@ -61,6 +61,31 @@ def make_pose(x=0.0, y=0.0, z=0.0, q=None, frame="base"):
     return pose
 
 
+def make_v2_preset(tag_ids=(1,), idle_joint_values=None):
+    preset = {
+        "version": 2,
+        "base_frame": "base",
+        "camera_frame": "camera",
+        "pickup_model": {
+            "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
+            "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
+            "contact_z_base": 0.1,
+        },
+        "tags": {},
+    }
+    for tag_id in tag_ids:
+        preset["tags"][str(tag_id)] = {
+            "grasp_offset_xy_base": [-0.03, 0.0],
+            "place_ee_in_base": {
+                "position": [0.4, 0.0, 0.1],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    if idle_joint_values is not None:
+        preset["idle_joint_values"] = list(idle_joint_values)
+    return preset
+
+
 def test_parse_sequence_accepts_comma_list_and_rejects_invalid_values():
     parse_sequence, = load_module_symbols("parse_sequence")
 
@@ -86,102 +111,12 @@ def test_parse_args_has_no_post_pick_place_joint_alignment():
     assert not hasattr(args, "carry_joint6_lock")
 
 
-def test_compute_grasp_transform_stores_end_effector_relative_to_tag():
-    compute_grasp_ee_in_tag, compute_grasp_pose = load_module_symbols(
-        "compute_grasp_ee_in_tag",
-        "compute_grasp_pose",
-    )
-    tag_at_teach = make_pose(1.0, 2.0, 0.5)
-    taught_ee = make_pose(1.1, 2.2, 0.8)
-
-    grasp_ee_in_tag = compute_grasp_ee_in_tag(tag_at_teach, taught_ee)
-    moved_tag = make_pose(0.2, -0.1, 0.4)
-    replay_grasp = compute_grasp_pose(moved_tag, grasp_ee_in_tag, "base")
-
-    assert grasp_ee_in_tag["position"] == pytest.approx([0.1, 0.2, 0.3])
-    assert replay_grasp.pose.position.x == pytest.approx(0.3)
-    assert replay_grasp.pose.position.y == pytest.approx(0.1)
-    assert replay_grasp.pose.position.z == pytest.approx(0.7)
-
-
-def test_position_stable_grasp_replay_ignores_current_tag_rotation_noise():
-    (
-        record_tag_grasp_in_preset,
-        compute_grasp_pose_from_entry,
-        build_pre_grasp_pose_from_entry,
-    ) = load_module_symbols(
-        "record_tag_grasp_in_preset",
-        "compute_grasp_pose_from_entry",
-        "build_pre_grasp_pose_from_entry",
-    )
-    root_half = 2 ** 0.5 / 2.0
-    taught_tag = make_pose(1.0, 2.0, 0.5)
-    taught_grasp = make_pose(
-        1.10,
-        2.20,
-        0.80,
-        q=[0.1, 0.2, 0.3, 0.9],
-    )
-    preset = {}
-
-    record_tag_grasp_in_preset(preset, 4, taught_tag, taught_grasp)
-    entry = preset["tags"]["4"]
-    moved_tag_with_bad_rotation = make_pose(
-        0.2,
-        -0.1,
-        0.4,
-        q=[0.0, 0.0, root_half, root_half],
-    )
-
-    replay_grasp = compute_grasp_pose_from_entry(
-        moved_tag_with_bad_rotation, entry, "base")
-    pre_grasp = build_pre_grasp_pose_from_entry(
-        moved_tag_with_bad_rotation, replay_grasp, entry, 0.03, "base")
-
-    assert entry["grasp_position_offset_in_base"] == pytest.approx([0.1, 0.2, 0.3])
-    assert entry["grasp_orientation_in_base"] == pytest.approx(
-        [0.10259783520851541, 0.20519567041703082,
-         0.3077935056255462, 0.9233805168766387])
-    assert replay_grasp.pose.position.x == pytest.approx(0.3)
-    assert replay_grasp.pose.position.y == pytest.approx(0.1)
-    assert replay_grasp.pose.position.z == pytest.approx(0.7)
-    assert replay_grasp.pose.orientation.z == pytest.approx(0.3077935056255462)
-    assert pre_grasp.pose.position.x == pytest.approx(0.3)
-    assert pre_grasp.pose.position.y == pytest.approx(0.1)
-    assert pre_grasp.pose.position.z == pytest.approx(0.73)
-
-
-def test_record_grasp_stores_taught_joint_values_when_available():
-    record_tag_grasp_in_preset, = load_module_symbols("record_tag_grasp_in_preset")
-    preset = {}
-
-    record_tag_grasp_in_preset(
-        preset,
-        4,
-        make_pose(1.0, 2.0, 0.5),
-        make_pose(1.1, 2.2, 0.8),
-        grasp_joint_values=[0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-    )
-
-    assert preset["tags"]["4"]["grasp_joint_values"] == pytest.approx(
-        [0.0, 0.1, 0.2, 0.3, 0.4, 1.5])
-
-
-def test_pregrasp_moves_along_tag_plus_z_and_preplace_moves_along_base_z():
-    build_pre_grasp_pose, build_pre_place_pose = load_module_symbols(
-        "build_pre_grasp_pose",
-        "build_pre_place_pose",
-    )
-    tag_pose = make_pose(0.0, 0.0, 0.0)
-    grasp_pose = make_pose(0.3, 0.1, 0.2)
+def test_preplace_moves_along_base_z():
+    build_pre_place_pose, = load_module_symbols("build_pre_place_pose")
     place_pose = make_pose(0.4, -0.2, 0.1)
 
-    pre_grasp = build_pre_grasp_pose(tag_pose, grasp_pose, 0.03, "base")
     pre_place = build_pre_place_pose(place_pose, 0.02, "base")
 
-    assert pre_grasp.pose.position.x == pytest.approx(0.3)
-    assert pre_grasp.pose.position.y == pytest.approx(0.1)
-    assert pre_grasp.pose.position.z == pytest.approx(0.23)
     assert pre_place.pose.position.x == pytest.approx(0.4)
     assert pre_place.pose.position.y == pytest.approx(-0.2)
     assert pre_place.pose.position.z == pytest.approx(0.12)
@@ -223,23 +158,7 @@ def test_teach_assist_pose_rejects_non_horizontal_tag_normal():
 def test_preset_roundtrip_and_overwrite_rules(tmp_path):
     save_preset, load_preset = load_module_symbols("save_preset", "load_preset")
     path = tmp_path / "preset.json"
-    preset = {
-        "version": 1,
-        "base_frame": "base",
-        "camera_frame": "camera",
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.2, 0.3],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.5, 0.6],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        },
-    }
+    preset = make_v2_preset()
 
     save_preset(str(path), preset, overwrite=False)
     assert load_preset(str(path)) == preset
@@ -262,50 +181,6 @@ def test_record_place_stores_pose_orientation_and_approach_axis_only():
          0.3077935056255462, 0.9233805168766387])
     assert entry["place_approach_axis_in_base"] == pytest.approx([0.0, 0.0, 1.0])
     assert "place_joint_values" not in entry
-
-
-def test_joint_alignment_uses_current_joints_but_taught_selected_joints():
-    build_joint_align_values, = load_module_symbols("build_joint_align_values")
-
-    align_values = build_joint_align_values(
-        current_joint_values=[1.0, 1.1, 1.2, 1.3, 1.4, -2.0],
-        taught_joint_values=[0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-        align_joints=[5, 6],
-        option='--grasp-align-joints',
-    )
-
-    assert align_values == pytest.approx([1.0, 1.1, 1.2, 1.3, 0.4, 1.5])
-
-    assert build_joint_align_values(
-        current_joint_values=[1.0, 1.1, 1.2, 1.3, 1.4, 1.51],
-        taught_joint_values=[0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-        align_joints=[5, 6],
-        option='--grasp-align-joints',
-    ) == pytest.approx([1.0, 1.1, 1.2, 1.3, 0.4, 1.51])
-
-    assert build_joint_align_values(
-        current_joint_values=[1.0, 1.1, 1.2, 1.3, 0.41, 1.51],
-        taught_joint_values=[0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-        align_joints=[5, 6],
-        option='--grasp-align-joints',
-    ) is None
-
-    assert build_joint_align_values(
-        current_joint_values=[1.0, 1.1, 1.2, 1.3, 1.4, -2.0],
-        taught_joint_values=[0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-        align_joints=[],
-        option='--grasp-align-joints',
-    ) is None
-
-    with pytest.raises(RuntimeError, match="joint value length"):
-        build_joint_align_values(
-            [0.0, 0.1], [0.0], align_joints=[5],
-            option='--grasp-align-joints')
-
-    with pytest.raises(RuntimeError, match="--grasp-align-joints"):
-        build_joint_align_values(
-            [0.0] * 6, [0.0] * 6, align_joints=[7],
-            option='--grasp-align-joints')
 
 
 def test_load_preset_reports_missing_corrupt_and_missing_tag(tmp_path):
@@ -370,21 +245,7 @@ def test_run_taught_sequence_dry_run_does_not_move_or_pump():
         debug_hold_seconds=0.0,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = {
-        "idle_joint_values": [0.0, 0.1, 0.2],
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        },
-    }
+    preset = make_v2_preset(idle_joint_values=[0.0, 0.1, 0.2])
     events = []
 
     run_taught_sequence.__globals__.update({
@@ -428,31 +289,8 @@ def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next
         home_after_idle=False,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = {
-        "idle_joint_values": [0.0, 0.1, 0.2],
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-            "2": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        },
-    }
+    preset = make_v2_preset(
+        tag_ids=(1, 2), idle_joint_values=[0.0, 0.1, 0.2])
     events = []
 
     run_taught_sequence.__globals__.update({
@@ -495,21 +333,9 @@ def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
         home_after_idle=False,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = {
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_joint_values": [0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-            },
-        },
-    }
+    preset = make_v2_preset()
+    preset["tags"]["1"]["place_joint_values"] = [
+        0.0, 0.1, 0.2, 0.3, 0.4, 1.5]
     events = []
 
     class FakeArm:
@@ -542,73 +368,6 @@ def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
         isinstance(event, tuple) and event[0] == "taught_place_align_joints"
         for event in events)
     assert events.index("taught_pre_place") < events.index("taught_place")
-
-
-def test_run_taught_sequence_aligns_taught_grasp_joints_before_pre_grasp_pose():
-    run_taught_sequence, = load_module_symbols("run_taught_sequence")
-    args = SimpleNamespace(
-        sequence=[1],
-        preset_file="/tmp/unused.json",
-        base_frame="base",
-        camera_frame="camera",
-        tf_timeout=1.0,
-        approach_gap=0.03,
-        place_approach_gap=0.02,
-        grasp_align_joints=[6],
-        dry_run=False,
-        debug_hold_seconds=0.0,
-        home_after_idle=False,
-        assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
-    )
-    preset = {
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "grasp_joint_values": [0.0, 0.1, 0.2, 0.3, 0.4, 1.5],
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        },
-    }
-    events = []
-
-    class FakeArm:
-        def get_current_joint_values(self):
-            events.append("read_joints")
-            return [1.0, 1.1, 1.2, 1.3, 1.4, -2.0]
-
-    def fake_execute_joint_values(arm, values, label):
-        events.append((label, list(values)))
-
-    run_taught_sequence.__globals__.update({
-        "load_preset": lambda path: preset,
-        "wait_for_tag_pose_in_base": lambda listener, args, tag_id: make_pose(0.2, 0.0, 0.1),
-        "publish_debug_geometry": lambda *items, **kwargs: None,
-        "execute_pose": lambda arm, pose, label: events.append(label),
-        "execute_cartesian_pose": lambda arm, pose, label, *args, **kwargs: events.append(label),
-        "execute_joint_values": fake_execute_joint_values,
-        "set_pump": lambda *items: events.append("pump"),
-        "tf": SimpleNamespace(TransformListener=lambda: object()),
-        "rospy": SimpleNamespace(
-            loginfo=lambda *items: None,
-            logwarn=lambda *items: None,
-            sleep=lambda seconds: None,
-        ),
-    })
-
-    run_taught_sequence(args, FakeArm(), object())
-
-    align_event = (
-        "taught_grasp_align_joints",
-        [1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
-    )
-    assert align_event in events
-    assert events.index(align_event) < events.index("taught_pre_grasp")
 
 
 def test_execute_cartesian_pose_retries_without_collision_check_then_falls_back_to_pose():
@@ -884,20 +643,7 @@ def test_run_taught_sequence_turns_pump_off_if_failure_happens_after_pickup():
         home_after_idle=False,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = {
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        },
-    }
+    preset = make_v2_preset()
     pump_events = []
 
     def fake_cartesian(arm, pose, label, *args, **kwargs):
@@ -941,21 +687,7 @@ def test_run_taught_sequence_can_run_startup_home_after_idle_when_requested():
         home_after_idle=True,
         assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
-    preset = {
-        "idle_joint_values": [0.0, 0.1, 0.2],
-        "tags": {
-            "1": {
-                "grasp_ee_in_tag": {
-                    "position": [0.1, 0.0, 0.0],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-                "place_ee_in_base": {
-                    "position": [0.4, 0.0, 0.1],
-                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-        },
-    }
+    preset = make_v2_preset(idle_joint_values=[0.0, 0.1, 0.2])
     events = []
 
     run_taught_sequence.__globals__.update({
@@ -1001,7 +733,9 @@ def test_source_contract_removes_old_tuning_modes_and_parameters():
         "--tool-axis",
         "--tag-detection-backend",
         "--place-align-joints",
+        "--grasp-align-joints",
         "taught_place_align_joints",
+        "taught_grasp_align_joints",
         "build_place_align_joint_values",
         "wait_for_enhanced_tag_pose",
     ]:

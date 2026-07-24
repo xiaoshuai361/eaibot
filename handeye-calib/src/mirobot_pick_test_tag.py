@@ -26,17 +26,20 @@ from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 
-PRESET_VERSION = 1
+PRESET_VERSION = 2
 DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_ASSIST_FRONT_GAP = 0.03
 DEFAULT_ASSIST_ORIENTATION_XYZW = '0,0,0,1'
 DEFAULT_TEACH_SETTLE_SECONDS = 0.8
 DEFAULT_MOTION_SETTLE_SECONDS = 0.25
+DEFAULT_TAG_SAMPLE_SECONDS = 1.5
+DEFAULT_TAG_MIN_SAMPLES = 10
+DEFAULT_TAG_MAX_MAD_M = 0.005
+DEFAULT_TAG_MAX_AGE_SECONDS = 0.5
+DEFAULT_PICKUP_APPROACH_AXIS_BASE = '-1,0,0'
 POSE_DONE_POSITION_TOLERANCE = 0.015
 POSE_DONE_ORIENTATION_TOLERANCE_RAD = 0.35
-PLACE_ALIGN_JOINT_TOLERANCE = 0.03
-DEFAULT_GRASP_ALIGN_JOINTS = '6'
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
 MOTION_SETTLE_SECONDS = DEFAULT_MOTION_SETTLE_SECONDS
 
@@ -67,31 +70,6 @@ def parse_sequence(text):
         result.append(tag_id)
     if not result:
         raise RuntimeError('--sequence must contain at least one tag ID.')
-    return result
-
-
-def parse_joint_indices(text, option):
-    if text is None:
-        return []
-    if isinstance(text, int):
-        return [text]
-    if not isinstance(text, STRING_TYPES):
-        raise RuntimeError('%s must be a comma separated list of joint indices.' % option)
-    if not text.strip() or text.strip() == '0':
-        return []
-    result = []
-    for item in text.split(','):
-        value = item.strip()
-        if not value:
-            continue
-        try:
-            joint_index = int(value)
-        except (TypeError, ValueError):
-            raise RuntimeError('%s values must be integer joint indices.' % option)
-        if joint_index <= 0:
-            raise RuntimeError('%s values must be positive joint indices, or 0 to disable.' % option)
-        if joint_index not in result:
-            result.append(joint_index)
     return result
 
 
@@ -142,6 +120,16 @@ def parse_args(argv):
     parser.add_argument('--base-frame', default='base')
     parser.add_argument('--group', default='manipulator')
     parser.add_argument('--tf-timeout', type=float, default=5.0)
+    parser.add_argument('--tag-sample-seconds', type=float,
+                        default=DEFAULT_TAG_SAMPLE_SECONDS)
+    parser.add_argument('--tag-min-samples', type=int,
+                        default=DEFAULT_TAG_MIN_SAMPLES)
+    parser.add_argument('--tag-max-mad-m', type=float,
+                        default=DEFAULT_TAG_MAX_MAD_M)
+    parser.add_argument('--tag-max-age-seconds', type=float,
+                        default=DEFAULT_TAG_MAX_AGE_SECONDS)
+    parser.add_argument('--pickup-approach-axis-base',
+                        default=DEFAULT_PICKUP_APPROACH_AXIS_BASE)
     parser.add_argument('--approach-gap', type=float, default=0.03)
     parser.add_argument('--place-approach-gap', type=float, default=0.02)
     parser.add_argument('--planning-time', type=float, default=2.0)
@@ -165,12 +153,14 @@ def parse_args(argv):
                         default=DEFAULT_STARTUP_HOME_SERVICE)
     parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
     parser.add_argument('--startup-home-settle-seconds', type=float, default=3.0)
-    parser.add_argument('--grasp-align-joints',
-                        default=DEFAULT_GRASP_ALIGN_JOINTS,
-                        help='Comma separated 1-based joint indices to align to taught grasp values before moving to pre-grasp. Default 6. Use 0 to disable.')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     _positive(args.tf_timeout, '--tf-timeout')
+    _positive(args.tag_sample_seconds, '--tag-sample-seconds')
+    if args.tag_min_samples < 3:
+        raise RuntimeError('--tag-min-samples must be at least 3.')
+    _positive(args.tag_max_mad_m, '--tag-max-mad-m')
+    _positive(args.tag_max_age_seconds, '--tag-max-age-seconds')
     _positive(args.approach_gap, '--approach-gap')
     _positive(args.place_approach_gap, '--place-approach-gap')
     _positive(args.planning_time, '--planning-time')
@@ -184,13 +174,17 @@ def parse_args(argv):
                  '--startup-home-settle-seconds')
     args.assist_orientation_xyzw = parse_quaternion_text(
         args.assist_orientation_xyzw, '--assist-orientation-xyzw')
+    axis_parts = [part.strip()
+                  for part in args.pickup_approach_axis_base.split(',')]
+    if len(axis_parts) != 3:
+        raise RuntimeError('--pickup-approach-axis-base must be x,y,z.')
+    try:
+        args.pickup_approach_axis_base = normalize_axis(
+            [float(part) for part in axis_parts])
+    except (TypeError, ValueError):
+        raise RuntimeError('--pickup-approach-axis-base must be x,y,z.')
     if args.debug_hold_seconds < 0.0:
         raise RuntimeError('--debug-hold-seconds must be non-negative.')
-    args.grasp_align_joints = parse_joint_indices(
-        args.grasp_align_joints, '--grasp-align-joints')
-    for joint_index in args.grasp_align_joints:
-        if joint_index > 6:
-            raise RuntimeError('--grasp-align-joints values must be in [1, 6], or 0 to disable.')
     return args
 
 
@@ -356,47 +350,35 @@ def pose_to_transform(pose_stamped):
     }
 
 
-def compute_grasp_ee_in_tag(tag_base_pose, ee_base_pose):
-    tag_in_base = pose_to_matrix(tag_base_pose)
-    ee_in_base = pose_to_matrix(ee_base_pose)
-    ee_in_tag = matrix_multiply(inverse_rigid_matrix(tag_in_base), ee_in_base)
-    return matrix_to_transform(ee_in_tag)
+def compute_v2_grasp_pose(tag_base_pose, pickup_model, entry, base_frame):
+    offset = entry['grasp_offset_xy_base']
+    orientation = normalize_quaternion(
+        pickup_model['orientation_xyzw_base'])
+    pose = PoseStamped()
+    pose.header.frame_id = base_frame
+    pose.header.stamp = ros_time_now()
+    pose.pose.position.x = (
+        float(tag_base_pose.pose.position.x) + float(offset[0]))
+    pose.pose.position.y = (
+        float(tag_base_pose.pose.position.y) + float(offset[1]))
+    pose.pose.position.z = float(pickup_model['contact_z_base'])
+    pose.pose.orientation.x = orientation[0]
+    pose.pose.orientation.y = orientation[1]
+    pose.pose.orientation.z = orientation[2]
+    pose.pose.orientation.w = orientation[3]
+    return pose
 
 
-def compute_grasp_pose(tag_base_pose, grasp_ee_in_tag, base_frame):
-    grasp_matrix = matrix_multiply(
-        pose_to_matrix(tag_base_pose),
-        transform_to_matrix(grasp_ee_in_tag))
-    return matrix_to_pose(base_frame, grasp_matrix)
-
-
-def compute_grasp_position_offset_in_base(tag_base_pose, ee_base_pose):
-    return [
-        float(ee_base_pose.pose.position.x - tag_base_pose.pose.position.x),
-        float(ee_base_pose.pose.position.y - tag_base_pose.pose.position.y),
-        float(ee_base_pose.pose.position.z - tag_base_pose.pose.position.z),
-    ]
-
-
-def compute_grasp_pose_from_entry(tag_base_pose, entry, base_frame):
-    if (
-        'grasp_position_offset_in_base' in entry and
-        'grasp_orientation_in_base' in entry
-    ):
-        offset = entry['grasp_position_offset_in_base']
-        orientation = normalize_quaternion(entry['grasp_orientation_in_base'])
-        pose = PoseStamped()
-        pose.header.frame_id = base_frame
-        pose.header.stamp = ros_time_now()
-        pose.pose.position.x = tag_base_pose.pose.position.x + float(offset[0])
-        pose.pose.position.y = tag_base_pose.pose.position.y + float(offset[1])
-        pose.pose.position.z = tag_base_pose.pose.position.z + float(offset[2])
-        pose.pose.orientation.x = orientation[0]
-        pose.pose.orientation.y = orientation[1]
-        pose.pose.orientation.z = orientation[2]
-        pose.pose.orientation.w = orientation[3]
-        return pose
-    return compute_grasp_pose(tag_base_pose, entry['grasp_ee_in_tag'], base_frame)
+def build_v2_pre_grasp_pose(grasp_pose, pickup_model,
+                            approach_gap, base_frame):
+    axis = normalize_axis(pickup_model['approach_axis_xyz_base'])
+    pre_grasp = copy.deepcopy(grasp_pose)
+    pre_grasp.header.frame_id = base_frame
+    pre_grasp.header.stamp = ros_time_now()
+    pre_grasp.pose.position.x += axis[0] * approach_gap
+    pre_grasp.pose.position.y += axis[1] * approach_gap
+    pre_grasp.pose.position.z += axis[2] * approach_gap
+    return pre_grasp
 
 
 def tag_plus_z_axis(tag_base_pose):
@@ -411,67 +393,12 @@ def normalize_axis(axis):
     return [float(value) / norm for value in axis]
 
 
-def build_pre_grasp_pose(tag_base_pose, grasp_pose, approach_gap, base_frame):
-    normal = tag_plus_z_axis(tag_base_pose)
-    pre_grasp = copy.deepcopy(grasp_pose)
-    pre_grasp.header.frame_id = base_frame
-    pre_grasp.header.stamp = ros_time_now()
-    pre_grasp.pose.position.x += normal[0] * approach_gap
-    pre_grasp.pose.position.y += normal[1] * approach_gap
-    pre_grasp.pose.position.z += normal[2] * approach_gap
-    return pre_grasp
-
-
-def build_pre_grasp_pose_from_entry(tag_base_pose, grasp_pose, entry,
-                                    approach_gap, base_frame):
-    if 'grasp_approach_axis_in_base' not in entry:
-        return build_pre_grasp_pose(
-            tag_base_pose, grasp_pose, approach_gap, base_frame)
-    normal = normalize_axis(entry['grasp_approach_axis_in_base'])
-    pre_grasp = copy.deepcopy(grasp_pose)
-    pre_grasp.header.frame_id = base_frame
-    pre_grasp.header.stamp = ros_time_now()
-    pre_grasp.pose.position.x += normal[0] * approach_gap
-    pre_grasp.pose.position.y += normal[1] * approach_gap
-    pre_grasp.pose.position.z += normal[2] * approach_gap
-    return pre_grasp
-
-
 def build_pre_place_pose(place_pose, place_gap, base_frame):
     pre_place = copy.deepcopy(place_pose)
     pre_place.header.frame_id = base_frame
     pre_place.header.stamp = ros_time_now()
     pre_place.pose.position.z += place_gap
     return pre_place
-
-
-def build_joint_align_values(current_joint_values, taught_joint_values,
-                             align_joints=None,
-                             option='--grasp-align-joints'):
-    if not taught_joint_values:
-        return None
-    align_joints = list(align_joints or [])
-    if not align_joints:
-        return None
-    current = [float(value) for value in current_joint_values]
-    taught = [float(value) for value in taught_joint_values]
-    if len(current) != len(taught):
-        raise RuntimeError('Taught joint value length does not match current joint value length.')
-    if not current:
-        return None
-    result = list(current)
-    changed = False
-    for align_joint in align_joints:
-        if align_joint < 1 or align_joint > len(current):
-            raise RuntimeError('%s must be in [1, %d], or 0 to disable.'
-                               % (option, len(current)))
-        index = align_joint - 1
-        if abs(result[index] - taught[index]) > PLACE_ALIGN_JOINT_TOLERANCE:
-            result[index] = taught[index]
-            changed = True
-    if not changed:
-        return None
-    return result
 
 
 def pose_position_distance(a, b):
@@ -534,7 +461,75 @@ def build_teach_assist_pose(tag_base_pose, front_gap, orientation_xyzw, base_fra
     return pose
 
 
-def load_preset(path):
+def median(values):
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise RuntimeError('Cannot compute median from no values.')
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def append_unique_tag_sample(samples, seen_stamps, stamp_ns,
+                             position, orientation_xyzw):
+    stamp_ns = int(stamp_ns)
+    if stamp_ns in seen_stamps:
+        return False
+    seen_stamps.add(stamp_ns)
+    samples.append({
+        'stamp_ns': stamp_ns,
+        'position': [float(value) for value in position],
+        'orientation_xyzw': normalize_quaternion(orientation_xyzw),
+    })
+    return True
+
+
+def filter_tag_translation_samples(samples, min_samples=10,
+                                   mad_scale=3.5,
+                                   max_axis_mad_m=0.005):
+    if len(samples) < int(min_samples):
+        raise RuntimeError(
+            'Only %d unique Tag samples were collected; need at least %d.'
+            % (len(samples), min_samples))
+    axes = list(zip(*[sample['position'] for sample in samples]))
+    centers = [median(axis) for axis in axes]
+    mads = [
+        median([abs(float(value) - center) for value in axis])
+        for axis, center in zip(axes, centers)
+    ]
+    if max(mads) > float(max_axis_mad_m):
+        raise RuntimeError(
+            'Tag translation is unstable: axis MAD=%s m exceeds %.4f m.'
+            % ([round(value, 6) for value in mads], max_axis_mad_m))
+    inliers = []
+    for sample in samples:
+        keep = True
+        for value, center, axis_mad in zip(
+                sample['position'], centers, mads):
+            limit = max(float(axis_mad) * float(mad_scale), 1e-6)
+            if abs(float(value) - center) > limit:
+                keep = False
+                break
+        if keep:
+            inliers.append(sample)
+    minimum_inliers = max(3, int(math.ceil(float(min_samples) * 0.7)))
+    if len(inliers) < minimum_inliers:
+        raise RuntimeError(
+            'Only %d stable Tag samples remain after filtering; need %d.'
+            % (len(inliers), minimum_inliers))
+    inlier_axes = list(zip(*[sample['position'] for sample in inliers]))
+    newest = max(inliers, key=lambda sample: sample['stamp_ns'])
+    return {
+        'position': [median(axis) for axis in inlier_axes],
+        'orientation_xyzw': newest['orientation_xyzw'],
+        'sample_count': len(samples),
+        'inlier_count': len(inliers),
+        'axis_mad_m': mads,
+    }
+
+
+def read_preset_json(path):
     if not os.path.isfile(path):
         raise RuntimeError('Preset file does not exist: %s' % path)
     try:
@@ -544,11 +539,50 @@ def load_preset(path):
         raise RuntimeError('Could not parse preset JSON: %s' % exc)
     except IOError as exc:
         raise RuntimeError('Could not read preset file: %s' % exc)
-    if preset.get('version') != PRESET_VERSION:
-        raise RuntimeError('Unsupported preset version: %r' % preset.get('version'))
     if not isinstance(preset.get('tags'), dict):
         raise RuntimeError('Preset file must contain a tags object.')
     return preset
+
+
+def load_preset(path):
+    preset = read_preset_json(path)
+    if preset.get('version') != PRESET_VERSION:
+        raise RuntimeError(
+            'Preset version 2 is required for robust pickup; found version %r. '
+            'Re-teach tag grasps to migrate while preserving place points.'
+            % preset.get('version'))
+    return preset
+
+
+def migrate_legacy_preset_for_teach(preset):
+    if preset.get('version') == PRESET_VERSION:
+        return copy.deepcopy(preset)
+    if preset.get('version') != 1:
+        raise RuntimeError(
+            'Cannot migrate unsupported preset version: %r.'
+            % preset.get('version'))
+    migrated = {
+        'version': PRESET_VERSION,
+        'base_frame': preset.get('base_frame', 'base'),
+        'camera_frame': preset.get(
+            'camera_frame', 'camera_rgb_optical_frame'),
+        'tags': {},
+    }
+    if 'idle_joint_values' in preset:
+        migrated['idle_joint_values'] = [
+            float(value) for value in preset['idle_joint_values']
+        ]
+    for tag_id, entry in preset.get('tags', {}).items():
+        migrated_entry = {}
+        if 'place_ee_in_base' in entry:
+            migrated_entry['place_ee_in_base'] = copy.deepcopy(
+                entry['place_ee_in_base'])
+        migrated['tags'][str(tag_id)] = migrated_entry
+    return migrated
+
+
+def load_preset_for_grasp_teach(path):
+    return migrate_legacy_preset_for_teach(read_preset_json(path))
 
 
 def make_empty_preset(base_frame, camera_frame):
@@ -562,7 +596,7 @@ def make_empty_preset(base_frame, camera_frame):
 
 def load_or_create_preset(args):
     if os.path.exists(args.preset_file):
-        return load_preset(args.preset_file), True
+        return load_preset_for_grasp_teach(args.preset_file), True
     return make_empty_preset(args.base_frame, args.camera_frame), False
 
 
@@ -608,6 +642,26 @@ def require_preset_tags(preset, sequence):
             raise RuntimeError('Preset file is missing tag %d.' % tag_id)
 
 
+def require_v2_pickup_model(preset):
+    model = preset.get('pickup_model')
+    if not isinstance(model, dict):
+        raise RuntimeError(
+            'Preset version 2 is missing pickup_model. Re-teach at least '
+            'one tag grasp before running.')
+    for field in (
+            'orientation_xyzw_base',
+            'approach_axis_xyz_base',
+            'contact_z_base'):
+        if field not in model:
+            raise RuntimeError(
+                'Preset pickup_model is missing %s. Re-teach tag grasps.'
+                % field)
+    normalize_quaternion(model['orientation_xyzw_base'])
+    normalize_axis(model['approach_axis_xyz_base'])
+    float(model['contact_z_base'])
+    return model
+
+
 def require_tag_fields(preset, tag_id, fields, mode):
     tags = preset.get('tags')
     if not isinstance(tags, dict) or str(tag_id) not in tags:
@@ -638,20 +692,28 @@ def require_field_overwrite(preset, sequence, field, overwrite):
 
 
 def record_tag_grasp_in_preset(preset, tag_id, tag_pose, grasp_pose,
-                               grasp_joint_values=None):
+                               approach_axis_base=None):
     entry = preset.setdefault('tags', {}).setdefault(str(tag_id), {})
-    entry['grasp_ee_in_tag'] = compute_grasp_ee_in_tag(tag_pose, grasp_pose)
-    entry['grasp_position_offset_in_base'] = compute_grasp_position_offset_in_base(
-        tag_pose, grasp_pose)
-    entry['grasp_orientation_in_base'] = normalize_quaternion(
-        quaternion_msg_to_list(grasp_pose.pose.orientation))
-    entry['grasp_approach_axis_in_base'] = normalize_axis(
-        tag_plus_z_axis(tag_pose))
-    if grasp_joint_values is not None:
-        entry['grasp_joint_values'] = [
-            float(value) for value in grasp_joint_values
-        ]
-    return entry['grasp_ee_in_tag']
+    entry['grasp_offset_xy_base'] = [
+        float(grasp_pose.pose.position.x - tag_pose.pose.position.x),
+        float(grasp_pose.pose.position.y - tag_pose.pose.position.y),
+    ]
+    if 'pickup_model' not in preset:
+        preset['pickup_model'] = {
+            'orientation_xyzw_base': normalize_quaternion(
+                quaternion_msg_to_list(grasp_pose.pose.orientation)),
+            'approach_axis_xyz_base': normalize_axis(
+                approach_axis_base or [-1.0, 0.0, 0.0]),
+            'contact_z_base': float(grasp_pose.pose.position.z),
+        }
+    for legacy_field in (
+            'grasp_ee_in_tag',
+            'grasp_position_offset_in_base',
+            'grasp_orientation_in_base',
+            'grasp_approach_axis_in_base',
+            'grasp_joint_values'):
+        entry.pop(legacy_field, None)
+    return entry['grasp_offset_xy_base']
 
 
 def record_tag_place_in_preset(preset, tag_id, place_pose):
@@ -746,25 +808,68 @@ def set_pump(pump_proxy, enabled):
 def wait_for_tag_pose_in_base(listener, args, tag_id):
     tag_frame = 'tag_%d' % tag_id
     deadline = rospy.Time.now() + rospy.Duration(args.tf_timeout)
+    sample_seconds = getattr(
+        args, 'tag_sample_seconds', DEFAULT_TAG_SAMPLE_SECONDS)
+    min_samples = getattr(
+        args, 'tag_min_samples', DEFAULT_TAG_MIN_SAMPLES)
+    max_mad_m = getattr(
+        args, 'tag_max_mad_m', DEFAULT_TAG_MAX_MAD_M)
+    max_age_seconds = getattr(
+        args, 'tag_max_age_seconds', DEFAULT_TAG_MAX_AGE_SECONDS)
+    samples = []
+    seen_stamps = set()
+    first_sample_wall_time = None
     while not rospy.is_shutdown() and rospy.Time.now() < deadline:
         try:
-            now = rospy.Time(0)
-            listener.waitForTransform(args.base_frame, tag_frame, now, rospy.Duration(0.3))
-            trans, rot = listener.lookupTransform(args.base_frame, tag_frame, now)
-            pose = PoseStamped()
-            pose.header.frame_id = args.base_frame
-            pose.header.stamp = rospy.Time.now()
-            pose.pose.position.x = trans[0]
-            pose.pose.position.y = trans[1]
-            pose.pose.position.z = trans[2]
-            pose.pose.orientation.x = rot[0]
-            pose.pose.orientation.y = rot[1]
-            pose.pose.orientation.z = rot[2]
-            pose.pose.orientation.w = rot[3]
-            return pose
+            common_time = listener.getLatestCommonTime(
+                args.base_frame, tag_frame)
+            age_seconds = (rospy.Time.now() - common_time).to_sec()
+            if age_seconds < 0.0 or age_seconds > max_age_seconds:
+                rospy.sleep(0.02)
+                continue
+            trans, rot = listener.lookupTransform(
+                args.base_frame, tag_frame, common_time)
+            stamp_ns = int(common_time.to_nsec())
+            if append_unique_tag_sample(
+                    samples, seen_stamps, stamp_ns, trans, rot):
+                if first_sample_wall_time is None:
+                    first_sample_wall_time = rospy.Time.now()
+            enough_time = (
+                first_sample_wall_time is not None and
+                (rospy.Time.now() - first_sample_wall_time).to_sec() >=
+                sample_seconds)
+            if enough_time and len(samples) >= min_samples:
+                filtered = filter_tag_translation_samples(
+                    samples, min_samples=min_samples,
+                    max_axis_mad_m=max_mad_m)
+                pose = PoseStamped()
+                pose.header.frame_id = args.base_frame
+                pose.header.stamp = rospy.Time.now()
+                pose.pose.position.x = filtered['position'][0]
+                pose.pose.position.y = filtered['position'][1]
+                pose.pose.position.z = filtered['position'][2]
+                orientation = filtered['orientation_xyzw']
+                pose.pose.orientation.x = orientation[0]
+                pose.pose.orientation.y = orientation[1]
+                pose.pose.orientation.z = orientation[2]
+                pose.pose.orientation.w = orientation[3]
+                rospy.loginfo(
+                    'tag_%d stable TF: inliers=%d/%d MAD_mm=[%.2f, %.2f, %.2f]',
+                    tag_id, filtered['inlier_count'],
+                    filtered['sample_count'],
+                    filtered['axis_mad_m'][0] * 1000.0,
+                    filtered['axis_mad_m'][1] * 1000.0,
+                    filtered['axis_mad_m'][2] * 1000.0)
+                return pose
         except (tf.Exception, tf.LookupException, tf.ConnectivityException,
                 tf.ExtrapolationException):
-            rospy.sleep(0.05)
+            pass
+        rospy.sleep(0.02)
+    if samples:
+        raise RuntimeError(
+            'tag_%d did not provide enough stable, fresh, unique TF samples: '
+            'collected %d, need %d within %.1fs.'
+            % (tag_id, len(samples), min_samples, args.tf_timeout))
     tag_exists = False
     camera_exists = False
     try:
@@ -1036,14 +1141,11 @@ def prompt_and_record_grasp(args, arm, preset, tag_id, tag_pose):
         rospy.loginfo('等待 %.2fs，让关节状态刷新稳定后再记录抓取点。', settle_seconds)
         rospy.sleep(settle_seconds)
     grasp_pose = arm.get_current_pose()
-    grasp_joint_values = arm.get_current_joint_values()
     record_tag_grasp_in_preset(
         preset, tag_id, tag_pose, grasp_pose,
-        grasp_joint_values=grasp_joint_values)
+        approach_axis_base=args.pickup_approach_axis_base)
     rospy.loginfo('步骤 3 完成：已记录 tag_%d 抓取接触姿态。', tag_id)
     rospy.loginfo(pose_to_text('tag_%d_grasp_ee_in_base' % tag_id, grasp_pose))
-    rospy.loginfo('tag_%d_grasp_joint_values=%s', tag_id,
-                  grasp_joint_values)
 
 
 def prompt_and_record_place(args, arm, preset, tag_id):
@@ -1080,8 +1182,8 @@ def teach_tag_sequence(args, arm):
 
 
 def teach_tag_grasp(args, arm):
-    preset = load_preset(args.preset_file)
-    require_field_overwrite(preset, args.sequence, 'grasp_ee_in_tag',
+    preset = load_preset_for_grasp_teach(args.preset_file)
+    require_field_overwrite(preset, args.sequence, 'grasp_offset_xy_base',
                             args.overwrite)
     for tag_id in args.sequence:
         require_tag_fields(preset, tag_id, ['place_ee_in_base'],
@@ -1104,8 +1206,9 @@ def teach_tag_place(args, arm):
     require_field_overwrite(preset, args.sequence, 'place_ee_in_base',
                             args.overwrite)
     for tag_id in args.sequence:
-        require_tag_fields(preset, tag_id, ['grasp_ee_in_tag'],
+        require_tag_fields(preset, tag_id, ['grasp_offset_xy_base'],
                            'teach_tag_place')
+    require_v2_pickup_model(preset)
     total_tags = len(args.sequence)
     for index, tag_id in enumerate(args.sequence, 1):
         rospy.loginfo('准备重采 tag_%d 放置点（当前第 %d/%d 个），抓取姿态会保留。',
@@ -1133,15 +1236,21 @@ def teach_idle(args, arm):
 def run_taught_sequence(args, arm, pump_proxy):
     preset = load_preset(args.preset_file)
     require_preset_tags(preset, args.sequence)
+    pickup_model = require_v2_pickup_model(preset)
     listener = tf.TransformListener()
     rospy.sleep(0.5)
     for tag_id in args.sequence:
         entry = preset['tags'][str(tag_id)]
+        require_tag_fields(
+            preset, tag_id,
+            ['grasp_offset_xy_base', 'place_ee_in_base'],
+            'run_taught_sequence')
         tag_pose = wait_for_tag_pose_in_base(listener, args, tag_id)
-        grasp_pose = compute_grasp_pose_from_entry(
-            tag_pose, entry, args.base_frame)
-        pre_grasp_pose = build_pre_grasp_pose_from_entry(
-            tag_pose, grasp_pose, entry, args.approach_gap, args.base_frame)
+        grasp_pose = compute_v2_grasp_pose(
+            tag_pose, pickup_model, entry, args.base_frame)
+        pre_grasp_pose = build_v2_pre_grasp_pose(
+            grasp_pose, pickup_model,
+            args.approach_gap, args.base_frame)
         place_pose = transform_to_pose(args.base_frame, entry['place_ee_in_base'])
         pre_place_pose = build_pre_place_pose(
             place_pose, args.place_approach_gap, args.base_frame)
@@ -1165,17 +1274,6 @@ def run_taught_sequence(args, arm, pump_proxy):
 
         holding_object = False
         try:
-            grasp_align_values = None
-            if entry.get('grasp_joint_values') and getattr(args, 'grasp_align_joints', None):
-                grasp_align_values = build_joint_align_values(
-                    arm.get_current_joint_values(),
-                    entry.get('grasp_joint_values'),
-                    args.grasp_align_joints,
-                    option='--grasp-align-joints')
-            if grasp_align_values is not None:
-                execute_joint_values(
-                    arm, grasp_align_values,
-                    'taught_grasp_align_joints')
             execute_pose(arm, pre_grasp_pose, 'taught_pre_grasp')
             execute_cartesian_pose(arm, grasp_pose, 'taught_grasp')
             set_pump(pump_proxy, True)
