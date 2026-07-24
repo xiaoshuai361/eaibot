@@ -91,7 +91,7 @@ def parse_args(argv):
     parser.add_argument('--python3', default=DEFAULT_PYTHON3)
     parser.add_argument('--detector-script', default=DEFAULT_DETECTOR_SCRIPT)
     parser.add_argument('--model', default=DEFAULT_MODEL)
-    parser.add_argument('--image-topic', default='/camera/rgb/image_raw')
+    parser.add_argument('--image-topic', default='/camera/rgb/image_rect_color')
     parser.add_argument('--camera-info-topic', default='/camera/rgb/camera_info')
     parser.add_argument('--output-image-topic', default='/tag_yolo_quiet/image_raw')
     parser.add_argument('--output-camera-info-topic', default='/tag_yolo_quiet/camera_info')
@@ -111,14 +111,34 @@ def parse_args(argv):
     return parser.parse_args(rospy.myargv(argv)[1:])
 
 
-def build_detections_payload(header, image_width, image_height, detections):
+def validate_camera_info_values(info_width, info_height, intrinsic_k,
+                                projection_p, image_width, image_height):
+    if int(info_width) != int(image_width) or int(info_height) != int(image_height):
+        return False
+    if len(intrinsic_k) != 9 or len(projection_p) != 12:
+        return False
+    fx = float(projection_p[0] or intrinsic_k[0])
+    fy = float(projection_p[5] or intrinsic_k[4])
+    return fx > 0.0 and fy > 0.0
+
+
+def build_detections_payload(header, image_width, image_height, detections,
+                             refresh_yolo=False, inference_seq=0,
+                             inference_stamp=None):
     stamp = getattr(header, 'stamp', None)
+    inference_stamp = stamp if inference_stamp is None else inference_stamp
     payload = {
         'stamp': {
             'secs': int(getattr(stamp, 'secs', 0)),
             'nsecs': int(getattr(stamp, 'nsecs', 0)),
         },
         'frame_id': getattr(header, 'frame_id', ''),
+        'refresh_yolo': bool(refresh_yolo),
+        'inference_seq': int(inference_seq),
+        'inference_stamp': {
+            'secs': int(getattr(inference_stamp, 'secs', 0)),
+            'nsecs': int(getattr(inference_stamp, 'nsecs', 0)),
+        },
         'image_width': int(image_width),
         'image_height': int(image_height),
         'detections': [],
@@ -228,6 +248,8 @@ class QuietZoneRelay(object):
         self.latest_camera_info = None
         self.busy = False
         self.last_yolo_update = rospy.Time(0)
+        self.last_inference_stamp = rospy.Time(0)
+        self.inference_seq = 0
         self.last_publish = rospy.Time(0)
         self.last_error_log_time = rospy.Time(0)
         self.lock = threading.Lock()
@@ -264,12 +286,31 @@ class QuietZoneRelay(object):
                 (rospy.Time.now() - self.last_yolo_update).to_sec() >= yolo_interval
             )
             image_bgr = self.bridge.imgmsg_to_cv2(message, desired_encoding='bgr8')
+            if not validate_camera_info_values(
+                    self.latest_camera_info.width,
+                    self.latest_camera_info.height,
+                    self.latest_camera_info.K,
+                    self.latest_camera_info.P,
+                    image_bgr.shape[1],
+                    image_bgr.shape[0]):
+                rospy.logerr_throttle(
+                    2.0,
+                    'Refusing uncalibrated/mismatched CameraInfo: '
+                    'image=%dx%d info=%dx%d fx=%.3f fy=%.3f',
+                    image_bgr.shape[1], image_bgr.shape[0],
+                    self.latest_camera_info.width,
+                    self.latest_camera_info.height,
+                    self.latest_camera_info.P[0] or self.latest_camera_info.K[0],
+                    self.latest_camera_info.P[5] or self.latest_camera_info.K[4])
+                return
             quiet_bgr, detections = self.worker.process_frame(
                 image_bgr, self.args.confidence, self.args.margin_ratio,
                 self.args.box_expand_pixels, refresh_boxes,
                 self.args.show_yolo_boxes)
             if refresh_boxes:
                 self.last_yolo_update = rospy.Time.now()
+                self.last_inference_stamp = message.header.stamp
+                self.inference_seq += 1
             output = self.bridge.cv2_to_imgmsg(quiet_bgr, encoding='bgr8')
             output.header = message.header
             camera_info = copy.deepcopy(self.latest_camera_info)
@@ -277,7 +318,10 @@ class QuietZoneRelay(object):
             self.image_pub.publish(output)
             self.info_pub.publish(camera_info)
             payload = build_detections_payload(
-                message.header, image_bgr.shape[1], image_bgr.shape[0], detections)
+                message.header, image_bgr.shape[1], image_bgr.shape[0],
+                detections, refresh_yolo=refresh_boxes,
+                inference_seq=self.inference_seq,
+                inference_stamp=self.last_inference_stamp)
             self.detections_pub.publish(
                 String(data=json.dumps(payload, ensure_ascii=True, allow_nan=False)))
             self.last_publish = rospy.Time.now()

@@ -122,10 +122,16 @@ def test_build_detections_payload_exposes_tag_ids_and_image_size():
         "outer_box": [5, 15, 35, 45],
     }]
 
-    payload = build_payload(header, image_width=640, image_height=480,
-                            detections=detections)
+    inference_stamp = type("Stamp", (), {"secs": 11, "nsecs": 99})()
+    payload = build_payload(
+        header, image_width=640, image_height=480,
+        detections=detections, refresh_yolo=True,
+        inference_seq=7, inference_stamp=inference_stamp)
 
     assert payload["stamp"] == {"secs": 12, "nsecs": 34}
+    assert payload["refresh_yolo"] is True
+    assert payload["inference_seq"] == 7
+    assert payload["inference_stamp"] == {"secs": 11, "nsecs": 99}
     assert payload["image_width"] == 640
     assert payload["image_height"] == 480
     assert payload["detections"] == [{
@@ -136,3 +142,23 @@ def test_build_detections_payload_exposes_tag_ids_and_image_size():
         "box": [10.0, 20.0, 30.0, 40.0],
         "outer_box": [5.0, 15.0, 35.0, 45.0],
     }]
+
+
+def test_relay_defaults_to_rectified_rgb_image():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "default='/camera/rgb/image_rect_color'" in source
+
+
+def test_camera_info_validation_rejects_uncalibrated_or_wrong_resolution():
+    validate, = load_functions("validate_camera_info_values")
+    valid_k = [520.0, 0.0, 320.0, 0.0, 520.0, 240.0, 0.0, 0.0, 1.0]
+    valid_p = [
+        520.0, 0.0, 320.0, 0.0,
+        0.0, 520.0, 240.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+    ]
+
+    assert validate(640, 480, valid_k, valid_p, 640, 480) is True
+    assert validate(640, 480, [0.0] * 9, [0.0] * 12, 640, 480) is False
+    assert validate(1280, 720, valid_k, valid_p, 640, 480) is False
