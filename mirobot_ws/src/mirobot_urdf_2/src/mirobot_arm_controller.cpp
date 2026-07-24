@@ -14,11 +14,15 @@
 #include <sensor_msgs/JointState.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 #include "MirobotType.h"
+#include "mirobot_motion_math.h"
 #include <boost/bind.hpp>
 #include <boost/thread/mutex.hpp>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <unistd.h>
+#include <vector>
 
 using namespace std;
 
@@ -38,20 +42,16 @@ namespace
 	double g_joint_state_publish_hz = 5.0;
 	double g_pose_query_timeout_seconds = 0.40;
 	double g_pose_query_poll_seconds = 0.02;
-	double g_post_motion_state_timeout_seconds = 1.0;
-	int g_post_motion_state_attempts = 3;
-	double g_post_motion_state_retry_delay_seconds = 0.20;
-	double g_measured_state_hold_seconds = 1.5;
+	int g_arm_feedrate = 1200;
+	double g_trajectory_completion_timeout_seconds = 15.0;
+	double g_trajectory_completion_poll_seconds = 0.15;
+	double g_trajectory_goal_tolerance_rad = 0.05;
 	double g_pose_query_failure_cooldown_seconds = 0.6;
 	const std::string kPumpOnCommand("1");
 	const std::string kPumpOffCommand("2");
 	boost::mutex g_arm_serial_mutex;
 	boost::mutex g_execution_state_mutex;
-	boost::mutex g_last_measured_pose_mutex;
 	bool g_executing_trajectory = false;
-	bool g_have_last_measured_pose = false;
-	Pose g_last_measured_pose;
-	ros::Time g_last_measured_pose_stamp;
 	ros::Time g_next_pose_query_time;
 
 	void setExecutingTrajectory(bool executing)
@@ -322,48 +322,11 @@ namespace
 		joint_state->position[5] = pose.jointAngle[5] * pi / 180;
 	}
 
-	void rememberMeasuredPose(const Pose &pose)
-	{
-		boost::mutex::scoped_lock lock(g_last_measured_pose_mutex);
-		g_last_measured_pose = pose;
-		g_last_measured_pose_stamp = ros::Time::now();
-		g_have_last_measured_pose = true;
-	}
-
 	void publishMeasuredJointState(const Pose &pose, const ros::Publisher &joint_pub)
 	{
-		rememberMeasuredPose(pose);
-
 		sensor_msgs::JointState joint_state;
 		fillJointStateFromPose(pose, &joint_state);
 		joint_pub.publish(joint_state);
-	}
-
-	bool publishLastMeasuredJointStateIfFresh(const ros::Publisher &joint_pub)
-	{
-		if (g_measured_state_hold_seconds <= 0.0)
-		{
-			return false;
-		}
-
-		Pose pose;
-		{
-			boost::mutex::scoped_lock lock(g_last_measured_pose_mutex);
-			if (!g_have_last_measured_pose)
-			{
-				return false;
-			}
-			if ((ros::Time::now() - g_last_measured_pose_stamp).toSec() > g_measured_state_hold_seconds)
-			{
-				return false;
-			}
-			pose = g_last_measured_pose;
-		}
-
-		sensor_msgs::JointState joint_state;
-		fillJointStateFromPose(pose, &joint_state);
-		joint_pub.publish(joint_state);
-		return true;
 	}
 
 	void markPoseQueryMiss()
@@ -380,39 +343,62 @@ namespace
 		g_next_pose_query_time = ros::Time(0);
 	}
 
-	void forgetLastMeasuredPose()
+	double maxJointTargetErrorRadians(
+		const Pose &pose, const std::vector<double> &target_positions)
 	{
-		boost::mutex::scoped_lock lock(g_last_measured_pose_mutex);
-		g_have_last_measured_pose = false;
+		double maximum_error = 0.0;
+		for (size_t index = 0; index < 6; ++index)
+		{
+			const double measured = pose.jointAngle[index] * pi / 180.0;
+			const double error = std::fabs(
+				shortestAngularDistance(measured, target_positions[index]));
+			maximum_error = std::max(maximum_error, error);
+		}
+		return maximum_error;
 	}
 
-	bool waitForMeasuredJointState(const ros::Publisher &joint_pub)
+	bool waitForFirmwareTarget(
+		const std::vector<double> &target_positions,
+		const ros::Publisher &joint_pub)
 	{
-		if (!g_publish_joint_states)
-		{
-			return true;
-		}
-
+		const ros::Time deadline = ros::Time::now() + ros::Duration(
+			g_trajectory_completion_timeout_seconds);
 		Pose pose;
-		for (int attempt = 0; attempt < g_post_motion_state_attempts; ++attempt)
+		while (ros::ok() && ros::Time::now() < deadline)
 		{
-			if (queryCurrentPoseUnlocked(&pose, g_post_motion_state_timeout_seconds))
+			if (!queryCurrentPoseUnlocked(
+					&pose, g_pose_query_timeout_seconds))
 			{
-				markPoseQuerySuccess();
-				publishMeasuredJointState(pose, joint_pub);
-				return true;
+				ros::Duration(
+					g_trajectory_completion_poll_seconds).sleep();
+				continue;
 			}
-
-			if (attempt + 1 < g_post_motion_state_attempts &&
-				g_post_motion_state_retry_delay_seconds > 0.0)
+			publishMeasuredJointState(pose, joint_pub);
+			if (pose.state == Alarm)
 			{
-				ros::Duration(g_post_motion_state_retry_delay_seconds).sleep();
+				ROS_ERROR("Mirobot firmware entered Alarm during trajectory completion.");
+				return false;
 			}
+			if (pose.state == Idle)
+			{
+				const double error = maxJointTargetErrorRadians(
+					pose, target_positions);
+				if (error <= g_trajectory_goal_tolerance_rad)
+				{
+					markPoseQuerySuccess();
+					return true;
+				}
+				ROS_ERROR(
+					"Mirobot firmware is Idle, but final joint error %.3f rad exceeds %.3f rad.",
+					error, g_trajectory_goal_tolerance_rad);
+				return false;
+			}
+			ros::Duration(g_trajectory_completion_poll_seconds).sleep();
 		}
-
 		markPoseQueryMiss();
-		ROS_WARN("Trajectory finished, but measured joint state was not updated from serial after %d attempt(s).",
-				 g_post_motion_state_attempts);
+		ROS_ERROR(
+			"Timed out after %.1fs waiting for Mirobot firmware Idle at the target.",
+			g_trajectory_completion_timeout_seconds);
 		return false;
 	}
 
@@ -430,7 +416,6 @@ namespace
 		}
 		if (ros::Time::now() < g_next_pose_query_time)
 		{
-			publishLastMeasuredJointStateIfFresh(*joint_pub);
 			return;
 		}
 
@@ -438,10 +423,6 @@ namespace
 		if (!queryCurrentPoseUnlocked(&pose, g_pose_query_timeout_seconds))
 		{
 			markPoseQueryMiss();
-			if (publishLastMeasuredJointStateIfFresh(*joint_pub))
-			{
-				return;
-			}
 			ROS_WARN_THROTTLE(5.0, "Failed to query measured arm joint state from serial.");
 			return;
 		}
@@ -466,12 +447,13 @@ namespace
 		{
 			ROS_INFO_STREAM("Auto homing on startup is enabled.");
 			_serial.write("$H\n");
-			forgetLastMeasuredPose();
 		}
 		else if (g_move_to_zero_pose_on_start)
 		{
 			ROS_INFO_STREAM("Auto homing on startup is disabled. Moving directly to zero pose.");
-			_serial.write("M50 G0 X0 Y0 Z0 A0B0C0 F3000\r\n");
+			std::ostringstream command;
+			command << "M50 G0 X0 Y0 Z0 A0B0C0 F" << g_arm_feedrate << "\r\n";
+			_serial.write(command.str());
 		}
 		else
 		{
@@ -486,6 +468,12 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 {
 	if (goalPtr->trajectory.points.empty())
 	{
+		moveit_server->setAborted();
+		return;
+	}
+	if (isExecutingTrajectory())
+	{
+		ROS_ERROR("Rejecting trajectory because the previous goal is still active.");
 		moveit_server->setAborted();
 		return;
 	}
@@ -505,8 +493,22 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 	char angle3[10];
 	char angle4[10];
 	char angle5[10];
+	char feedrate[16];
+	sprintf(feedrate, "%d", g_arm_feedrate);
+	std::vector<double> target_positions(6, 0.0);
 
 	const size_t n_tra_points = goalPtr->trajectory.points.size();
+	double previous_joint6 = goalPtr->trajectory.points[0].positions.size() >= 6
+		? goalPtr->trajectory.points[0].positions[5] : 0.0;
+	Pose initial_pose;
+	if (queryCurrentPoseUnlocked(&initial_pose, g_pose_query_timeout_seconds))
+	{
+		previous_joint6 = initial_pose.jointAngle[5] * pi / 180.0;
+		if (g_publish_joint_states)
+		{
+			publishMeasuredJointState(initial_pose, *joint_pub);
+		}
+	}
 	for (size_t index = 0; index < n_tra_points; ++index)
 	{
 		if (index == 0 && n_tra_points > 1)
@@ -529,14 +531,20 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 			moveit_server->setAborted();
 			return;
 		}
+		std::vector<double> adjusted_positions(
+			point.positions.begin(), point.positions.begin() + 6);
+		adjusted_positions[5] = nearestEquivalentAngleWithinLimits(
+			adjusted_positions[5], previous_joint6, -2.0 * pi, 2.0 * pi);
+		previous_joint6 = adjusted_positions[5];
+		target_positions = adjusted_positions;
 
-		sprintf(angle0, "%.2f", point.positions[0] * 57.296);
-		sprintf(angle1, "%.2f", point.positions[1] * 57.296);
-		sprintf(angle2, "%.2f", point.positions[2] * 57.296);
-		sprintf(angle3, "%.2f", point.positions[3] * 57.296);
-		sprintf(angle4, "%.2f", point.positions[4] * 57.296);
-		sprintf(angle5, "%.2f", point.positions[5] * 57.296);
-		Gcode = (std::string) "M50 G0 X" + angle0 + " Y" + angle1 + " Z" + angle2 + " A" + angle3 + "B" + angle4 + "C" + angle5 + " F3000" + "\r\n";
+		sprintf(angle0, "%.2f", adjusted_positions[0] * 57.296);
+		sprintf(angle1, "%.2f", adjusted_positions[1] * 57.296);
+		sprintf(angle2, "%.2f", adjusted_positions[2] * 57.296);
+		sprintf(angle3, "%.2f", adjusted_positions[3] * 57.296);
+		sprintf(angle4, "%.2f", adjusted_positions[4] * 57.296);
+		sprintf(angle5, "%.2f", adjusted_positions[5] * 57.296);
+		Gcode = (std::string) "M50 G0 X" + angle0 + " Y" + angle1 + " Z" + angle2 + " A" + angle3 + "B" + angle4 + "C" + angle5 + " F" + feedrate + "\r\n";
 		ROS_DEBUG_STREAM("Arm GCode: " << Gcode);
 		_serial.write(Gcode.c_str());
 
@@ -556,7 +564,11 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 		}
 	}
 
-	waitForMeasuredJointState(*joint_pub);
+	if (!waitForFirmwareTarget(target_positions, *joint_pub))
+	{
+		moveit_server->setAborted();
+		return;
+	}
 	if (moveit_server->isPreemptRequested())
 	{
 		ROS_WARN("Trajectory execution finished after a preempt request.");
@@ -605,7 +617,6 @@ bool trigger_startup_home(std_srvs::Trigger::Request &req,
 
 	ROS_INFO_STREAM("Startup homing service requested.");
 	_serial.write("$H\n");
-	forgetLastMeasuredPose();
 	res.success = true;
 	res.message = "Sent startup homing command $H.";
 	return true;
@@ -624,10 +635,10 @@ int main(int argc, char *argv[])
 	private_nh.param("move_to_zero_pose_on_start", g_move_to_zero_pose_on_start, false);
 	private_nh.param("joint_state_publish_hz", g_joint_state_publish_hz, 5.0);
 	private_nh.param("pose_query_timeout_seconds", g_pose_query_timeout_seconds, 0.40);
-	private_nh.param("post_motion_state_timeout_seconds", g_post_motion_state_timeout_seconds, 1.0);
-	private_nh.param("post_motion_state_attempts", g_post_motion_state_attempts, 3);
-	private_nh.param("post_motion_state_retry_delay_seconds", g_post_motion_state_retry_delay_seconds, 0.20);
-	private_nh.param("measured_state_hold_seconds", g_measured_state_hold_seconds, 1.5);
+	private_nh.param("arm_feedrate", g_arm_feedrate, 1200);
+	private_nh.param("trajectory_completion_timeout_seconds", g_trajectory_completion_timeout_seconds, 15.0);
+	private_nh.param("trajectory_completion_poll_seconds", g_trajectory_completion_poll_seconds, 0.15);
+	private_nh.param("trajectory_goal_tolerance_rad", g_trajectory_goal_tolerance_rad, 0.05);
 	private_nh.param("pose_query_failure_cooldown_seconds", g_pose_query_failure_cooldown_seconds, 0.6);
 
 	if (g_joint_state_publish_hz <= 0.0)
@@ -638,21 +649,21 @@ int main(int argc, char *argv[])
 	{
 		g_pose_query_timeout_seconds = 0.05;
 	}
-	if (g_post_motion_state_timeout_seconds < 0.05)
+	if (g_arm_feedrate < 1)
 	{
-		g_post_motion_state_timeout_seconds = 0.05;
+		g_arm_feedrate = 1200;
 	}
-	if (g_post_motion_state_attempts < 1)
+	if (g_trajectory_completion_timeout_seconds < 1.0)
 	{
-		g_post_motion_state_attempts = 1;
+		g_trajectory_completion_timeout_seconds = 1.0;
 	}
-	if (g_post_motion_state_retry_delay_seconds < 0.0)
+	if (g_trajectory_completion_poll_seconds < 0.02)
 	{
-		g_post_motion_state_retry_delay_seconds = 0.0;
+		g_trajectory_completion_poll_seconds = 0.02;
 	}
-	if (g_measured_state_hold_seconds < 0.0)
+	if (g_trajectory_goal_tolerance_rad <= 0.0)
 	{
-		g_measured_state_hold_seconds = 0.0;
+		g_trajectory_goal_tolerance_rad = 0.05;
 	}
 	if (g_pose_query_failure_cooldown_seconds < 0.0)
 	{

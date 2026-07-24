@@ -5,10 +5,10 @@
 	<arg name="single_arm_serial" default="true" />
 	<arg name="joint_state_publish_hz" default="5.0" />
 	<arg name="pose_query_timeout_seconds" default="0.40" />
-	<arg name="post_motion_state_timeout_seconds" default="1.0" />
-	<arg name="post_motion_state_attempts" default="3" />
-	<arg name="post_motion_state_retry_delay_seconds" default="0.20" />
-	<arg name="measured_state_hold_seconds" default="1.5" />
+	<arg name="arm_feedrate" default="1200" />
+	<arg name="trajectory_completion_timeout_seconds" default="15.0" />
+	<arg name="trajectory_completion_poll_seconds" default="0.15" />
+	<arg name="trajectory_goal_tolerance_rad" default="0.05" />
 	<arg name="pose_query_failure_cooldown_seconds" default="0.6" />
 	<arg name="auto_home_on_start" default="true" />
 	<arg name="move_to_zero_pose_on_start" default="false" />
@@ -26,10 +26,10 @@
 		<param name="publish_joint_states" value="$(arg single_arm_serial)" />
 		<param name="joint_state_publish_hz" value="$(arg joint_state_publish_hz)" />
 		<param name="pose_query_timeout_seconds" value="$(arg pose_query_timeout_seconds)" />
-		<param name="post_motion_state_timeout_seconds" value="$(arg post_motion_state_timeout_seconds)" />
-		<param name="post_motion_state_attempts" value="$(arg post_motion_state_attempts)" />
-		<param name="post_motion_state_retry_delay_seconds" value="$(arg post_motion_state_retry_delay_seconds)" />
-		<param name="measured_state_hold_seconds" value="$(arg measured_state_hold_seconds)" />
+		<param name="arm_feedrate" value="$(arg arm_feedrate)" />
+		<param name="trajectory_completion_timeout_seconds" value="$(arg trajectory_completion_timeout_seconds)" />
+		<param name="trajectory_completion_poll_seconds" value="$(arg trajectory_completion_poll_seconds)" />
+		<param name="trajectory_goal_tolerance_rad" value="$(arg trajectory_goal_tolerance_rad)" />
 		<param name="pose_query_failure_cooldown_seconds" value="$(arg pose_query_failure_cooldown_seconds)" />
 		<param name="auto_home_on_start" value="$(arg auto_home_on_start)" />
 		<param name="move_to_zero_pose_on_start" value="$(arg move_to_zero_pose_on_start)" />
