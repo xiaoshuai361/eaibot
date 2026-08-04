@@ -9,10 +9,17 @@ import cv2
 import numpy as np
 import rospy
 from geometry_msgs.msg import Twist
+from traffic_light_vision import (
+    TrafficLightDetector,
+    configure_traffic_camera,
+    draw_traffic_light,
+    set_capture_resolution,
+    update_green_hits,
+)
 
 
 # ===== 摄像头与运行模式 =====
-CAMERA_INDEX = 2          # 巡线摄像头编号；打不开画面时依次试 0/1/2。
+CAMERA_INDEX = 4          # 巡线摄像头编号；红绿灯摄像头固定使用 0。
 PROCESS_WIDTH = 640       # 处理图宽度；通常保持 640，改动后 PID 和像素距离要重调。
 DRY_RUN = True            # True 只识别不发速度；实车确认画面正确后改 False。
 DEBUG_VIEW = True         # True 显示识别窗口；无显示器运行时可改 False。
@@ -150,6 +157,17 @@ MODEL_MAX_ABS_SLOPE = 0.85  # 新锁边线最大横向斜率；斑马条拟合�
 MODEL_CENTER_CROSS_MARGIN_RATIO = 0.08 # 边线在 ROI 内越过画面中心的容差；误锁对侧杂线时减小。
 WINDOW_NAME = "line_cy_new" # 调试窗口名称；不影响算法。
 PROCESSED_WINDOW_NAME = "line_cy_new_processed" # 二值处理结果窗口名称。
+
+# ===== 红绿灯等待 =====
+TRAFFIC_LIGHT_ENABLED = True # 摆正入口横条后必须确认绿灯才进入路口。
+TRAFFIC_LIGHT_CAMERA_INDEX = 0 # 红绿灯摄像头编号。
+TRAFFIC_LIGHT_FRAME_WIDTH = 320 # 红绿灯摄像头采集宽度。
+TRAFFIC_LIGHT_FRAME_HEIGHT = 240 # 红绿灯摄像头采集高度。
+TRAFFIC_LIGHT_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/traffic_lights_yolov5n_320_best.onnx"
+TRAFFIC_LIGHT_CONFIDENCE = 0.55 # 单帧灯色最低置信度。
+TRAFFIC_GREEN_STABLE_FRAMES = 2 # 连续绿灯确认帧数，防止单帧误放行。
+TRAFFIC_LIGHT_RETRY_TIME = 2.0 # 摄像头或模型失败后的重试间隔(s)。
+TRAFFIC_LIGHT_WINDOW_NAME = "line_cy_new_traffic_light"
 
 
 def clamp(value, low, high):
@@ -1306,7 +1324,7 @@ class BinaryVision(object):
 
 
 class CameraReader(object):
-    def __init__(self, index):
+    def __init__(self, index, frame_width=None, frame_height=None):
         backend = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else 0
         self.cap = cv2.VideoCapture(index, backend)
         if not self.cap.isOpened():
@@ -1318,7 +1336,10 @@ class CameraReader(object):
         self.running = self.cap.isOpened()
         self.thread = None
         if self.running:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if frame_width is not None and frame_height is not None:
+                set_capture_resolution(self.cap, frame_width, frame_height)
+            else:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.thread = threading.Thread(target=self._loop)
             self.thread.daemon = True
             self.thread.start()
@@ -1381,6 +1402,21 @@ class LaneFollower(object):
         self.process_width = int(rospy.get_param("~process_width", PROCESS_WIDTH))
         self.dry_run = bool(rospy.get_param("~dry_run", DRY_RUN))
         self.debug_view = bool(rospy.get_param("~debug_view", DEBUG_VIEW))
+        self.traffic_light_enabled = bool(rospy.get_param(
+            "~traffic_light_enabled", TRAFFIC_LIGHT_ENABLED
+        ))
+        self.traffic_light_camera_index = int(rospy.get_param(
+            "~traffic_light_camera_index", TRAFFIC_LIGHT_CAMERA_INDEX
+        ))
+        self.traffic_light_model_path = str(rospy.get_param(
+            "~traffic_light_model_path", TRAFFIC_LIGHT_MODEL_PATH
+        ))
+        self.traffic_light_confidence = clamp(float(rospy.get_param(
+            "~traffic_light_confidence", TRAFFIC_LIGHT_CONFIDENCE
+        )), 0.01, 1.0)
+        self.traffic_green_stable_frames = max(1, int(rospy.get_param(
+            "~traffic_green_stable_frames", TRAFFIC_GREEN_STABLE_FRAMES
+        )))
         self.turn_entry_time = max(0.0, float(rospy.get_param(
             "~turn_entry_time", TURN_ENTRY_TIME
         )))
@@ -1407,6 +1443,11 @@ class LaneFollower(object):
         self.lanes = LaneDetector(fill_width=FILL_WIDTH_PIXELS)
         self.crosswalk = CrosswalkDetector()
         self.camera = CameraReader(self.camera_index)
+        self.traffic_camera = None
+        self.traffic_detector = None
+        self.traffic_green_hits = 0
+        self.traffic_last_color = None
+        self.traffic_retry_after = 0.0
         self.pid = PID(KP, KD, MAX_ANGULAR)
         self.lane_width = LANE_WIDTH_PIXELS if LANE_WIDTH_PIXELS > 0 else PROCESS_WIDTH * DEFAULT_LANE_WIDTH_RATIO
         self.bridge = DualLineBridge(self.lane_width, fill_width=FILL_WIDTH_PIXELS)
@@ -1491,10 +1532,100 @@ class LaneFollower(object):
         else:
             self.publish(0, 0)
 
+    def _entry_ready_state(self):
+        return "TRAFFIC_WAIT" if self.traffic_light_enabled else "MANEUVER"
+
+    def _close_traffic_light(self):
+        if self.traffic_detector is not None:
+            self.traffic_detector.close()
+        self.traffic_detector = None
+        if self.traffic_camera is not None:
+            self.traffic_camera.release()
+        self.traffic_camera = None
+        self.traffic_green_hits = 0
+        self.traffic_last_color = None
+        try:
+            cv2.destroyWindow(TRAFFIC_LIGHT_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+    def _open_traffic_light(self):
+        configure_traffic_camera(self.traffic_light_camera_index)
+        camera = CameraReader(
+            self.traffic_light_camera_index,
+            TRAFFIC_LIGHT_FRAME_WIDTH,
+            TRAFFIC_LIGHT_FRAME_HEIGHT,
+        )
+        if not camera.cap.isOpened():
+            camera.release()
+            raise RuntimeError("无法打开红绿灯摄像头 %d" %
+                               self.traffic_light_camera_index)
+        detector = TrafficLightDetector(
+            self.traffic_light_model_path,
+            confidence=self.traffic_light_confidence,
+        )
+        try:
+            detector.load()
+        except Exception:
+            camera.release()
+            raise
+        self.traffic_camera = camera
+        self.traffic_detector = detector
+        rospy.loginfo(
+            "line_cy_new 红绿灯模型已在停止线加载：camera=%d model=%s",
+            self.traffic_light_camera_index,
+            self.traffic_light_model_path,
+        )
+
+    def _handle_traffic_light_wait(self, now):
+        self.publish(0, 0)
+        if self.traffic_detector is None or self.traffic_camera is None:
+            if float(now) < self.traffic_retry_after:
+                return
+            try:
+                self._open_traffic_light()
+            except Exception as exc:
+                self._close_traffic_light()
+                self.traffic_retry_after = float(now) + TRAFFIC_LIGHT_RETRY_TIME
+                rospy.logwarn("line_cy_new 红绿灯识别启动失败，保持停车：%s", exc)
+                return
+        ok, frame = self.traffic_camera.read(0.2)
+        if not ok:
+            return
+        try:
+            detections = self.traffic_detector.detect(frame)
+        except Exception as exc:
+            self._close_traffic_light()
+            self.traffic_retry_after = float(now) + TRAFFIC_LIGHT_RETRY_TIME
+            rospy.logwarn("line_cy_new 红绿灯推理失败，保持停车：%s", exc)
+            return
+        self.traffic_green_hits, green_ready, color = update_green_hits(
+            detections, self.traffic_green_hits,
+            self.traffic_green_stable_frames,
+        )
+        self.traffic_last_color = color
+        if self.debug_view:
+            try:
+                cv2.imshow(
+                    TRAFFIC_LIGHT_WINDOW_NAME,
+                    draw_traffic_light(
+                        frame, detections, color, self.traffic_green_hits,
+                        self.traffic_green_stable_frames,
+                    ),
+                )
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+        if green_ready:
+            rospy.loginfo("line_cy_new 连续识别到绿灯，释放模型并进入路口")
+            self._set_state("MANEUVER")
+
     def _set_state(self, state):
         if state == self.state:
             return
         previous_state = self.state
+        if previous_state == "TRAFFIC_WAIT" and state != "TRAFFIC_WAIT":
+            self._close_traffic_light()
         rospy.loginfo("line_cy_new state: %s -> %s", previous_state, state)
         self.state = state
         self.state_started = rospy.get_time()
@@ -1508,8 +1639,12 @@ class LaneFollower(object):
             self.entry_accept_after = (
                 self.state_started + EXIT_ENTRY_IGNORE_TIME
             )
-        if state in ("FOLLOW", "MANEUVER"):
+        if state in ("FOLLOW", "MANEUVER", "TRAFFIC_WAIT"):
             self.crosswalk.unlock_bar()
+        if state == "TRAFFIC_WAIT":
+            self.traffic_retry_after = self.state_started
+            self.traffic_green_hits = 0
+            self.traffic_last_color = None
         if state == "MANEUVER":
             self.entry_cleared = False
             self.clear_hits = self.exit_hits = self.dual_hits = 0
@@ -1642,7 +1777,7 @@ class LaneFollower(object):
                 now - self.state_started, len(cross.stripe_polygons),
             )
             if next_state is not None:
-                self._set_state(next_state)
+                self._set_state(self._entry_ready_state())
 
         elif self.state == "EXIT_ALIGN":
             angle = cross.stop_angle if cross.candidate else cross.tracking_angle
@@ -1673,6 +1808,9 @@ class LaneFollower(object):
                 else:
                     self.publish(0, 0)
 
+        elif self.state == "TRAFFIC_WAIT":
+            self._handle_traffic_light_wait(now)
+
         elif self.state == "WAIT":
             angle = cross.stop_angle if cross.candidate else cross.tracking_angle
             visible = angle is not None
@@ -1687,7 +1825,7 @@ class LaneFollower(object):
             )
             self.publish(0, 0)
             if next_state is not None:
-                self._set_state(next_state)
+                self._set_state(self._entry_ready_state())
 
         elif self.state == "MANEUVER":
             lane_binary = mask_crosswalk(binary, cross, include_loose=True)
@@ -1844,6 +1982,7 @@ class LaneFollower(object):
         try:
             self.publish(0, 0)
             self.camera.release()
+            self._close_traffic_light()
         except Exception:
             pass
 

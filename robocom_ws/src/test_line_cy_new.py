@@ -1592,6 +1592,92 @@ class StateTests(unittest.TestCase):
             elapsed=0.25,
         ), "FOLLOW")
 
+    def test_both_routes_use_camera_four_and_required_traffic_model(self):
+        expected_model = (
+            "/home/eaibot/handeye-calib/src/model/yolov5/"
+            "traffic_lights_yolov5n_320_best.onnx"
+        )
+        for module in (line_new, line_task):
+            self.assertEqual(module.CAMERA_INDEX, 4)
+            self.assertEqual(module.TRAFFIC_LIGHT_CAMERA_INDEX, 0)
+            self.assertEqual(module.TRAFFIC_LIGHT_FRAME_WIDTH, 320)
+            self.assertEqual(module.TRAFFIC_LIGHT_FRAME_HEIGHT, 240)
+            self.assertEqual(module.TRAFFIC_LIGHT_MODEL_PATH, expected_model)
+
+    def test_entry_alignment_routes_through_traffic_wait(self):
+        for module in (line_new, line_task):
+            follower = module.LaneFollower.__new__(module.LaneFollower)
+            follower.traffic_light_enabled = True
+            self.assertEqual(follower._entry_ready_state(), "TRAFFIC_WAIT")
+            follower.traffic_light_enabled = False
+            self.assertEqual(follower._entry_ready_state(), "MANEUVER")
+
+    def test_closing_traffic_wait_releases_owned_model_and_camera(self):
+        events = []
+        follower = line_new.LaneFollower.__new__(line_new.LaneFollower)
+        follower.traffic_detector = types.SimpleNamespace(
+            close=lambda: events.append("model_closed")
+        )
+        follower.traffic_camera = types.SimpleNamespace(
+            release=lambda: events.append("camera_closed")
+        )
+        follower.traffic_green_hits = 2
+        follower.traffic_last_color = "Green"
+
+        follower._close_traffic_light()
+
+        self.assertEqual(events, ["model_closed", "camera_closed"])
+        self.assertIsNone(follower.traffic_detector)
+        self.assertIsNone(follower.traffic_camera)
+
+    def test_two_green_frames_are_required_before_maneuver(self):
+        detection = types.SimpleNamespace(class_name="Green", confidence=0.9)
+        follower = line_new.LaneFollower.__new__(line_new.LaneFollower)
+        follower.traffic_detector = types.SimpleNamespace(
+            detect=lambda frame: [detection]
+        )
+        follower.traffic_camera = types.SimpleNamespace(
+            read=lambda timeout: (True, np.zeros((240, 320, 3), np.uint8))
+        )
+        follower.traffic_green_hits = 0
+        follower.traffic_green_stable_frames = 2
+        follower.traffic_last_color = None
+        follower.traffic_retry_after = 0.0
+        follower.debug_view = False
+        follower.publish = lambda linear, angular: None
+        transitions = []
+        follower._set_state = lambda state: transitions.append(state)
+        original_loginfo = getattr(line_new.rospy, "loginfo", None)
+        line_new.rospy.loginfo = lambda *args: None
+        try:
+            follower._handle_traffic_light_wait(10.0)
+            self.assertEqual(transitions, [])
+            follower._handle_traffic_light_wait(10.1)
+        finally:
+            if original_loginfo is None:
+                delattr(line_new.rospy, "loginfo")
+            else:
+                line_new.rospy.loginfo = original_loginfo
+
+        self.assertEqual(transitions, ["MANEUVER"])
+
+    def test_task_traffic_wait_does_not_overlap_existing_yolo_inference(self):
+        follower = line_task.LaneFollower.__new__(line_task.LaneFollower)
+        follower.yolo_worker_active = True
+        follower.traffic_detector = None
+        follower.traffic_camera = None
+        follower.published = []
+        follower.publish = lambda linear, angular: follower.published.append(
+            (linear, angular)
+        )
+        follower._open_traffic_light = lambda: self.fail(
+            "旧 YOLO 推理未结束时不应加载红绿灯模型"
+        )
+
+        follower._handle_traffic_light_wait(10.0)
+
+        self.assertEqual(follower.published, [(0, 0)])
+
 
 class TaskEntryAlignmentLockTests(unittest.TestCase):
     def _patch_task_rospy(self, now=10.0):
@@ -1905,7 +1991,7 @@ class TaskYoloTests(unittest.TestCase):
                 return []
 
         class FakeCamera(object):
-            def __init__(self, index):
+            def __init__(self, index, frame_width=None, frame_height=None):
                 events.append("camera_created")
                 self.cap = types.SimpleNamespace(isOpened=lambda: True)
 
@@ -2433,7 +2519,7 @@ class TaskYoloTests(unittest.TestCase):
                 return []
 
         class FakeCamera(object):
-            def __init__(self, index):
+            def __init__(self, index, frame_width=None, frame_height=None):
                 self.cap = types.SimpleNamespace(isOpened=lambda: True)
 
             def read(self, timeout=0.0):
