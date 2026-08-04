@@ -61,7 +61,8 @@ def make_pose(x=0.0, y=0.0, z=0.0, q=None, frame="base"):
     return pose
 
 
-def make_v3_preset(tag_ids=(1,), idle_joint_values=None):
+def make_v3_preset(tag_ids=(1,), idle_joint_values=None,
+                   carry_joint_values=None):
     preset = {
         "version": 3,
         "base_frame": "base",
@@ -82,6 +83,8 @@ def make_v3_preset(tag_ids=(1,), idle_joint_values=None):
         }
     if idle_joint_values is not None:
         preset["idle_joint_values"] = list(idle_joint_values)
+    if carry_joint_values is not None:
+        preset["carry_joint_values"] = list(carry_joint_values)
     return preset
 
 
@@ -108,6 +111,193 @@ def test_parse_args_has_no_post_pick_place_joint_alignment():
 
     assert not hasattr(args, "place_align_joints")
     assert not hasattr(args, "carry_joint6_lock")
+    assert not hasattr(args, "tag_sample_seconds")
+    assert args.tag_min_samples == 5
+    assert args.tag_max_age_seconds == pytest.approx(2.0)
+    assert args.velocity_scale == pytest.approx(0.4)
+    assert args.acceleration_scale == pytest.approx(0.4)
+    assert parse_args(["prog", "--mode", "teach_carry"]).mode == "teach_carry"
+
+
+def test_teach_tag_pose_falls_back_to_latest_tf_when_strict_sampling_has_no_fresh_frames():
+    wait_for_tag_pose_in_base, = load_module_symbols("wait_for_tag_pose_in_base")
+    warnings = []
+
+    class FakeDuration:
+        def __init__(self, seconds):
+            self.seconds = float(seconds)
+
+        def to_sec(self):
+            return self.seconds
+
+    class FakeTime:
+        current = 0.0
+
+        def __init__(self, seconds=0.0):
+            self.seconds = float(seconds)
+
+        @staticmethod
+        def now():
+            FakeTime.current += 0.25
+            return FakeTime(FakeTime.current)
+
+        def __add__(self, duration):
+            return FakeTime(self.seconds + duration.seconds)
+
+        def __sub__(self, other):
+            return FakeDuration(self.seconds - other.seconds)
+
+        def __lt__(self, other):
+            return self.seconds < other.seconds
+
+        def to_nsec(self):
+            return int(self.seconds * 1000000000)
+
+    class FakeListener:
+        def getLatestCommonTime(self, base_frame, tag_frame):
+            return FakeTime(-10.0)
+
+        def lookupTransform(self, base_frame, tag_frame, stamp):
+            return [0.24, 0.08, 0.11], [0.0, 0.0, 0.0, 1.0]
+
+    args = SimpleNamespace(
+        mode="teach_tag_grasp",
+        base_frame="base",
+        camera_frame="camera_rgb_optical_frame",
+        tf_timeout=0.5,
+        tag_min_samples=2,
+        tag_max_mad_m=0.005,
+        tag_max_age_seconds=0.5,
+    )
+    wait_for_tag_pose_in_base.__globals__.update({
+        "rospy": SimpleNamespace(
+            Time=FakeTime,
+            Duration=FakeDuration,
+            is_shutdown=lambda: False,
+            sleep=lambda seconds: None,
+            loginfo=lambda *items: None,
+            logwarn=lambda *items: warnings.append(items),
+        ),
+        "tf": SimpleNamespace(
+            Exception=Exception,
+            LookupException=Exception,
+            ConnectivityException=Exception,
+            ExtrapolationException=Exception,
+        ),
+    })
+
+    pose = wait_for_tag_pose_in_base(FakeListener(), args, 4)
+
+    assert pose.pose.position.x == pytest.approx(0.24)
+    assert pose.pose.position.y == pytest.approx(0.08)
+    assert pose.pose.position.z == pytest.approx(0.11)
+    assert warnings
+
+
+def test_filter_tag_translation_samples_requires_five_inliers_after_mad_filtering():
+    filter_tag_translation_samples, = load_module_symbols("filter_tag_translation_samples")
+    samples = [
+        {"stamp_ns": 1, "position": [0.100, 0.200, 0.300], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"stamp_ns": 2, "position": [0.101, 0.199, 0.300], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"stamp_ns": 3, "position": [0.099, 0.201, 0.300], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"stamp_ns": 4, "position": [0.100, 0.200, 0.301], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"stamp_ns": 5, "position": [0.102, 0.198, 0.299], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"stamp_ns": 6, "position": [0.180, 0.260, 0.300], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+    ]
+
+    filtered = filter_tag_translation_samples(
+        samples, min_samples=5, max_axis_mad_m=0.005)
+
+    assert filtered["inlier_count"] == 5
+    assert filtered["sample_count"] == 6
+    assert filtered["position"] == pytest.approx([0.100, 0.200, 0.300])
+
+
+def test_wait_for_tag_pose_keeps_collecting_until_five_mad_inliers():
+    wait_for_tag_pose_in_base, = load_module_symbols("wait_for_tag_pose_in_base")
+    logs = []
+
+    class FakeDuration:
+        def __init__(self, seconds):
+            self.seconds = float(seconds)
+
+        def to_sec(self):
+            return self.seconds
+
+    class FakeTime:
+        current = 0.0
+
+        def __init__(self, seconds=0.0):
+            self.seconds = float(seconds)
+
+        @staticmethod
+        def now():
+            FakeTime.current += 0.01
+            return FakeTime(FakeTime.current)
+
+        def __add__(self, duration):
+            return FakeTime(self.seconds + duration.seconds)
+
+        def __sub__(self, other):
+            return FakeDuration(self.seconds - other.seconds)
+
+        def __lt__(self, other):
+            return self.seconds < other.seconds
+
+        def to_nsec(self):
+            return int(self.seconds * 1000000000)
+
+    class FakeListener:
+        def __init__(self):
+            self.index = -1
+            self.positions = [
+                [0.100, 0.200, 0.300],
+                [0.101, 0.199, 0.300],
+                [0.099, 0.201, 0.300],
+                [0.100, 0.200, 0.301],
+                [0.180, 0.260, 0.300],
+                [0.102, 0.198, 0.299],
+            ]
+
+        def getLatestCommonTime(self, base_frame, tag_frame):
+            self.index = min(self.index + 1, len(self.positions) - 1)
+            return FakeTime(FakeTime.current)
+
+        def lookupTransform(self, base_frame, tag_frame, stamp):
+            return self.positions[self.index], [0.0, 0.0, 0.0, 1.0]
+
+    args = SimpleNamespace(
+        mode="run_taught_sequence",
+        base_frame="base",
+        camera_frame="camera_rgb_optical_frame",
+        tf_timeout=1.0,
+        tag_min_samples=5,
+        tag_max_mad_m=0.005,
+        tag_max_age_seconds=2.0,
+    )
+    wait_for_tag_pose_in_base.__globals__.update({
+        "rospy": SimpleNamespace(
+            Time=FakeTime,
+            Duration=FakeDuration,
+            is_shutdown=lambda: False,
+            sleep=lambda seconds: None,
+            loginfo=lambda *items: logs.append(items),
+            logwarn=lambda *items: None,
+        ),
+        "tf": SimpleNamespace(
+            Exception=Exception,
+            LookupException=Exception,
+            ConnectivityException=Exception,
+            ExtrapolationException=Exception,
+        ),
+    })
+
+    pose = wait_for_tag_pose_in_base(FakeListener(), args, 1)
+
+    assert pose.pose.position.x == pytest.approx(0.100)
+    assert pose.pose.position.y == pytest.approx(0.200)
+    assert pose.pose.position.z == pytest.approx(0.300)
+    assert any("稳定位姿锁存" in items[0] for items in logs)
 
 
 def test_preplace_moves_along_base_z():
@@ -193,7 +383,7 @@ def test_load_preset_reports_missing_corrupt_and_missing_tag(tmp_path):
 
     corrupt = tmp_path / "corrupt.json"
     corrupt.write_text("{not-json", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="Could not parse"):
+    with pytest.raises(RuntimeError, match="无法解析"):
         load_preset(str(corrupt))
 
     with pytest.raises(RuntimeError, match="tag 2"):
@@ -226,8 +416,42 @@ def test_prompt_enter_accepts_enter_and_allows_abort():
         ),
         "rospy": SimpleNamespace(is_shutdown=lambda: True),
     })
-    with pytest.raises(UserAbort, match="Interrupted"):
+    with pytest.raises(UserAbort, match="ROS 已中断"):
         prompt_enter("shutdown")
+
+
+def test_teach_carry_records_current_joint_values(tmp_path):
+    teach_carry, = load_module_symbols("teach_carry")
+    preset = make_v3_preset()
+    saved = {}
+
+    class FakeArm:
+        def get_current_joint_values(self):
+            return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+
+    args = SimpleNamespace(
+        preset_file=str(tmp_path / "preset.json"),
+        overwrite=True,
+        base_frame="base",
+        camera_frame="camera",
+    )
+    teach_carry.__globals__.update({
+        "load_or_create_preset": lambda args: (preset, True),
+        "prompt_enter": lambda text: None,
+        "save_preset": lambda path, data, overwrite: saved.update({
+            "path": path,
+            "preset": copy.deepcopy(data),
+            "overwrite": overwrite,
+        }),
+        "rospy": SimpleNamespace(loginfo=lambda *items: None),
+    })
+
+    teach_carry(args, FakeArm())
+
+    assert saved["path"] == args.preset_file
+    assert saved["overwrite"] is True
+    assert saved["preset"]["carry_joint_values"] == pytest.approx(
+        [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
 
 
 def test_run_taught_sequence_dry_run_does_not_move_or_pump():
@@ -315,6 +539,49 @@ def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next
     idle_event = ("idle", [0.0, 0.1, 0.2], "idle")
     assert events.count(idle_event) == 2
     assert events.index(idle_event) < events.index(("wait_tag", 2))
+
+
+def test_run_taught_sequence_moves_to_carry_between_grasp_and_place():
+    run_taught_sequence, = load_module_symbols("run_taught_sequence")
+    args = SimpleNamespace(
+        sequence=[1],
+        preset_file="/tmp/unused.json",
+        base_frame="base",
+        camera_frame="camera",
+        tf_timeout=1.0,
+        approach_gap=0.03,
+        place_approach_gap=0.02,
+        dry_run=False,
+        debug_hold_seconds=0.0,
+        home_after_idle=False,
+        assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+    )
+    carry_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+    preset = make_v3_preset(carry_joint_values=carry_values)
+    events = []
+
+    run_taught_sequence.__globals__.update({
+        "load_preset": lambda path: preset,
+        "wait_for_tag_pose_in_base": lambda listener, args, tag_id: make_pose(0.2, 0.0, 0.1),
+        "publish_debug_geometry": lambda *items, **kwargs: None,
+        "execute_pose": lambda arm, pose, label: events.append(label),
+        "execute_cartesian_pose": lambda arm, pose, label, *items, **kwargs: events.append(label),
+        "execute_joint_values": lambda arm, values, label: events.append((label, list(values))),
+        "set_pump": lambda *items: events.append("pump"),
+        "tf": SimpleNamespace(TransformListener=lambda: object()),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            logwarn=lambda *items: None,
+            sleep=lambda seconds: None,
+        ),
+    })
+
+    run_taught_sequence(args, object(), object())
+
+    carry_event = ("carry", carry_values)
+    assert carry_event in events
+    assert events.index("taught_grasp_retreat") < events.index(carry_event)
+    assert events.index(carry_event) < events.index("taught_pre_place")
 
 
 def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
@@ -717,6 +984,7 @@ def test_source_contract_removes_old_tuning_modes_and_parameters():
     source = SCRIPT.read_text(encoding="utf-8")
 
     assert "teach_tag_sequence" in source
+    assert "teach_carry" in source
     assert "teach_idle" in source
     assert "run_taught_sequence" in source
     for old_text in [

@@ -23,14 +23,8 @@ DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_PICK_SCRIPT = '/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py'
 DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.24,1.00'
-DEFAULT_TARGET_Y_RATIO_RANGE = '0.25,0.75'
-DEFAULT_BOX_WIDTH_RATIO_RANGE = '0.03,0.15'
-DEFAULT_BOX_HEIGHT_RATIO_RANGE = '0.04,0.20'
-DEFAULT_BOX_ASPECT_RATIO_RANGE = '0.60,1.60'
-DEFAULT_TAG_WORKSPACE_X_RANGE = '0.15,0.32'
-DEFAULT_TAG_WORKSPACE_Y_RANGE = '0.03,0.20'
-DEFAULT_TAG_WORKSPACE_Z_RANGE = '0.07,0.16'
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
+DEFAULT_MAX_DETECTION_AGE_SECONDS = 4.0
 
 try:
     STRING_TYPES = (basestring,)
@@ -87,18 +81,6 @@ def parse_roi_ratio(text):
     x1, y1, x2, y2 = values
     if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
         raise RuntimeError('target ROI must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1.')
-    return values
-
-
-def parse_range(text, option):
-    if not isinstance(text, STRING_TYPES):
-        raise RuntimeError('%s must be min,max.' % option)
-    parts = [part.strip() for part in text.split(',')]
-    if len(parts) != 2:
-        raise RuntimeError('%s must be min,max.' % option)
-    values = [finite(part, option) for part in parts]
-    if values[0] < 0.0 or values[1] <= values[0]:
-        raise RuntimeError('%s must satisfy 0 <= min < max.' % option)
     return values
 
 
@@ -172,42 +154,6 @@ def ros_time_to_seconds(stamp):
     if hasattr(stamp, 'to_sec'):
         return float(stamp.to_sec())
     return float(getattr(stamp, 'seconds'))
-
-
-def validate_detection_geometry(detection, message, args):
-    box = normalize_box(detection.get('box'))
-    width = finite(message.get('image_width'), 'image_width')
-    height = finite(message.get('image_height'), 'image_height')
-    box_width = box[2] - box[0]
-    box_height = box[3] - box[1]
-    metrics = {
-        'center_y_ratio': ((box[1] + box[3]) / 2.0) / height,
-        'width_ratio': box_width / width,
-        'height_ratio': box_height / height,
-        'aspect_ratio': box_width / box_height,
-    }
-    checks = [
-        ('center_y_ratio', args.target_y_ratio_range),
-        ('width_ratio', args.box_width_ratio_range),
-        ('height_ratio', args.box_height_ratio_range),
-        ('aspect_ratio', args.box_aspect_ratio_range),
-    ]
-    for name, allowed in checks:
-        if not (float(allowed[0]) <= metrics[name] <= float(allowed[1])):
-            return False, (
-                '%s %.3f outside [%.3f, %.3f]'
-                % (name, metrics[name], allowed[0], allowed[1])), metrics
-    return True, '', metrics
-
-
-def position_within_workspace(position, x_range, y_range, z_range):
-    for name, value, allowed in zip(
-            ('x', 'y', 'z'), position, (x_range, y_range, z_range)):
-        if not (float(allowed[0]) <= float(value) <= float(allowed[1])):
-            return False, (
-                'Tag %s %.4f outside [%.4f, %.4f]'
-                % (name, value, allowed[0], allowed[1]))
-    return True, ''
 
 
 def select_detection_for_tag(message, tag_id, min_confidence):
@@ -305,7 +251,7 @@ def run_pick_command(command, tag_id):
         return True
     if pick_failure_is_missing_tf(output, tag_id):
         rospy.logwarn(
-            'Pick for ID%d skipped because tag TF disappeared before motion.',
+            '跳过 ID%d 抓取：机械臂动作前 tag TF 已经消失。',
             tag_id)
         return False
     raise subprocess.CalledProcessError(return_code, command)
@@ -322,19 +268,12 @@ def parse_args(argv):
     parser.add_argument('--debug-image-input-topic', default='/tag_detections_image')
     parser.add_argument('--debug-image-topic', default='/tag_chassis_align/debug_image')
     parser.add_argument('--target-roi-ratio', default=DEFAULT_TARGET_ROI_RATIO)
-    parser.add_argument('--target-y-ratio-range',
-                        default=DEFAULT_TARGET_Y_RATIO_RANGE)
-    parser.add_argument('--box-width-ratio-range',
-                        default=DEFAULT_BOX_WIDTH_RATIO_RANGE)
-    parser.add_argument('--box-height-ratio-range',
-                        default=DEFAULT_BOX_HEIGHT_RATIO_RANGE)
-    parser.add_argument('--box-aspect-ratio-range',
-                        default=DEFAULT_BOX_ASPECT_RATIO_RANGE)
-    parser.add_argument('--max-detection-age-seconds', type=float, default=1.5)
+    parser.add_argument('--max-detection-age-seconds', type=float,
+                        default=DEFAULT_MAX_DETECTION_AGE_SECONDS)
     parser.add_argument('--chassis-settle-seconds', type=float, default=0.8)
-    parser.add_argument('--drive-speed', type=float, default=0.02)
+    parser.add_argument('--drive-speed', type=float, default=0.012)
     parser.add_argument('--align-tolerance-px', type=float, default=12.0)
-    parser.add_argument('--stable-frames', type=int, default=2)
+    parser.add_argument('--stable-frames', type=int, default=4)
     parser.add_argument('--max-align-seconds', type=float, default=25.0)
     parser.add_argument('--control-hz', type=float, default=5.0)
     parser.add_argument('--min-confidence', type=float, default=0.1)
@@ -345,12 +284,6 @@ def parse_args(argv):
                         help='Required consecutive successful TF reads before picking.')
     parser.add_argument('--tag-tf-max-range-m', type=float, default=0.005,
                         help='Maximum xyz range across fresh TF gate samples.')
-    parser.add_argument('--tag-workspace-x-range',
-                        default=DEFAULT_TAG_WORKSPACE_X_RANGE)
-    parser.add_argument('--tag-workspace-y-range',
-                        default=DEFAULT_TAG_WORKSPACE_Y_RANGE)
-    parser.add_argument('--tag-workspace-z-range',
-                        default=DEFAULT_TAG_WORKSPACE_Z_RANGE)
     parser.add_argument('--target-right-motion', choices=['forward', 'backward'],
                         default='forward')
     parser.add_argument('--dry-run', action='store_true')
@@ -360,8 +293,8 @@ def parse_args(argv):
     parser.add_argument('--python2', default=sys.executable)
     parser.add_argument('--pick-script', default=DEFAULT_PICK_SCRIPT)
     parser.add_argument('--preset-file', default=DEFAULT_PRESET_FILE)
-    parser.add_argument('--pick-velocity-scale', type=float, default=0.1)
-    parser.add_argument('--pick-acceleration-scale', type=float, default=0.1)
+    parser.add_argument('--pick-velocity-scale', type=float, default=0.4)
+    parser.add_argument('--pick-acceleration-scale', type=float, default=0.4)
     parser.add_argument('--pick-motion-settle-seconds', type=float, default=0.25)
     parser.add_argument('--disable-replanning', action='store_true')
     parser.add_argument('--startup-home-service', default=DEFAULT_STARTUP_HOME_SERVICE,
@@ -374,20 +307,6 @@ def parse_args(argv):
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     args.target_roi_ratio = parse_roi_ratio(args.target_roi_ratio)
-    args.target_y_ratio_range = parse_range(
-        args.target_y_ratio_range, '--target-y-ratio-range')
-    args.box_width_ratio_range = parse_range(
-        args.box_width_ratio_range, '--box-width-ratio-range')
-    args.box_height_ratio_range = parse_range(
-        args.box_height_ratio_range, '--box-height-ratio-range')
-    args.box_aspect_ratio_range = parse_range(
-        args.box_aspect_ratio_range, '--box-aspect-ratio-range')
-    args.tag_workspace_x_range = parse_range(
-        args.tag_workspace_x_range, '--tag-workspace-x-range')
-    args.tag_workspace_y_range = parse_range(
-        args.tag_workspace_y_range, '--tag-workspace-y-range')
-    args.tag_workspace_z_range = parse_range(
-        args.tag_workspace_z_range, '--tag-workspace-z-range')
     if args.drive_speed <= 0.0:
         raise RuntimeError('--drive-speed must be positive.')
     if args.align_tolerance_px < 0.0:
@@ -442,7 +361,7 @@ class ChassisAlignPickSequence(object):
         try:
             self.latest_detections = json.loads(message.data)
         except ValueError as exc:
-            rospy.logwarn_throttle(2.0, 'Could not parse YOLO detections JSON: %s', exc)
+            rospy.logwarn_throttle(2.0, '无法解析 YOLO 检测 JSON：%s', exc)
 
     def image_callback(self, message):
         if self.latest_detections is None:
@@ -454,14 +373,6 @@ class ChassisAlignPickSequence(object):
             roi = roi_ratio_to_pixels(self.args.target_roi_ratio, width, height)
             x1, y1, x2, y2 = [int(round(value)) for value in roi]
             cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            gate_y1 = int(round(
-                self.args.target_y_ratio_range[0] * height))
-            gate_y2 = int(round(
-                self.args.target_y_ratio_range[1] * height))
-            cv2.line(image, (0, gate_y1), (width - 1, gate_y1),
-                     (0, 255, 255), 1)
-            cv2.line(image, (0, gate_y2), (width - 1, gate_y2),
-                     (0, 255, 255), 1)
             for detection in self.latest_detections.get('detections', []):
                 box = normalize_box(detection.get('box'))
                 bx1, by1, bx2, by2 = [int(round(value)) for value in box]
@@ -476,7 +387,7 @@ class ChassisAlignPickSequence(object):
             output.header = message.header
             self.debug_image_pub.publish(output)
         except Exception as exc:
-            rospy.logwarn_throttle(2.0, 'Could not draw chassis alignment debug image: %s', exc)
+            rospy.logwarn_throttle(2.0, '无法绘制底盘对准调试图：%s', exc)
 
     def publish_velocity(self, linear_x):
         if self.args.dry_run:
@@ -515,16 +426,16 @@ class ChassisAlignPickSequence(object):
                 message, remaining_tags, self.args.min_confidence)
             if order:
                 rospy.loginfo(
-                    'Visible remaining tags left-to-right: %s. Next ID%d.',
+                    '当前可见剩余 tag 从左到右：%s。下一步处理 ID%d。',
                     order, order[0])
                 return order[0]
             rospy.logwarn_throttle(
                 2.0,
-                'Waiting for at least one remaining requested tag. remaining=%s',
+                '等待至少一个剩余目标 tag 出现在画面中。remaining=%s',
                 remaining_tags)
             rate.sleep()
         raise RuntimeError(
-            'No remaining requested tag IDs are visible for left-to-right ordering: %s.'
+            '没有看到任何剩余目标 tag，无法确定下一步处理对象：%s.'
             % remaining_tags)
 
     def align_tag(self, tag_id):
@@ -548,7 +459,7 @@ class ChassisAlignPickSequence(object):
                 self.publish_velocity(0.0)
                 rospy.logwarn_throttle(
                     2.0,
-                    'Stopping chassis: latest YOLO inference is %.2fs old.',
+                    '底盘停车：最新 YOLO 推理已经 %.2fs，没有足够新的框。',
                     age)
                 rate.sleep()
                 continue
@@ -558,20 +469,7 @@ class ChassisAlignPickSequence(object):
                 stable = 0
                 self.publish_velocity(0.0)
                 rospy.logwarn_throttle(
-                    2.0, 'Waiting for YOLO ID%d before chassis alignment.', tag_id)
-                rate.sleep()
-                continue
-            geometry_ok, geometry_reason, metrics = (
-                validate_detection_geometry(
-                    detection, message, self.args))
-            if not geometry_ok:
-                stable = 0
-                confirmation_required = False
-                self.publish_velocity(0.0)
-                rospy.logwarn_throttle(
-                    2.0,
-                    'ID%d rejected by distance/height gate: %s',
-                    tag_id, geometry_reason)
+                    2.0, '等待 YOLO 检测到 ID%d 后再对准。', tag_id)
                 rate.sleep()
                 continue
             roi = roi_ratio_to_pixels(
@@ -583,47 +481,61 @@ class ChassisAlignPickSequence(object):
                 self.args.align_tolerance_px, target_right_forward)
             next_stable, next_key, accepted = update_alignment_stability(
                 stable, last_inference_key, message, result.aligned)
+            self.publish_velocity(result.linear_x)
             if not accepted:
                 rate.sleep()
                 continue
             stable = next_stable
             last_inference_key = next_key
-            self.publish_velocity(result.linear_x)
             if result.aligned:
                 if confirmation_required:
                     self.stop_chassis()
-                    rospy.loginfo(
-                        'ID%d alignment confirmed after chassis settle. '
-                        'center_x=%.1f y_ratio=%.3f width_ratio=%.3f',
-                        tag_id, result.center_x,
-                        metrics['center_y_ratio'],
-                        metrics['width_ratio'])
-                    return
-                if stable >= self.args.stable_frames:
+                    if stable >= self.args.stable_frames:
+                        rospy.loginfo(
+                            'ID%d 对准确认完成：底盘已停稳，连续 %d 帧在红框内，center_x=%.1f。',
+                            tag_id, stable, result.center_x)
+                        return
+                    rate.sleep()
+                    continue
+                if stable >= 1:
                     self.stop_chassis()
                     rospy.loginfo(
-                        'ID%d entered target ROI; waiting %.2fs for chassis settle '
-                        'and one new YOLO inference.',
-                        tag_id, self.args.chassis_settle_seconds)
+                        'ID%d 已进入红框，立即停车；等待 %.2fs 让底盘停稳，再确认 %d 帧。',
+                        tag_id, self.args.chassis_settle_seconds,
+                        self.args.stable_frames)
                     rospy.sleep(self.args.chassis_settle_seconds)
                     stable = 0
                     confirmation_required = True
+                    confirmation_seconds = max(
+                        5.0,
+                        self.args.chassis_settle_seconds +
+                        self.args.max_detection_age_seconds + 2.0)
+                    deadline = (
+                        rospy.Time.now() +
+                        rospy.Duration(confirmation_seconds))
             else:
                 stable = 0
+                if confirmation_required:
+                    rospy.logwarn(
+                        'ID%d 停稳后已经偏出红框，重新开始慢速对准。',
+                        tag_id)
+                    deadline = (
+                        rospy.Time.now() +
+                        rospy.Duration(self.args.max_align_seconds))
                 confirmation_required = False
             rate.sleep()
         self.stop_chassis()
-        raise RuntimeError('Timed out aligning ID%d into target ROI.' % tag_id)
+        raise RuntimeError('ID%d 对准红框超时。' % tag_id)
 
     def run_pick(self, tag_id):
         if self.args.align_only:
-            rospy.logwarn('Align-only enabled. Pick for ID%d is skipped.', tag_id)
+            rospy.logwarn('当前是只对准模式，跳过 ID%d 抓取。', tag_id)
             return
         if self.args.dry_run:
-            rospy.logwarn('Dry run enabled. Pick for ID%d is skipped.', tag_id)
+            rospy.logwarn('当前是 dry-run，跳过 ID%d 抓取。', tag_id)
             return
         command = build_pick_command(self.args, tag_id)
-        rospy.loginfo('Starting taught pick for ID%d.', tag_id)
+        rospy.loginfo('开始执行 ID%d 示教抓取。', tag_id)
         return run_pick_command(command, tag_id)
 
     def run_startup_home(self, tag_id):
@@ -631,7 +543,7 @@ class ChassisAlignPickSequence(object):
                 getattr(self.args, 'skip_startup_home', False)):
             return
         rospy.loginfo(
-            'Running startup homing after ID%d through %s.',
+            'ID%d 抓取完成，调用 %s 执行启动回零。',
             tag_id, self.args.startup_home_service)
         rospy.wait_for_service(
             self.args.startup_home_service,
@@ -639,7 +551,7 @@ class ChassisAlignPickSequence(object):
         response = rospy.ServiceProxy(self.args.startup_home_service, Trigger)()
         if not response.success:
             raise RuntimeError(
-                'Startup homing service failed after ID%d: %s'
+                'ID%d 后启动回零服务失败：%s'
                 % (tag_id, response.message))
         rospy.sleep(self.args.startup_home_settle_seconds)
 
@@ -672,23 +584,12 @@ class ChassisAlignPickSequence(object):
         deadline = rospy.Time.now() + rospy.Duration(self.args.tag_tf_wait_seconds)
         rate = rospy.Rate(self.args.control_hz)
         rospy.loginfo(
-            'Waiting up to %.1fs for tag_%d TF to stabilize before pick.',
+            '抓取前最多等待 %.1fs，让 tag_%d TF 稳定。',
             self.args.tag_tf_wait_seconds, tag_id)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             sample = self.read_tag_tf_sample(tag_id)
             if sample is not None and sample[0] not in seen_stamps:
                 stamp_ns, position = sample
-                workspace_ok, reason = position_within_workspace(
-                    position,
-                    self.args.tag_workspace_x_range,
-                    self.args.tag_workspace_y_range,
-                    self.args.tag_workspace_z_range)
-                if not workspace_ok:
-                    self.stop_chassis()
-                    rospy.logwarn(
-                        'Skipping ID%d outside calibrated pickup workspace: %s',
-                        tag_id, reason)
-                    return False
                 seen_stamps.add(stamp_ns)
                 samples.append(position)
                 samples = samples[-self.args.tag_tf_stable_frames:]
@@ -698,19 +599,19 @@ class ChassisAlignPickSequence(object):
                     if max(ranges) > self.args.tag_tf_max_range_m:
                         rospy.logwarn_throttle(
                             2.0,
-                            'tag_%d TF range is unstable: %s m',
+                            'tag_%d TF 还不稳定，xyz 波动：%s m',
                             tag_id, [round(value, 5) for value in ranges])
                         rate.sleep()
                         continue
                     rospy.loginfo(
-                        'tag_%d TF gate passed with %d unique frames; range_mm=%s.',
+                        'tag_%d TF 稳定检查通过：%d 帧，range_mm=%s。',
                         tag_id, len(samples),
                         [round(value * 1000.0, 2) for value in ranges])
                     return True
             rate.sleep()
         self.stop_chassis()
         rospy.logwarn(
-            'Skipping ID%d because tag_%d TF did not stabilize within %.1fs.',
+            '跳过 ID%d：tag_%d TF 在 %.1fs 内没有稳定。',
             tag_id, tag_id, self.args.tag_tf_wait_seconds)
         return False
 
@@ -723,7 +624,7 @@ class ChassisAlignPickSequence(object):
             sys.stdout.flush()
         line = sys.stdin.readline()
         if line.strip().lower() in ('q', 'quit', 'exit'):
-            raise RuntimeError('User aborted after ID%d.' % tag_id)
+            raise RuntimeError('用户在 ID%d 后主动退出。' % tag_id)
 
     def run(self):
         try:
@@ -733,7 +634,7 @@ class ChassisAlignPickSequence(object):
             while remaining_tags:
                 tag_id = self.select_next_tag(remaining_tags)
                 processed += 1
-                rospy.loginfo('Aligning ID%d into target ROI.', tag_id)
+                rospy.loginfo('开始把 ID%d 对准到红框。', tag_id)
                 self.align_tag(tag_id)
                 needs_pick_tf = not self.args.align_only and not self.args.dry_run
                 if needs_pick_tf and not self.wait_for_tag_tf_before_pick(tag_id):

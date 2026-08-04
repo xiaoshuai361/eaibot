@@ -17,6 +17,11 @@ __pycache__/
 .idea/
 .superpowers/
 .worktrees/
+*:Zone.Identifier
+
+# 本机保存的工作区副本和压缩包不进入版本库
+mirobot_ws_new/
+*.zip
 
 # ROS generated artifacts inside workspaces
 **/build/

@@ -33,11 +33,12 @@ DEFAULT_ASSIST_FRONT_GAP = 0.03
 DEFAULT_ASSIST_ORIENTATION_XYZW = '0,0,0,1'
 DEFAULT_TEACH_SETTLE_SECONDS = 0.8
 DEFAULT_MOTION_SETTLE_SECONDS = 0.25
-DEFAULT_TAG_SAMPLE_SECONDS = 1.5
-DEFAULT_TAG_MIN_SAMPLES = 10
+DEFAULT_TAG_MIN_SAMPLES = 5
 DEFAULT_TAG_MAX_MAD_M = 0.005
-DEFAULT_TAG_MAX_AGE_SECONDS = 0.5
+DEFAULT_TAG_MAX_AGE_SECONDS = 2.0
 DEFAULT_PICKUP_APPROACH_AXIS_BASE = '-1,0,0'
+DEFAULT_VELOCITY_SCALE = 0.4
+DEFAULT_ACCELERATION_SCALE = 0.4
 POSE_DONE_POSITION_TOLERANCE = 0.015
 POSE_DONE_ORIENTATION_TOLERANCE_RAD = 0.35
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
@@ -107,10 +108,24 @@ def _nonnegative(value, option):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description='RViz taught AprilTag pick and fixed bin placement helper.')
+        description='RViz taught AprilTag pick and fixed bin placement helper.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Common modes:\n'
+            '  teach_tag_grasp      record a tag pickup point\n'
+            '  teach_tag_place      record a fixed bin place point\n'
+            '  teach_carry          record the safe carry pose after pickup\n'
+            '  teach_idle           record the idle/waiting pose\n'
+            '  run_taught_sequence  pick and place taught tags\n\n'
+            'Carry pose example:\n'
+            '  python2 /home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py \\\n'
+            '    --mode teach_carry \\\n'
+            '    --preset-file /home/eaibot/handeye-calib/config/tag_pick_place_presets.json \\\n'
+            '    --overwrite'))
     parser.add_argument('--mode',
                         choices=['teach_tag_sequence', 'teach_tag_grasp',
-                                 'teach_tag_place', 'teach_idle',
+                                 'teach_tag_place', 'teach_carry',
+                                 'teach_idle',
                                  'run_taught_sequence'],
                         required=True)
     parser.add_argument('--sequence', default=DEFAULT_SEQUENCE)
@@ -120,8 +135,6 @@ def parse_args(argv):
     parser.add_argument('--base-frame', default='base')
     parser.add_argument('--group', default='manipulator')
     parser.add_argument('--tf-timeout', type=float, default=5.0)
-    parser.add_argument('--tag-sample-seconds', type=float,
-                        default=DEFAULT_TAG_SAMPLE_SECONDS)
     parser.add_argument('--tag-min-samples', type=int,
                         default=DEFAULT_TAG_MIN_SAMPLES)
     parser.add_argument('--tag-max-mad-m', type=float,
@@ -134,8 +147,10 @@ def parse_args(argv):
     parser.add_argument('--place-approach-gap', type=float, default=0.02)
     parser.add_argument('--planning-time', type=float, default=2.0)
     parser.add_argument('--disable-replanning', action='store_true')
-    parser.add_argument('--velocity-scale', type=float, default=0.1)
-    parser.add_argument('--acceleration-scale', type=float, default=0.1)
+    parser.add_argument('--velocity-scale', type=float,
+                        default=DEFAULT_VELOCITY_SCALE)
+    parser.add_argument('--acceleration-scale', type=float,
+                        default=DEFAULT_ACCELERATION_SCALE)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--debug-hold-seconds', type=float, default=0.0)
     parser.add_argument('--assist-front-gap', type=float,
@@ -156,9 +171,8 @@ def parse_args(argv):
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     _positive(args.tf_timeout, '--tf-timeout')
-    _positive(args.tag_sample_seconds, '--tag-sample-seconds')
-    if args.tag_min_samples < 3:
-        raise RuntimeError('--tag-min-samples must be at least 3.')
+    if args.tag_min_samples < 1:
+        raise RuntimeError('--tag-min-samples must be at least 1.')
     _positive(args.tag_max_mad_m, '--tag-max-mad-m')
     _positive(args.tag_max_age_seconds, '--tag-max-age-seconds')
     _positive(args.approach_gap, '--approach-gap')
@@ -430,14 +444,13 @@ def current_pose_is_close_to_target(arm, target_pose, label):
     try:
         current_pose = arm.get_current_pose()
     except Exception as exc:
-        rospy.logwarn('Could not read current pose after failed %s: %s',
-                      label, exc)
+        rospy.logwarn('动作 %s 失败后读取当前末端位姿也失败：%s',
+                      display_label(label), exc)
         return False
     if pose_is_close(current_pose, target_pose):
         rospy.logwarn(
-            'MoveIt reported failure during %s, but current pose is already close to target. '
-            'Accepting this motion to avoid duplicate execution.',
-            label)
+            'MoveIt 报告 %s 失败，但当前末端已经接近目标点；接受这次动作，避免重复执行。',
+            display_label(label))
         return True
     return False
 
@@ -500,26 +513,22 @@ def filter_tag_translation_samples(samples, min_samples=10,
         median([abs(float(value) - center) for value in axis])
         for axis, center in zip(axes, centers)
     ]
-    if max(mads) > float(max_axis_mad_m):
-        raise RuntimeError(
-            'Tag translation is unstable: axis MAD=%s m exceeds %.4f m.'
-            % ([round(value, 6) for value in mads], max_axis_mad_m))
     inliers = []
     for sample in samples:
         keep = True
         for value, center, axis_mad in zip(
                 sample['position'], centers, mads):
-            limit = max(float(axis_mad) * float(mad_scale), 1e-6)
+            limit = max(float(axis_mad) * float(mad_scale),
+                        float(max_axis_mad_m))
             if abs(float(value) - center) > limit:
                 keep = False
                 break
         if keep:
             inliers.append(sample)
-    minimum_inliers = max(3, int(math.ceil(float(min_samples) * 0.7)))
-    if len(inliers) < minimum_inliers:
+    if len(inliers) < int(min_samples):
         raise RuntimeError(
-            'Only %d stable Tag samples remain after filtering; need %d.'
-            % (len(inliers), minimum_inliers))
+            'Only %d stable Tag samples remain after MAD filtering; need %d.'
+            % (len(inliers), int(min_samples)))
     inlier_axes = list(zip(*[sample['position'] for sample in inliers]))
     newest = max(inliers, key=lambda sample: sample['stamp_ns'])
     return {
@@ -538,9 +547,9 @@ def read_preset_json(path):
         with open(path, 'r') as handle:
             preset = json.load(handle)
     except ValueError as exc:
-        raise RuntimeError('Could not parse preset JSON: %s' % exc)
+        raise RuntimeError('无法解析 preset JSON：%s' % exc)
     except IOError as exc:
-        raise RuntimeError('Could not read preset file: %s' % exc)
+        raise RuntimeError('无法读取 preset 文件：%s' % exc)
     if not isinstance(preset.get('tags'), dict):
         raise RuntimeError('Preset file must contain a tags object.')
     return preset
@@ -573,6 +582,10 @@ def migrate_legacy_preset_for_teach(preset):
     if 'idle_joint_values' in preset:
         migrated['idle_joint_values'] = [
             float(value) for value in preset['idle_joint_values']
+        ]
+    if 'carry_joint_values' in preset:
+        migrated['carry_joint_values'] = [
+            float(value) for value in preset['carry_joint_values']
         ]
     for tag_id, entry in preset.get('tags', {}).items():
         migrated_entry = {}
@@ -734,6 +747,13 @@ def record_idle_in_preset(preset, arm):
     return preset['idle_joint_values']
 
 
+def record_carry_in_preset(preset, arm):
+    preset['carry_joint_values'] = [
+        float(value) for value in arm.get_current_joint_values()
+    ]
+    return preset['carry_joint_values']
+
+
 def build_move_group(group_name, base_frame, velocity_scale, acceleration_scale,
                      planning_time, allow_replanning):
     if not rospy.has_param('robot_description'):
@@ -771,7 +791,7 @@ def get_mirobot_pump_type():
 
 
 def get_pump_proxy():
-    rospy.loginfo('Waiting for pump service: switch_pump_status')
+    rospy.loginfo('等待吸泵服务：switch_pump_status')
     rospy.wait_for_service('switch_pump_status', timeout=5.0)
     return rospy.ServiceProxy('switch_pump_status', get_mirobot_pump_type())
 
@@ -790,27 +810,45 @@ def run_startup_home(args):
         args, 'startup_home_service', DEFAULT_STARTUP_HOME_SERVICE)
     wait_seconds = getattr(args, 'startup_home_wait_seconds', 8.0)
     settle_seconds = getattr(args, 'startup_home_settle_seconds', 3.0)
-    rospy.loginfo('Running startup homing through %s.', service_name)
+    rospy.loginfo('执行启动回零服务：%s', service_name)
     rospy.wait_for_service(service_name, timeout=wait_seconds)
     response = rospy.ServiceProxy(service_name, get_startup_home_type())()
     if not response.success:
         raise RuntimeError(
-            'Startup homing service failed: %s' % response.message)
+            '启动回零服务执行失败：%s' % response.message)
     rospy.sleep(settle_seconds)
 
 
 def set_pump(pump_proxy, enabled):
-    rospy.loginfo('Pump %s', 'ON' if enabled else 'OFF')
+    rospy.loginfo('吸泵%s', '开启' if enabled else '关闭')
     response = pump_proxy(enabled)
     if not response.Sucess:
-        raise RuntimeError('Pump service returned failure.')
+        raise RuntimeError('吸泵服务返回失败。')
+
+
+def pose_from_tf_sample(frame_id, trans, rot):
+    pose = PoseStamped()
+    pose.header.frame_id = frame_id
+    pose.header.stamp = rospy.Time.now()
+    pose.pose.position.x = trans[0]
+    pose.pose.position.y = trans[1]
+    pose.pose.position.z = trans[2]
+    orientation = normalize_quaternion(rot)
+    pose.pose.orientation.x = orientation[0]
+    pose.pose.orientation.y = orientation[1]
+    pose.pose.orientation.z = orientation[2]
+    pose.pose.orientation.w = orientation[3]
+    return pose
+
+
+def tag_sample_fallback_allowed(args):
+    return getattr(args, 'mode', '') in (
+        'teach_tag_sequence', 'teach_tag_grasp')
 
 
 def wait_for_tag_pose_in_base(listener, args, tag_id):
     tag_frame = 'tag_%d' % tag_id
     deadline = rospy.Time.now() + rospy.Duration(args.tf_timeout)
-    sample_seconds = getattr(
-        args, 'tag_sample_seconds', DEFAULT_TAG_SAMPLE_SECONDS)
     min_samples = getattr(
         args, 'tag_min_samples', DEFAULT_TAG_MIN_SAMPLES)
     max_mad_m = getattr(
@@ -819,30 +857,48 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
         args, 'tag_max_age_seconds', DEFAULT_TAG_MAX_AGE_SECONDS)
     samples = []
     seen_stamps = set()
-    first_sample_wall_time = None
+    latest_pose = None
+    latest_age_seconds = None
+    latest_filter_error = None
+    last_reported_sample_count = 0
+    last_filter_report_count = 0
+    rospy.loginfo(
+        '等待 tag_%d 稳定位姿：需要 %d 个新 TF，过滤后至少保留 %d 个内点。',
+        tag_id, min_samples, min_samples)
     while not rospy.is_shutdown() and rospy.Time.now() < deadline:
         try:
             common_time = listener.getLatestCommonTime(
                 args.base_frame, tag_frame)
             age_seconds = (rospy.Time.now() - common_time).to_sec()
+            trans, rot = listener.lookupTransform(
+                args.base_frame, tag_frame, common_time)
+            latest_pose = pose_from_tf_sample(args.base_frame, trans, rot)
+            latest_age_seconds = age_seconds
             if age_seconds < 0.0 or age_seconds > max_age_seconds:
                 rospy.sleep(0.02)
                 continue
-            trans, rot = listener.lookupTransform(
-                args.base_frame, tag_frame, common_time)
             stamp_ns = int(common_time.to_nsec())
-            if append_unique_tag_sample(
-                    samples, seen_stamps, stamp_ns, trans, rot):
-                if first_sample_wall_time is None:
-                    first_sample_wall_time = rospy.Time.now()
-            enough_time = (
-                first_sample_wall_time is not None and
-                (rospy.Time.now() - first_sample_wall_time).to_sec() >=
-                sample_seconds)
-            if enough_time and len(samples) >= min_samples:
-                filtered = filter_tag_translation_samples(
-                    samples, min_samples=min_samples,
-                    max_axis_mad_m=max_mad_m)
+            if append_unique_tag_sample(samples, seen_stamps, stamp_ns, trans, rot):
+                if len(samples) != last_reported_sample_count:
+                    last_reported_sample_count = len(samples)
+                    rospy.loginfo(
+                        'tag_%d 已采集新 TF：%d/%d，当前帧 age=%.2fs。',
+                        tag_id, min(len(samples), min_samples),
+                        min_samples, age_seconds)
+            if len(samples) >= min_samples:
+                try:
+                    filtered = filter_tag_translation_samples(
+                        samples, min_samples=min_samples,
+                        max_axis_mad_m=max_mad_m)
+                except RuntimeError as exc:
+                    latest_filter_error = exc
+                    if len(samples) != last_filter_report_count:
+                        last_filter_report_count = len(samples)
+                        rospy.logwarn(
+                            'tag_%d 当前采样过滤后内点不足，继续等待新 TF：%s',
+                            tag_id, exc)
+                    rospy.sleep(0.02)
+                    continue
                 pose = PoseStamped()
                 pose.header.frame_id = args.base_frame
                 pose.header.stamp = rospy.Time.now()
@@ -855,7 +911,7 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
                 pose.pose.orientation.z = orientation[2]
                 pose.pose.orientation.w = orientation[3]
                 rospy.loginfo(
-                    'tag_%d stable TF: inliers=%d/%d MAD_mm=[%.2f, %.2f, %.2f]',
+                    'tag_%d 稳定位姿锁存：内点=%d/%d，MAD_mm=[%.2f, %.2f, %.2f]',
                     tag_id, filtered['inlier_count'],
                     filtered['sample_count'],
                     filtered['axis_mad_m'][0] * 1000.0,
@@ -866,11 +922,31 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
                 tf.ExtrapolationException):
             pass
         rospy.sleep(0.02)
+    if latest_pose is not None and tag_sample_fallback_allowed(args):
+        rospy.logwarn(
+            'tag_%d 有 TF，但多帧稳定采样没有完成'
+            '（样本=%d/%d，最新帧age=%s）。示教模式下改用最新一帧 TF。',
+            tag_id, len(samples), min_samples,
+            'unknown' if latest_age_seconds is None else '%.2fs' % latest_age_seconds)
+        return latest_pose
     if samples:
+        if latest_filter_error is not None:
+            raise RuntimeError(
+                'tag_%d did not provide %d stable inlier TF samples before timeout. '
+                'Collected %d unique fresh samples. Last filter error: %s'
+                % (tag_id, min_samples, len(samples), latest_filter_error))
         raise RuntimeError(
             'tag_%d did not provide enough stable, fresh, unique TF samples: '
             'collected %d, need %d within %.1fs.'
             % (tag_id, len(samples), min_samples, args.tf_timeout))
+    if latest_pose is not None:
+        raise RuntimeError(
+            'TF for %s was visible but too old for robust pickup '
+            '(latest_age=%s, allowed<=%.1fs). Check AprilTag publish rate or '
+            'increase --tag-max-age-seconds.'
+            % (tag_frame,
+               'unknown' if latest_age_seconds is None else '%.2fs' % latest_age_seconds,
+               max_age_seconds))
     tag_exists = False
     camera_exists = False
     try:
@@ -904,7 +980,7 @@ def prompt_enter(message):
         sys.stdout.flush()
     while True:
         if ros_is_shutdown():
-            raise UserAbort('Interrupted while waiting for Enter.')
+            raise UserAbort('等待 Enter 时 ROS 已中断。')
         try:
             ready, _, _ = select.select([sys.stdin], [], [], 0.1)
         except (select.error, IOError) as exc:
@@ -912,7 +988,7 @@ def prompt_enter(message):
                 continue
             raise
         except KeyboardInterrupt:
-            raise UserAbort('Interrupted by user.')
+            raise UserAbort('用户中断。')
         if not ready:
             continue
         try:
@@ -920,7 +996,7 @@ def prompt_enter(message):
         except EOFError:
             raise RuntimeError('Input closed while waiting for Enter.')
         except KeyboardInterrupt:
-            raise UserAbort('Interrupted by user.')
+            raise UserAbort('用户中断。')
         if line == '':
             raise RuntimeError('Input closed while waiting for Enter.')
         value = line.strip().lower()
@@ -931,11 +1007,28 @@ def prompt_enter(message):
 
 def pose_to_text(name, pose_stamped):
     pose = pose_stamped.pose
-    return ('%s position=(%.4f, %.4f, %.4f) orientation=(%.4f, %.4f, %.4f, %.4f)'
+    return ('%s 位置=(%.4f, %.4f, %.4f) 姿态xyzw=(%.4f, %.4f, %.4f, %.4f)'
             % (name,
                pose.position.x, pose.position.y, pose.position.z,
                pose.orientation.x, pose.orientation.y,
                pose.orientation.z, pose.orientation.w))
+
+
+DISPLAY_LABELS = {
+    'tag_in_base': 'tag在base下位姿',
+    'taught_pre_grasp': '预抓点',
+    'taught_grasp': '抓取接触点',
+    'taught_grasp_retreat': '抓取后退点',
+    'carry': '搬运中间姿态',
+    'taught_pre_place': '放置上方点',
+    'taught_place': '放置接触点',
+    'taught_place_retreat': '放置后退点',
+    'idle': '空闲姿态',
+}
+
+
+def display_label(label):
+    return DISPLAY_LABELS.get(label, label)
 
 
 def create_debug_marker(marker_id, pose_stamped, rgb, scale):
@@ -991,7 +1084,7 @@ def settle_after_motion():
 
 
 def execute_pose(arm, target_pose, label):
-    rospy.loginfo('Executing %s', pose_to_text(label, target_pose))
+    rospy.loginfo('执行动作：%s', pose_to_text(display_label(label), target_pose))
     for attempt in range(2):
         arm.set_start_state_to_current_state()
         arm.set_pose_target(target_pose)
@@ -1006,14 +1099,15 @@ def execute_pose(arm, target_pose, label):
             return
         if attempt == 0:
             rospy.logwarn(
-                'MoveIt failed during %s. Waiting for joint state to settle and retrying once.',
-                label)
+                'MoveIt 执行 %s 失败，等待关节状态稳定后重试一次。',
+                display_label(label))
             rospy.sleep(0.3)
-    raise RuntimeError('MoveIt failed during %s.' % label)
+    raise RuntimeError('MoveIt 执行 %s 失败。' % display_label(label))
 
 
 def execute_joint_values(arm, joint_values, label):
-    rospy.loginfo('Executing %s joint_values=%s', label, joint_values)
+    rospy.loginfo('执行关节动作：%s joint_values=%s',
+                  display_label(label), joint_values)
     target_values = [float(value) for value in joint_values]
     for attempt in range(2):
         arm.set_start_state_to_current_state()
@@ -1026,18 +1120,17 @@ def execute_joint_values(arm, joint_values, label):
             return
         if attempt == 0:
             rospy.logwarn(
-                'MoveIt failed during %s. Waiting for joint state to settle and retrying once.',
-                label)
+                'MoveIt 执行 %s 失败，等待关节状态稳定后重试一次。',
+                display_label(label))
             rospy.sleep(0.5)
-    raise RuntimeError('MoveIt failed during %s.' % label)
+    raise RuntimeError('MoveIt 执行 %s 失败。' % display_label(label))
 
 
 def log_current_pose(arm, label):
     try:
         current_pose = arm.get_current_pose()
     except Exception as exc:
-        rospy.logwarn('Could not read current end-effector pose after %s: %s',
-                      label, exc)
+        rospy.logwarn('%s 后读取当前末端位姿失败：%s', label, exc)
         return None
     rospy.loginfo(pose_to_text(label, current_pose))
     return current_pose
@@ -1046,7 +1139,8 @@ def log_current_pose(arm, label):
 def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
                            jump_threshold=0.0, retry_without_collisions=False,
                            fallback_to_pose=False):
-    rospy.loginfo('Executing cartesian %s', pose_to_text(label, target_pose))
+    rospy.loginfo('执行直线动作：%s',
+                  pose_to_text(display_label(label), target_pose))
     for attempt in range(2):
         arm.set_start_state_to_current_state()
         plan, fraction = arm.compute_cartesian_path(
@@ -1054,26 +1148,25 @@ def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
         if fraction < 0.999:
             if retry_without_collisions:
                 rospy.logwarn(
-                    'MoveIt cartesian path during %s reached only %.3f with collision checking. '
-                    'Retrying without collision checking.',
-                    label, fraction)
+                    'MoveIt 规划 %s 直线路径只完成 %.3f，尝试关闭碰撞检查后重算。',
+                    display_label(label), fraction)
                 arm.set_start_state_to_current_state()
                 plan, fraction = arm.compute_cartesian_path(
                     [copy.deepcopy(target_pose.pose)], eef_step, jump_threshold,
                     False)
             if fraction < 0.999 and fallback_to_pose:
                 rospy.logwarn(
-                    'MoveIt cartesian path during %s still reached only %.3f. '
-                    'Falling back to normal pose planning.',
-                    label, fraction)
+                    'MoveIt 规划 %s 直线路径仍只完成 %.3f，改用普通位姿规划。',
+                    display_label(label), fraction)
                 execute_pose(arm, target_pose, label + '_pose_fallback')
                 return
             if fraction < 0.999:
                 raise RuntimeError(
-                    'MoveIt failed to compute a full cartesian path during %s (fraction=%.3f).'
-                    % (label, fraction))
+                    'MoveIt 无法完整规划 %s 直线路径，完成比例=%.3f。'
+                    % (display_label(label), fraction))
         if not plan.joint_trajectory.points:
-            raise RuntimeError('MoveIt returned an empty cartesian trajectory during %s.' % label)
+            raise RuntimeError('MoveIt 为 %s 返回了空直线轨迹。' %
+                               display_label(label))
         success = arm.execute(plan, wait=True)
         arm.stop()
         arm.clear_pose_targets()
@@ -1082,11 +1175,10 @@ def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
             return
         if attempt == 0:
             rospy.logwarn(
-                'MoveIt failed during cartesian %s. Holding current pose, waiting for '
-                'joint state to settle, replanning from current state and retrying once.',
-                label)
+                'MoveIt 执行 %s 直线动作失败，保持当前姿态，等待关节状态稳定后重试一次。',
+                display_label(label))
             rospy.sleep(0.5)
-    raise RuntimeError('MoveIt failed during cartesian %s.' % label)
+    raise RuntimeError('MoveIt 执行 %s 直线动作失败。' % display_label(label))
 
 
 def cache_tag_pose_for_teach(listener, args, tag_id, index, total_tags):
@@ -1120,7 +1212,7 @@ def move_to_teach_assist(args, arm, tag_id, tag_pose):
         })
         if args.dry_run:
             rospy.logwarn(
-                'Dry run enabled. Teach assist motion for tag_%d was skipped.',
+                '当前是 dry-run，已跳过 tag_%d 的示教辅助移动。',
                 tag_id)
         else:
             execute_pose(arm, assist_pose, 'tag_%d_teach_assist_front' % tag_id)
@@ -1179,7 +1271,7 @@ def teach_tag_sequence(args, arm):
         prompt_and_record_place(args, arm, preset, tag_id)
     save_preset(args.preset_file, preset,
                 overwrite=(preset_existed or args.overwrite))
-    rospy.loginfo('Saved taught tag preset: %s', args.preset_file)
+    rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
 
 
 def teach_tag_grasp(args, arm):
@@ -1199,7 +1291,7 @@ def teach_tag_grasp(args, arm):
         prompt_and_record_grasp(args, arm, preset, tag_id, tag_pose)
         rospy.loginfo('tag_%d 原来的载物仓释放姿态已保留，不会覆盖。', tag_id)
     save_preset(args.preset_file, preset, overwrite=True)
-    rospy.loginfo('Saved taught tag preset: %s', args.preset_file)
+    rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
 
 
 def teach_tag_place(args, arm):
@@ -1216,7 +1308,7 @@ def teach_tag_place(args, arm):
                       tag_id, index, total_tags)
         prompt_and_record_place(args, arm, preset, tag_id)
     save_preset(args.preset_file, preset, overwrite=True)
-    rospy.loginfo('Saved taught tag preset: %s', args.preset_file)
+    rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
 
 
 def teach_idle(args, arm):
@@ -1230,8 +1322,24 @@ def teach_idle(args, arm):
     idle_joint_values = record_idle_in_preset(preset, arm)
     save_preset(args.preset_file, preset,
                 overwrite=(preset_existed or args.overwrite))
-    rospy.loginfo('Saved idle joint values: %s', idle_joint_values)
-    rospy.loginfo('Saved taught tag preset: %s', args.preset_file)
+    rospy.loginfo('已保存空闲姿态关节值：%s', idle_joint_values)
+    rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
+
+
+def teach_carry(args, arm):
+    preset, preset_existed = load_or_create_preset(args)
+    if 'carry_joint_values' in preset and not args.overwrite:
+        raise RuntimeError(
+            'Preset already contains carry_joint_values. Use --overwrite to update it.')
+    prompt_enter(
+        '记录抓取后搬运中间姿态\n'
+        '请在 RViz 里把机械臂移动到抓起物块后、去放置点前的安全中转姿态。\n'
+        '建议姿态：物块离开料仓，关节不过极限，吸泵管线不缠绕。Plan/Execute 到位后回这里按 Enter。')
+    carry_joint_values = record_carry_in_preset(preset, arm)
+    save_preset(args.preset_file, preset,
+                overwrite=(preset_existed or args.overwrite))
+    rospy.loginfo('已保存搬运中间姿态关节值：%s', carry_joint_values)
+    rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
 
 
 def run_taught_sequence(args, arm, pump_proxy):
@@ -1240,7 +1348,9 @@ def run_taught_sequence(args, arm, pump_proxy):
     pickup_model = require_pickup_model(preset)
     listener = tf.TransformListener()
     rospy.sleep(0.5)
-    for tag_id in args.sequence:
+    total_tags = len(args.sequence)
+    for index, tag_id in enumerate(args.sequence, 1):
+        rospy.loginfo('开始处理 tag_%d（%d/%d）。', tag_id, index, total_tags)
         entry = preset['tags'][str(tag_id)]
         require_tag_fields(
             preset, tag_id,
@@ -1256,11 +1366,11 @@ def run_taught_sequence(args, arm, pump_proxy):
         pre_place_pose = build_pre_place_pose(
             place_pose, args.place_approach_gap, args.base_frame)
 
-        rospy.loginfo(pose_to_text('tag_%d_in_base' % tag_id, tag_pose))
-        rospy.loginfo(pose_to_text('taught_pre_grasp', pre_grasp_pose))
-        rospy.loginfo(pose_to_text('taught_grasp', grasp_pose))
-        rospy.loginfo(pose_to_text('taught_pre_place', pre_place_pose))
-        rospy.loginfo(pose_to_text('taught_place', place_pose))
+        rospy.loginfo(pose_to_text('tag_%d在base下位姿' % tag_id, tag_pose))
+        rospy.loginfo(pose_to_text('预抓点', pre_grasp_pose))
+        rospy.loginfo(pose_to_text('抓取接触点', grasp_pose))
+        rospy.loginfo(pose_to_text('放置上方点', pre_place_pose))
+        rospy.loginfo(pose_to_text('放置接触点', place_pose))
         publish_debug_geometry(args.base_frame, {
             'tag_in_base': tag_pose,
             'taught_pre_grasp': pre_grasp_pose,
@@ -1270,7 +1380,7 @@ def run_taught_sequence(args, arm, pump_proxy):
         })
 
         if args.dry_run:
-            rospy.logwarn('Dry run enabled for tag_%d. No arm motion will be executed.', tag_id)
+            rospy.logwarn('tag_%d 当前是 dry-run，只打印/发布调试位姿，不执行机械臂动作。', tag_id)
             continue
 
         holding_object = False
@@ -1281,6 +1391,9 @@ def run_taught_sequence(args, arm, pump_proxy):
             holding_object = True
             rospy.sleep(0.8)
             execute_cartesian_pose(arm, pre_grasp_pose, 'taught_grasp_retreat')
+            if preset.get('carry_joint_values'):
+                execute_joint_values(arm, preset['carry_joint_values'], 'carry')
+                rospy.sleep(0.5)
             execute_pose(arm, pre_place_pose, 'taught_pre_place')
             execute_cartesian_pose(
                 arm, place_pose, 'taught_place',
@@ -1300,15 +1413,15 @@ def run_taught_sequence(args, arm, pump_proxy):
             if holding_object:
                 try:
                     rospy.logwarn(
-                        'Motion failed after pump was enabled. Turning pump OFF before aborting.')
+                        '吸泵已开启后动作失败，退出前先关闭吸泵。')
                     set_pump(pump_proxy, False)
                 except Exception as pump_exc:
-                    rospy.logerr('Failed to turn pump OFF after motion error: %s',
+                    rospy.logerr('动作失败后关闭吸泵也失败：%s',
                                  pump_exc)
             raise
 
     if args.dry_run and args.debug_hold_seconds > 0.0:
-        rospy.loginfo('Holding debug pose topics for %.1f seconds.',
+        rospy.loginfo('保持调试位姿话题 %.1f 秒。',
                       args.debug_hold_seconds)
         rospy.sleep(args.debug_hold_seconds)
 
@@ -1331,18 +1444,20 @@ def main():
             teach_tag_grasp(args, arm)
         elif args.mode == 'teach_tag_place':
             teach_tag_place(args, arm)
+        elif args.mode == 'teach_carry':
+            teach_carry(args, arm)
         elif args.mode == 'teach_idle':
             teach_idle(args, arm)
         else:
             pump_proxy = None if args.dry_run else get_pump_proxy()
             run_taught_sequence(args, arm, pump_proxy)
-        rospy.loginfo('Tag taught sequence finished.')
+        rospy.loginfo('Tag 示教/抓取流程结束。')
     except UserAbort as exc:
         rospy.logwarn(str(exc))
     except rospy.ROSInterruptException:
         pass
     except KeyboardInterrupt:
-        rospy.logwarn('Interrupted by user.')
+        rospy.logwarn('用户中断。')
     except Exception as exc:
         rospy.logerr(str(exc))
         raise

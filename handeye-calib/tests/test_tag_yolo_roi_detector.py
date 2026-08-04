@@ -35,7 +35,7 @@ class Model:
 
 
 def test_resolve_model_path_accepts_file_or_directory(tmp_path):
-    model_file = tmp_path / "tag_yolov5n_640_best.onnx"
+    model_file = tmp_path / "tag_new_yolov5n_640_best.onnx"
     model_file.write_bytes(b"fake")
     assert detector.resolve_model_path(str(model_file)) == str(model_file)
     assert detector.resolve_model_path(str(tmp_path)) == str(model_file)
@@ -54,11 +54,11 @@ def test_resolve_model_path_prefers_nested_yolov5_onnx(tmp_path):
     root_model.write_bytes(b"fake")
     nested = tmp_path / "yolov5"
     nested.mkdir()
-    onnx_model = nested / "tag_yolov5n_640_best.onnx"
+    onnx_model = nested / "tag_new_yolov5n_640_best.onnx"
     onnx_model.write_bytes(b"fake")
 
     assert detector.resolve_model_path(str(tmp_path)) == str(onnx_model)
-    assert detector.DEFAULT_MODEL.endswith("/model/yolov5/tag_yolov5n_640_best.onnx")
+    assert detector.DEFAULT_MODEL.endswith("/model/yolov5/tag_new_yolov5n_640_best.onnx")
 
 
 def test_resolve_model_path_rejects_non_onnx_files(tmp_path):

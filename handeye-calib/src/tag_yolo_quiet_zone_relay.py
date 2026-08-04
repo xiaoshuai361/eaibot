@@ -20,7 +20,7 @@ from std_msgs.msg import String
 
 DEFAULT_PYTHON3 = 'auto'
 DEFAULT_DETECTOR_SCRIPT = '/home/eaibot/handeye-calib/src/tag_yolo_roi_detector.py'
-DEFAULT_MODEL = '/home/eaibot/handeye-calib/src/model/yolov5/tag_yolov5n_640_best.onnx'
+DEFAULT_MODEL = '/home/eaibot/handeye-calib/src/model/yolov5/tag_new_yolov5n_640_best.onnx'
 DEFAULT_BOX_EXPAND_PIXELS = 0
 
 

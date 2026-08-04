@@ -170,43 +170,6 @@ def test_alignment_stability_counts_only_new_yolo_inferences():
     assert (stable, accepted) == (2, True)
 
 
-def test_detection_geometry_gate_checks_y_size_and_aspect():
-    validate_geometry, = load_symbols("validate_detection_geometry")
-    args = SimpleNamespace(
-        target_y_ratio_range=[0.25, 0.75],
-        box_width_ratio_range=[0.03, 0.15],
-        box_height_ratio_range=[0.04, 0.20],
-        box_aspect_ratio_range=[0.6, 1.6],
-    )
-    message = {"image_width": 640, "image_height": 480}
-
-    valid, reason, metrics = validate_geometry(
-        {"box": [80, 180, 125, 225]}, message, args)
-    assert valid is True
-    assert reason == ""
-    assert metrics["center_y_ratio"] == pytest.approx(202.5 / 480.0)
-
-    valid, reason, _ = validate_geometry(
-        {"box": [80, 10, 125, 55]}, message, args)
-    assert valid is False
-    assert "center_y_ratio" in reason
-
-    valid, reason, _ = validate_geometry(
-        {"box": [80, 180, 90, 225]}, message, args)
-    assert valid is False
-    assert "width_ratio" in reason
-
-
-def test_tag_workspace_gate_rejects_uncalibrated_pick_area():
-    within_workspace, = load_symbols("position_within_workspace")
-    ranges = ([0.15, 0.32], [0.03, 0.20], [0.07, 0.16])
-
-    assert within_workspace([0.24, 0.10, 0.11], *ranges)[0] is True
-    valid, reason = within_workspace([0.40, 0.10, 0.11], *ranges)
-    assert valid is False
-    assert "x" in reason
-
-
 def test_left_to_right_order_sorts_available_tag_ids_by_x_center():
     left_to_right_order, = load_symbols("left_to_right_order")
     message = {
@@ -300,15 +263,8 @@ def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
         "--base-frame", "base",
         "--startup-home-service", "/mirobot_startup_home",
         "--skip-startup-home",
-        "--target-y-ratio-range", "0.25,0.75",
-        "--box-width-ratio-range", "0.03,0.15",
-        "--box-height-ratio-range", "0.04,0.20",
-        "--box-aspect-ratio-range", "0.6,1.6",
         "--max-detection-age-seconds", "1.5",
         "--chassis-settle-seconds", "0.8",
-        "--tag-workspace-x-range", "0.15,0.32",
-        "--tag-workspace-y-range", "0.03,0.20",
-        "--tag-workspace-z-range", "0.07,0.16",
         "--tag-tf-max-range-m", "0.005",
     ])
 
@@ -319,12 +275,127 @@ def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
     assert args.base_frame == "base"
     assert args.startup_home_service == "/mirobot_startup_home"
     assert args.skip_startup_home is True
-    assert args.target_y_ratio_range == pytest.approx([0.25, 0.75])
-    assert args.box_width_ratio_range == pytest.approx([0.03, 0.15])
     assert args.max_detection_age_seconds == pytest.approx(1.5)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
-    assert args.tag_workspace_x_range == pytest.approx([0.15, 0.32])
     assert args.tag_tf_max_range_m == pytest.approx(0.005)
+
+
+def test_parse_args_defaults_match_competition_short_command():
+    parse_args, = load_symbols("parse_args")
+
+    args = parse_args(["tag_chassis_align_pick_sequence.py"])
+
+    assert args.sequence == [1, 2, 3, 4]
+    assert args.order == "left_to_right"
+    assert args.preset_file == "/home/eaibot/handeye-calib/config/tag_pick_place_presets.json"
+    assert args.target_roi_ratio == pytest.approx([0.06, 0.0, 0.24, 1.0])
+    assert args.drive_speed == pytest.approx(0.012)
+    assert args.align_tolerance_px == pytest.approx(12.0)
+    assert args.stable_frames == 4
+    assert args.max_detection_age_seconds == pytest.approx(4.0)
+    assert args.chassis_settle_seconds == pytest.approx(0.8)
+    assert args.tag_tf_wait_seconds == pytest.approx(10.0)
+    assert args.tag_tf_stable_frames == 3
+    assert args.tag_tf_max_range_m == pytest.approx(0.005)
+    assert args.startup_home_settle_seconds == pytest.approx(3.0)
+    assert args.pick_velocity_scale == pytest.approx(0.4)
+    assert args.pick_acceleration_scale == pytest.approx(0.4)
+
+
+def test_align_tag_extends_timeout_for_settle_confirmation():
+    ChassisAlignPickSequence, AlignmentResult = load_symbols(
+        "ChassisAlignPickSequence", "AlignmentResult")
+    events = []
+
+    class FakeDuration:
+        def __init__(self, seconds):
+            self.seconds = float(seconds)
+
+    class FakeTime:
+        def __init__(self, seconds=0.0):
+            self.seconds = float(seconds)
+
+        @staticmethod
+        def now():
+            FakeRospy._now += 0.1
+            return FakeTime(FakeRospy._now)
+
+        def __add__(self, duration):
+            return FakeTime(self.seconds + duration.seconds)
+
+        def __lt__(self, other):
+            return self.seconds < other.seconds
+
+    class FakeRate:
+        def __init__(self, hz):
+            self.hz = hz
+
+        def sleep(self):
+            FakeRospy._now += 0.1
+
+    class FakeRospy:
+        _now = 0.0
+        Time = FakeTime
+        Duration = FakeDuration
+        Rate = FakeRate
+
+        @staticmethod
+        def is_shutdown():
+            return False
+
+        @staticmethod
+        def sleep(seconds):
+            FakeRospy._now += float(seconds)
+
+        @staticmethod
+        def loginfo(*items):
+            events.append("info")
+
+        @staticmethod
+        def logwarn(*items):
+            events.append("warn")
+
+        @staticmethod
+        def logwarn_throttle(*items):
+            events.append("warn_throttle")
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                max_align_seconds=0.3,
+                control_hz=5.0,
+                target_right_motion="forward",
+                max_detection_age_seconds=4.0,
+                min_confidence=0.1,
+                target_roi_ratio=[0.0, 0.0, 1.0, 1.0],
+                drive_speed=0.012,
+                align_tolerance_px=12.0,
+                stable_frames=1,
+                chassis_settle_seconds=0.8,
+            )
+            self.latest_detections = {"image_width": 640, "image_height": 480}
+
+        def publish_velocity(self, linear_x):
+            events.append(("velocity", linear_x))
+
+        def stop_chassis(self):
+            events.append("stop")
+
+    ChassisAlignPickSequence.align_tag.__globals__.update({
+        "rospy": FakeRospy,
+        "inference_age_seconds": lambda message, now: 0.0,
+        "ros_time_to_seconds": lambda stamp: stamp.seconds,
+        "select_detection_for_tag": lambda message, tag_id, min_confidence: {"box": [50, 0, 80, 20]},
+        "roi_ratio_to_pixels": lambda ratio, width, height: [0.0, 0.0, 640.0, 480.0],
+        "compute_drive_command": lambda *items: AlignmentResult(0.0, True, 65.0, 12.0, 628.0),
+        "update_alignment_stability": lambda stable, key, message, aligned: (
+            stable + 1, object(), True),
+    })
+
+    FakeSequence().align_tag(4)
+
+    assert events.count("stop") >= 2
+    assert "info" in events
 
 
 def test_run_calls_controller_startup_home_after_each_successful_pick():

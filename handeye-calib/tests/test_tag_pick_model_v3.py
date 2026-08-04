@@ -169,6 +169,23 @@ def test_tag_filter_deduplicates_timestamps_and_rejects_outlier():
     assert filtered["inlier_count"] == 3
 
 
+def test_tag_filter_accepts_two_low_rate_samples():
+    filter_samples, = load_module_symbols("filter_tag_translation_samples")
+    samples = [
+        {"stamp_ns": 1, "position": [0.200, 0.100, 0.120],
+         "orientation_xyzw": [0, 0, 0, 1]},
+        {"stamp_ns": 2, "position": [0.202, 0.098, 0.122],
+         "orientation_xyzw": [0, 0, 0, 1]},
+    ]
+
+    filtered = filter_samples(
+        samples, min_samples=2, mad_scale=3.5, max_axis_mad_m=0.005)
+
+    assert filtered["position"] == pytest.approx([0.201, 0.099, 0.121])
+    assert filtered["sample_count"] == 2
+    assert filtered["inlier_count"] == 2
+
+
 def test_tag_filter_rejects_unstable_translation():
     filter_samples, = load_module_symbols("filter_tag_translation_samples")
     samples = [

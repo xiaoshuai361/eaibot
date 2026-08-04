@@ -1,30 +1,20 @@
 #include <ros/ros.h>
 #include <actionlib/server/simple_action_server.h>
 #include <control_msgs/FollowJointTrajectoryAction.h>
-#include <std_msgs/Float32MultiArray.h>
-#include <iostream>
 #include <serial/serial.h>
-#include <std_msgs/String.h>
-#include <std_msgs/Empty.h>
-#include <std_msgs/UInt16.h>
-#include <std_msgs/Float32.h>
 #include <std_srvs/Trigger.h>
-#include <moveit_msgs/RobotTrajectory.h>
 #include <mirobot_urdf_2/mirobotPump.h>
 #include <sensor_msgs/JointState.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 #include "MirobotType.h"
-#include "mirobot_motion_math.h"
 #include <boost/bind.hpp>
 #include <boost/thread/mutex.hpp>
-#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
-#include <unistd.h>
+#include <string>
 #include <vector>
-
-using namespace std;
 
 typedef actionlib::SimpleActionServer<control_msgs::FollowJointTrajectoryAction> Server;
 
@@ -46,8 +36,10 @@ namespace
 	double g_trajectory_completion_timeout_seconds = 15.0;
 	double g_trajectory_completion_poll_seconds = 0.15;
 	double g_trajectory_goal_tolerance_rad = 0.05;
-	double g_joint6_max_trajectory_travel_rad = 3.0;
 	double g_pose_query_failure_cooldown_seconds = 0.6;
+	const size_t kTrajectoryWaypointStride = 4;
+	const size_t kFinalTargetRepeats = 3;
+	const double kSparseWaypointSleepSeconds = 0.15;
 	const std::string kPumpOnCommand("1");
 	const std::string kPumpOffCommand("2");
 	boost::mutex g_arm_serial_mutex;
@@ -65,6 +57,48 @@ namespace
 	{
 		boost::mutex::scoped_lock lock(g_execution_state_mutex);
 		return g_executing_trajectory;
+	}
+
+	bool shouldSendSparseWaypoint(size_t index, size_t point_count)
+	{
+		if (point_count <= 1)
+		{
+			return true;
+		}
+		if (index == 0 || index + 1 >= point_count)
+		{
+			return false;
+		}
+		return index == 1 ||
+			((index - 1) % kTrajectoryWaypointStride) == 0;
+	}
+
+	std::string buildArmCommand(
+		const std::vector<double> &positions, const char *feedrate)
+	{
+		char angle0[10];
+		char angle1[10];
+		char angle2[10];
+		char angle3[10];
+		char angle4[10];
+		char angle5[10];
+		sprintf(angle0, "%.2f", positions[0] * 57.296);
+		sprintf(angle1, "%.2f", positions[1] * 57.296);
+		sprintf(angle2, "%.2f", positions[2] * 57.296);
+		sprintf(angle3, "%.2f", positions[3] * 57.296);
+		sprintf(angle4, "%.2f", positions[4] * 57.296);
+		sprintf(angle5, "%.2f", positions[5] * 57.296);
+		return (std::string) "M50 G0 X" + angle0 + " Y" + angle1 +
+			" Z" + angle2 + " A" + angle3 + "B" + angle4 +
+			"C" + angle5 + " F" + feedrate + "\r\n";
+	}
+
+	void sendArmCommand(
+		const std::vector<double> &positions, const char *feedrate)
+	{
+		const std::string gcode = buildArmCommand(positions, feedrate);
+		ROS_DEBUG_STREAM("Arm GCode: " << gcode);
+		_serial.write(gcode.c_str());
 	}
 
 	class TrajectoryExecutionGuard
@@ -344,18 +378,51 @@ namespace
 		g_next_pose_query_time = ros::Time(0);
 	}
 
-	double maxJointTargetErrorRadians(
+	double shortestAngularDistance(double from, double to)
+	{
+		const double two_pi = 2.0 * pi;
+		double delta = std::fmod(to - from, two_pi);
+		if (delta > pi)
+		{
+			delta -= two_pi;
+		}
+		else if (delta < -pi)
+		{
+			delta += two_pi;
+		}
+		return delta;
+	}
+
+	struct JointTargetError
+	{
+		double error;
+		size_t joint_index;
+		double measured;
+		double target;
+	};
+
+	JointTargetError maxJointTargetErrorRadians(
 		const Pose &pose, const std::vector<double> &target_positions)
 	{
-		double maximum_error = 0.0;
+		JointTargetError result;
+		result.error = 0.0;
+		result.joint_index = 0;
+		result.measured = 0.0;
+		result.target = 0.0;
 		for (size_t index = 0; index < 6; ++index)
 		{
 			const double measured = pose.jointAngle[index] * pi / 180.0;
 			const double error = std::fabs(
 				shortestAngularDistance(measured, target_positions[index]));
-			maximum_error = std::max(maximum_error, error);
+			if (error > result.error)
+			{
+				result.error = error;
+				result.joint_index = index;
+				result.measured = measured;
+				result.target = target_positions[index];
+			}
 		}
-		return maximum_error;
+		return result;
 	}
 
 	bool waitForFirmwareTarget(
@@ -382,16 +449,19 @@ namespace
 			}
 			if (pose.state == Idle)
 			{
-				const double error = maxJointTargetErrorRadians(
+				const JointTargetError error = maxJointTargetErrorRadians(
 					pose, target_positions);
-				if (error <= g_trajectory_goal_tolerance_rad)
+				if (error.error <= g_trajectory_goal_tolerance_rad)
 				{
 					markPoseQuerySuccess();
 					return true;
 				}
 				ROS_ERROR(
-					"Mirobot firmware is Idle, but final joint error %.3f rad exceeds %.3f rad.",
-					error, g_trajectory_goal_tolerance_rad);
+					"Mirobot firmware is Idle, but final joint%d error %.3f rad exceeds %.3f rad "
+					"(measured=%.3f rad, target=%.3f rad).",
+					static_cast<int>(error.joint_index + 1),
+					error.error, g_trajectory_goal_tolerance_rad,
+					error.measured, error.target);
 				return false;
 			}
 			ros::Duration(g_trajectory_completion_poll_seconds).sleep();
@@ -487,30 +557,19 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 		return;
 	}
 
-	std::string Gcode = "";
-	char angle0[10];
-	char angle1[10];
-	char angle2[10];
-	char angle3[10];
-	char angle4[10];
-	char angle5[10];
 	char feedrate[16];
 	sprintf(feedrate, "%d", g_arm_feedrate);
 	std::vector<double> target_positions(6, 0.0);
 
 	const size_t n_tra_points = goalPtr->trajectory.points.size();
 	Pose initial_pose;
-	bool have_initial_pose = false;
 	if (queryCurrentPoseUnlocked(&initial_pose, g_pose_query_timeout_seconds))
 	{
-		have_initial_pose = true;
 		if (g_publish_joint_states)
 		{
 			publishMeasuredJointState(initial_pose, *joint_pub);
 		}
 	}
-	std::vector<double> joint6_positions;
-	joint6_positions.reserve(n_tra_points);
 	for (size_t index = 0; index < n_tra_points; ++index)
 	{
 		const trajectory_msgs::JointTrajectoryPoint &point =
@@ -521,27 +580,12 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 			moveit_server->setAborted();
 			return;
 		}
-		joint6_positions.push_back(point.positions[5]);
-	}
-	const double joint6_start = have_initial_pose
-		? initial_pose.jointAngle[5] * pi / 180.0
-		: joint6_positions.front();
-	const double joint6_travel = accumulatedJointTravel(
-		joint6_positions, joint6_start);
-	if (joint6_travel > g_joint6_max_trajectory_travel_rad)
-	{
-		ROS_ERROR(
-			"Rejecting trajectory before execution: joint6 travel %.3f rad exceeds %.3f rad.",
-			joint6_travel, g_joint6_max_trajectory_travel_rad);
-		moveit_server->setAborted();
-		return;
 	}
 
 	for (size_t index = 0; index < n_tra_points; ++index)
 	{
-		if (index == 0 && n_tra_points > 1)
+		if (!shouldSendSparseWaypoint(index, n_tra_points))
 		{
-			ROS_DEBUG("Skipping first trajectory point because it is MoveIt's planned start state.");
 			continue;
 		}
 
@@ -555,32 +599,24 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 		const trajectory_msgs::JointTrajectoryPoint &point = goalPtr->trajectory.points[index];
 		std::vector<double> commanded_positions(
 			point.positions.begin(), point.positions.begin() + 6);
-		target_positions = commanded_positions;
+		sendArmCommand(commanded_positions, feedrate);
+		ros::Duration(kSparseWaypointSleepSeconds).sleep();
+	}
 
-		sprintf(angle0, "%.2f", commanded_positions[0] * 57.296);
-		sprintf(angle1, "%.2f", commanded_positions[1] * 57.296);
-		sprintf(angle2, "%.2f", commanded_positions[2] * 57.296);
-		sprintf(angle3, "%.2f", commanded_positions[3] * 57.296);
-		sprintf(angle4, "%.2f", commanded_positions[4] * 57.296);
-		sprintf(angle5, "%.2f", commanded_positions[5] * 57.296);
-		Gcode = (std::string) "M50 G0 X" + angle0 + " Y" + angle1 + " Z" + angle2 + " A" + angle3 + "B" + angle4 + "C" + angle5 + " F" + feedrate + "\r\n";
-		ROS_DEBUG_STREAM("Arm GCode: " << Gcode);
-		_serial.write(Gcode.c_str());
-
-		ros::Duration wait_time;
-		if (index == 0)
+	const trajectory_msgs::JointTrajectoryPoint &final_point =
+		goalPtr->trajectory.points[n_tra_points - 1];
+	target_positions.assign(
+		final_point.positions.begin(), final_point.positions.begin() + 6);
+	for (size_t repeat = 0; repeat < kFinalTargetRepeats; ++repeat)
+	{
+		if (moveit_server->isPreemptRequested() || !ros::ok())
 		{
-			wait_time = point.time_from_start;
+			ROS_WARN("Trajectory execution was preempted or ROS is shutting down.");
+			moveit_server->setPreempted();
+			return;
 		}
-		else
-		{
-			wait_time = point.time_from_start - goalPtr->trajectory.points[index - 1].time_from_start;
-		}
-
-		if (wait_time.toSec() > 0.0)
-		{
-			wait_time.sleep();
-		}
+		sendArmCommand(target_positions, feedrate);
+		ros::Duration(kSparseWaypointSleepSeconds).sleep();
 	}
 
 	if (!waitForFirmwareTarget(target_positions, *joint_pub))
@@ -658,7 +694,6 @@ int main(int argc, char *argv[])
 	private_nh.param("trajectory_completion_timeout_seconds", g_trajectory_completion_timeout_seconds, 15.0);
 	private_nh.param("trajectory_completion_poll_seconds", g_trajectory_completion_poll_seconds, 0.15);
 	private_nh.param("trajectory_goal_tolerance_rad", g_trajectory_goal_tolerance_rad, 0.05);
-	private_nh.param("joint6_max_trajectory_travel_rad", g_joint6_max_trajectory_travel_rad, 3.0);
 	private_nh.param("pose_query_failure_cooldown_seconds", g_pose_query_failure_cooldown_seconds, 0.6);
 
 	if (g_joint_state_publish_hz <= 0.0)
@@ -684,10 +719,6 @@ int main(int argc, char *argv[])
 	if (g_trajectory_goal_tolerance_rad <= 0.0)
 	{
 		g_trajectory_goal_tolerance_rad = 0.05;
-	}
-	if (g_joint6_max_trajectory_travel_rad <= 0.0)
-	{
-		g_joint6_max_trajectory_travel_rad = 3.0;
 	}
 	if (g_pose_query_failure_cooldown_seconds < 0.0)
 	{

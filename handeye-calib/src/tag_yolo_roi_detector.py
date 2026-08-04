@@ -14,7 +14,7 @@ import numpy as np
 
 EXPECTED_MODEL_NAMES = {0: "ID1", 1: "ID2", 2: "ID3", 3: "ID4"}
 ALLOWED_TAG_IDS = (1, 2, 3, 4)
-DEFAULT_MODEL = "/home/eaibot/handeye-calib/src/model/yolov5/tag_yolov5n_640_best.onnx"
+DEFAULT_MODEL = "/home/eaibot/handeye-calib/src/model/yolov5/tag_new_yolov5n_640_best.onnx"
 DEFAULT_TAG_SIZE_M = 0.0145
 YOLO_INPUT_SIZE = 640
 
@@ -62,7 +62,7 @@ def resolve_model_path(model_path):
     if not candidates:
         raise TagDetectionError("No .onnx model file found in directory: %s" % model_path)
     preferences = [
-        lambda path: os.path.basename(path).lower() == "tag_yolov5n_640_best.onnx",
+        lambda path: os.path.basename(path).lower() == "tag_new_yolov5n_640_best.onnx",
         lambda path: path.lower().endswith(".onnx") and "yolov5" in path.lower().split(os.path.sep),
         lambda path: path.lower().endswith(".onnx"),
     ]

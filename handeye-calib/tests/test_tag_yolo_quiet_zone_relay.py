@@ -28,7 +28,7 @@ def test_default_model_points_to_yolov5_onnx():
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             values[node.targets[0].id] = ast.literal_eval(node.value)
 
-    assert values["DEFAULT_MODEL"].endswith("/model/yolov5/tag_yolov5n_640_best.onnx")
+    assert values["DEFAULT_MODEL"].endswith("/model/yolov5/tag_new_yolov5n_640_best.onnx")
 
 
 def test_resolve_python3_executable_prefers_ww_environment_with_yolo_runtime():
