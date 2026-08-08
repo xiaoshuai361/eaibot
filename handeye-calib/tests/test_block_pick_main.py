@@ -36,7 +36,7 @@ def test_action_mode_is_required_and_mutually_exclusive():
     with pytest.raises(SystemExit):
         main.parse_args(["--target", "fire"])
     with pytest.raises(SystemExit):
-        main.parse_args(["--target", "fire", "--dry-run", "--execute"])
+        main.parse_args(["--target", "fire", "--dry-run", "--run-taught-block"])
 
 
 def test_target_is_optional_for_all_detection_dry_run():
@@ -50,8 +50,33 @@ def test_target_is_optional_for_all_detection_dry_run():
     assert "--show-rgb" in command
 
 
+def test_live_preview_is_target_optional_and_forwards_rate():
+    parsed = main.parse_args(["--live-preview", "--preview-hz", "1.5"])
+
+    main.validate_runtime_args(parsed, {"distance_method": "theory"})
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+
+    assert "--live-preview" in command
+    assert command[command.index("--preview-hz") + 1] == "1.5"
+    assert "--block-target" not in command
+
+
+def test_pregrasp_distance_must_be_positive_and_is_forwarded():
+    parsed = args(
+        "--stop-at-taught-pre-grasp", "--pregrasp-distance-mm", "100")
+
+    main.validate_runtime_args(parsed, {"distance_method": "fixed_plane"})
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+    assert command[command.index("--pregrasp-distance-mm") + 1] == "100.0"
+
+    invalid = args(
+        "--stop-at-taught-pre-grasp", "--pregrasp-distance-mm", "0")
+    with pytest.raises(ValueError, match="positive"):
+        main.validate_runtime_args(invalid, {"distance_method": "fixed_plane"})
+
+
 def test_target_is_required_for_motion_actions():
-    parsed = main.parse_args(["--execute"])
+    parsed = main.parse_args(["--run-taught-block"])
 
     with pytest.raises(ValueError, match="--target"):
         main.validate_runtime_args(parsed, {"distance_method": "calibrated"})
@@ -59,7 +84,7 @@ def test_target_is_required_for_motion_actions():
 
 def test_validate_runtime_args_allows_theory_only_for_non_motion():
     dry = args("--dry-run")
-    execute = args("--execute")
+    execute = args("--run-taught-block")
 
     main.validate_runtime_args(dry, {"distance_method": "theory"})
     with pytest.raises(ValueError, match="theory"):
@@ -105,7 +130,7 @@ def test_build_child_command_forwards_action_and_ros_debug_flags():
 
 def test_build_child_command_forwards_taught_block_actions():
     teach = args(
-        "--teach-block",
+        "--teach-block-grasp",
         "--preset-file",
         "/tmp/block_presets.json",
         "--overwrite",
@@ -119,7 +144,7 @@ def test_build_child_command_forwards_taught_block_actions():
     teach_command = main.build_child_command(teach, request_fd=11, response_fd=12)
     run_command = main.build_child_command(run, request_fd=21, response_fd=22)
 
-    assert "--teach-block" in teach_command
+    assert "--teach-block-grasp" in teach_command
     assert "--run-taught-block" in run_command
     assert "--preset-file" in teach_command
     assert "/tmp/block_presets.json" in teach_command
@@ -129,7 +154,7 @@ def test_build_child_command_forwards_taught_block_actions():
 
 
 def test_taught_block_actions_require_target_and_non_theory_distance():
-    parsed = main.parse_args(["--teach-block"])
+    parsed = main.parse_args(["--teach-block-grasp"])
 
     with pytest.raises(ValueError, match="--target"):
         main.validate_runtime_args(parsed, {"distance_method": "fixed_plane"})

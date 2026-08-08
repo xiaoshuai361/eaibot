@@ -52,19 +52,23 @@ target_classes:
     class_name: Structural support device
 
 target_size_mm: 30.0
+target_height_mm: 30.0
 distance_method: theory
 
 input_size: 640
 confidence_min: %.2f
 nms_iou: 0.45
-frames_required: 10
+frames_required: 5
+observation_timeout: 50.0
+image_max_age_seconds: 1.0
 box_width_min_px: 30.0
 box_aspect_ratio_min: 0.75
 box_aspect_ratio_max: 1.30
 center_std_max_px: 2.0
 width_cv_max: 0.03
+grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
 
-rgb_topic: /camera/rgb/image_raw
+rgb_topic: /camera/rgb/image_rect_color
 camera_info_topic: /camera/rgb/camera_info
 rgb_timeout: 5.0
 camera_frame: camera_rgb_optical_frame
@@ -72,21 +76,28 @@ base_frame: base
 tf_timeout: 5.0
 
 distance_models:
-  power: {a: null, b: null}
-  fire: {a: null, b: null}
-  gas: {a: null, b: null}
-  support: {a: null, b: null}
+  power:
+    width: {a: null, b: null}
+    height: {a: null, b: null}
+  fire:
+    width: {a: null, b: null}
+    height: {a: null, b: null}
+  gas:
+    width: {a: null, b: null}
+    height: {a: null, b: null}
+  support:
+    width: {a: null, b: null}
+    height: {a: null, b: null}
+
+max_axis_distance_disagreement_mm: 20.0
 
 fixed_z_mm: null
-target_offset_mm: [0.0, 0.0, 0.0]
-tool_offset_mm: null
-fixed_orientation_xyzw: null
 
 pregrasp_distance_mm: 50.0
-suction_compression_mm: 3.0
 velocity_scale: 0.05
 acceleration_scale: 0.05
 planning_time: 5.0
+motion_settle_seconds: 0.25
 base_min_z_mm: 40.0
 base_max_radius_mm: 500.0
 """ % DEFAULT_CONFIDENCE_MIN
@@ -142,15 +153,22 @@ def parse_args(argv=None):
     parser.add_argument("--arm-script", default=DEFAULT_ARM_SCRIPT)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--dry-run", action="store_true")
-    action.add_argument("--stop-at-pre-grasp", action="store_true")
-    action.add_argument("--execute", action="store_true")
+    action.add_argument("--live-preview", action="store_true")
     action.add_argument("--calib-record", action="store_true")
-    action.add_argument("--teach-block", action="store_true")
+    action.add_argument("--teach-block-grasp", action="store_true")
+    action.add_argument("--teach-block-place", action="store_true")
+    action.add_argument("--teach-block-idle", action="store_true")
+    action.add_argument("--teach-block-carry", action="store_true")
+    action.add_argument("--preview-taught-block", action="store_true")
+    action.add_argument("--stop-at-taught-pre-grasp", action="store_true")
     action.add_argument("--run-taught-block", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--reset-pickup-model", action="store_true")
     parser.add_argument("--known-z-mm", type=float)
     parser.add_argument("--frames", type=int)
+    parser.add_argument("--preview-hz", type=float, default=1.0)
+    parser.add_argument("--pregrasp-distance-mm", type=float)
     parser.add_argument(
         "--confidence",
         type=float,
@@ -170,17 +188,22 @@ def _finite(value, option):
 def selected_action(args):
     actions = [
         ("dry_run", bool(args.dry_run)),
-        ("stop_at_pre_grasp", bool(args.stop_at_pre_grasp)),
-        ("execute", bool(args.execute)),
+        ("live_preview", bool(args.live_preview)),
         ("calib_record", bool(args.calib_record)),
-        ("teach_block", bool(args.teach_block)),
+        ("teach_block_grasp", bool(args.teach_block_grasp)),
+        ("teach_block_place", bool(args.teach_block_place)),
+        ("teach_block_idle", bool(args.teach_block_idle)),
+        ("teach_block_carry", bool(args.teach_block_carry)),
+        ("preview_taught_block", bool(args.preview_taught_block)),
+        ("stop_at_taught_pre_grasp", bool(args.stop_at_taught_pre_grasp)),
         ("run_taught_block", bool(args.run_taught_block)),
     ]
     enabled = [name for name, is_enabled in actions if is_enabled]
     if len(enabled) != 1:
         raise ValueError(
-            "choose exactly one action: --dry-run, --stop-at-pre-grasp, "
-            "--execute, --calib-record, --teach-block, or --run-taught-block"
+            "choose exactly one action: --dry-run, --live-preview, --calib-record, "
+            "a teach action, --preview-taught-block, "
+            "--stop-at-taught-pre-grasp, or --run-taught-block"
         )
     return enabled[0]
 
@@ -197,20 +220,31 @@ def validate_runtime_args(args, config):
     if args.arm_timeout <= 0.0:
         raise ValueError("--arm-timeout must be positive")
     _finite(args.arm_timeout, "--arm-timeout")
+    _finite(args.preview_hz, "--preview-hz")
+    if args.preview_hz <= 0.0:
+        raise ValueError("--preview-hz must be positive")
+    if args.pregrasp_distance_mm is not None:
+        _finite(args.pregrasp_distance_mm, "--pregrasp-distance-mm")
+        if args.pregrasp_distance_mm <= 0.0:
+            raise ValueError("--pregrasp-distance-mm must be positive")
     if args.known_z_mm is not None:
         _finite(args.known_z_mm, "--known-z-mm")
         if args.known_z_mm <= 0.0:
             raise ValueError("--known-z-mm must be positive")
     if action == "calib_record" and args.known_z_mm is None:
         raise ValueError("--calib-record requires --known-z-mm")
-    if action != "dry_run" and args.target is None:
+    if args.reset_pickup_model and action != "teach_block_grasp":
+        raise ValueError("--reset-pickup-model requires --teach-block-grasp")
+    targetless_actions = (
+        "dry_run", "live_preview", "teach_block_idle", "teach_block_carry")
+    if action not in targetless_actions and args.target is None:
         raise ValueError("--target is required except for all-target --dry-run")
 
     method = str((config or {}).get("distance_method", "theory")).lower()
     if action in (
-        "stop_at_pre_grasp",
-        "execute",
-        "teach_block",
+        "teach_block_grasp",
+        "preview_taught_block",
+        "stop_at_taught_pre_grasp",
         "run_taught_block",
     ) and method == "theory":
         raise ValueError(
@@ -367,24 +401,37 @@ def build_child_command(args, request_fd, response_fd):
         command += ["--block-target", args.target]
     if args.dry_run:
         command.append("--dry-run")
-    if args.stop_at_pre_grasp:
-        command.append("--stop-at-pre-grasp")
-    if args.execute:
-        command.append("--execute")
+    if args.live_preview:
+        command.append("--live-preview")
     if args.calib_record:
         command.append("--calib-record")
-    if args.teach_block:
-        command.append("--teach-block")
+    if args.teach_block_grasp:
+        command.append("--teach-block-grasp")
+    if args.teach_block_place:
+        command.append("--teach-block-place")
+    if args.teach_block_idle:
+        command.append("--teach-block-idle")
+    if args.teach_block_carry:
+        command.append("--teach-block-carry")
+    if args.preview_taught_block:
+        command.append("--preview-taught-block")
+    if args.stop_at_taught_pre_grasp:
+        command.append("--stop-at-taught-pre-grasp")
     if args.run_taught_block:
         command.append("--run-taught-block")
     if args.preset_file:
         command += ["--preset-file", args.preset_file]
     if args.overwrite:
         command.append("--overwrite")
+    if args.reset_pickup_model:
+        command.append("--reset-pickup-model")
     if args.known_z_mm is not None:
         command += ["--known-z-mm", str(args.known_z_mm)]
     if args.frames is not None:
         command += ["--frames", str(args.frames)]
+    command += ["--preview-hz", str(args.preview_hz)]
+    if args.pregrasp_distance_mm is not None:
+        command += ["--pregrasp-distance-mm", str(args.pregrasp_distance_mm)]
     if args.confidence is not None:
         command += ["--confidence", str(args.confidence)]
     if args.show_rgb:
@@ -454,7 +501,10 @@ def run_parent(args):
     if args.confidence is not None:
         config["confidence_min"] = args.confidence
     args = validate_runtime_args(args, config)
-    detector = OnnxYoloDetector(config["model_path"], config)
+    action = selected_action(args)
+    detector = None
+    if action not in ("teach_block_place", "teach_block_idle", "teach_block_carry"):
+        detector = OnnxYoloDetector(config["model_path"], config)
 
     request_read = request_write = response_read = response_write = None
     request_stream = response_stream = None
@@ -482,8 +532,10 @@ def run_parent(args):
         serve_requests(detector, config, request_stream, response_stream)
 
         arm_phase_started = (
-            args.execute or args.stop_at_pre_grasp
-            or args.teach_block or args.run_taught_block
+            args.teach_block_grasp
+            or args.teach_block_place or args.teach_block_idle
+            or args.teach_block_carry or args.stop_at_taught_pre_grasp
+            or args.run_taught_block
         )
         return_code = child.wait(timeout=args.arm_timeout)
         if return_code != 0:

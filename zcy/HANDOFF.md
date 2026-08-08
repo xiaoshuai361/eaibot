@@ -1,438 +1,336 @@
-# 交接文档：Mirobot 机械臂抓取与 WSL 协作
+# Mirobot 抓取项目交接文档
 
-写给完全没有上下文的新会话。
+> 更新日期：2026-08-06
+> 写给没有上下文的新 AI，请先读本文，再读对应操作文档和代码。
 
-## 当前鲁棒抓取版本（2026-07-24）
+## 1. 当前任务和结论
 
-当前开发分支是 `fix/tag-grasp-robustness`。最新方案已不再使用旧的 `grasp_ee_in_tag` 全旋转回放：
+项目是 Astra RGB 相机 + Mirobot 六轴机械臂 + MoveIt + 吸盘抓取。当前有两条链路：
 
-- preset 版本为 3；版本 1/2 运行时拒绝，重采抓取点时保留原放置点和 idle。
-- 抓取 XYZ 来自多帧过滤后的 Tag 平移加每个 ID 的固定 XYZ 偏移；吸盘姿态和接近轴固定。
-- YOLO 使用 `/camera/rgb/image_rect_color`，CameraInfo 无效时补白节点拒绝发布。
-- 底盘稳定计数只认新 YOLO 推理，并检查框高度、尺寸、宽高比、TF 离散和 base 工作区。
-- Mirobot 控制器只有固件 `Idle` 且关节角到达目标才返回成功，不再用缓存状态伪装新反馈。
-- Joint6 不使用硬路径约束，也不再对 RRT 轨迹做 `2π` 等价角改写；控制器只在下发前检查原轨迹累计转动量，超限则拒绝。
+1. **有 Tag 抓取**：已经基本能抓取和定点放置，但小 Tag、手眼误差和开环步进机会限制鲁棒性。当前不是主要开发线。
+2. **无 Tag 抓取**：当前主线。使用 YOLOv5 ONNX + 矫正后 RGB + 单目框尺寸估距，不使用深度图。
 
-真机必须先完成 `640x480` RGB 内参标定，再重新做 eye-on-base 手眼标定。具体命令以 `zcy/机械臂操作.md` 为准。下面旧内容仅用于理解历史，不要照搬旧抓取参数。
+用户的硬性要求：
 
-## 1. 当前协作环境
+- 无 Tag 链路不使用深度相机数据。
+- Python3/conda `ww` 只负责 ONNX 推理；Python2 只负责 ROS Melodic/MoveIt。
+- 显示终端和抓取终端分开。
+- 只允许红色 ROI 中的物块进入定位、标定和抓取。
+- 四类物块分别标定距离，不对四个不同框求共同平均。
+- 放置点与有 Tag 链路共用，无 Tag 只需重新示教抓取。
+- 代码要精简，旧实现只能留在 `src/old/` 参考，不要再接回主路径。
 
-当前不是在 WSL 里直接跑真机。
+## 2. 工作环境
 
-- WSL 镜像目录：`/home/zcy/eaibot`
-- 真机运行目录：`/home/eaibot`
-
-工作方式：
-
-1. 在 WSL 里读代码、改代码、做静态检查。
-2. 改完后必须把对应文件同步回真机 `/home/eaibot/...`。
-3. 机械臂、吸泵、Astra 相机、AprilTag、MoveIt 真机动作都在真机上验证，不要在 WSL 里假装已经验证真机。
-
-重点参考文档：
-
-- `/home/zcy/eaibot/zcy/WSL协作说明.md`
-- `/home/zcy/eaibot/zcy/机械臂操作.txt`
-- `/home/zcy/eaibot/zcy/记忆.md`
-
-ROS 环境是 Melodic，抓取脚本必须用 Python 2：
-
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-```
-
-## 2. 我们在做什么任务
-
-目标是让 Mirobot 机械臂更稳定地完成比赛物资抓取。
-
-最近的核心需求有两个：
-
-1. 启动机械臂 MoveIt 后端时可以不打开 RViz，降低比赛机负载。
-2. 抓取时把吸盘从“默认朝下”调整成用户照片里确认过的“水平朝前”姿态，再用于后续正面/侧向接近物体。
-
-补充：当前比赛物资 AprilTag 已切到 `tag16h5`，黑色码块外边长为 `1.45cm`，也就是 `size=0.0145` 米。
-
-用户已经确认的目标腕部姿态来自真机：
+当前 AI 操作的是 WSL 镜像，不是真机：
 
 ```text
-name:     [joint1, joint2, joint3, joint4, joint5, joint6]
-position: [0.0, 0.0, 0.0002792526888193459, 0.0, -1.5709534265016345, 0.0]
+WSL 代码根目录：/home/zcy/eaibot
+真机对应目录：/home/eaibot
+Git 分支：fix/tag-grasp-robustness
+ROS：Melodic
 ```
 
-最关键的是：
+协作规则：
+
+1. 在 WSL 修改、做静态检查和单元测试。
+2. 必须明确告诉用户需同步到真机的文件。
+3. 真机的相机、泵、机械臂和 MoveIt 动作由用户验证，不得把 WSL 测试写成真机验收。
+4. 工作树有其他改动，不要回退与当前任务无关的文件。
+
+必读文档：
 
 ```text
-joint5 = -1.5709534265016345
+/home/zcy/eaibot/zcy/WSL协作说明.md
+/home/zcy/eaibot/zcy/无tag的机械臂操作.md
+/home/zcy/eaibot/zcy/机械臂操作.md
 ```
 
-这个姿态就是用户想要的“吸盘水平朝前”样子。不要再误判为主要调 `joint6`；`joint6` 更多是绕吸盘自身轴旋转，不能把吸盘从朝下变成朝前。主要关节是 `joint5`。
-
-## 3. 已经完成了什么
-
-### 3.1 RViz 启动开关
-
-已在 WSL 修改：
-
-- `/home/zcy/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot.launch`
-- `/home/zcy/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot_moveit.launch`
-
-新增参数：
-
-```bash
-start_rviz:=false
-```
-
-用法：
-
-```bash
-roslaunch mirobot_moveit_config mirobot.launch start_rviz:=false
-```
-
-默认不加参数仍会打开 RViz：
-
-```bash
-roslaunch mirobot_moveit_config mirobot.launch
-```
-
-实现方式：
-
-- `mirobot.launch` 定义并转发 `start_rviz`
-- `mirobot_moveit.launch` 用 `if="$(arg start_rviz)"` 包住 `moveit_rviz.launch`
-
-已做过 WSL 静态检查：
-
-- XML 解析通过
-- 参数转发断言通过
-
-注意：改 launch 不需要重新 `catkin_make`。
-
-### 3.2 抓取脚本新增 wrist_forward
-
-已在 WSL 修改：
-
-- `/home/zcy/eaibot/handeye-calib/src/mirobot_pick_test.py`
-- `/home/zcy/eaibot/zcy/机械臂操作.txt`
-
-新增常量：
-
-```python
-WRIST_FORWARD_JOINT5 = -1.5709534265016345
-```
-
-新增模式：
-
-```bash
---mode wrist_forward
-```
-
-单独把吸盘转成水平朝前姿态：
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py --mode wrist_forward --velocity-scale 0.05 --acceleration-scale 0.05 --planning-time 8.0
-```
-
-新增抓取参数：
-
-```bash
---wrist-forward
---wrist-forward-joint5
-```
-
-抓取前先转腕部，再继续抓取：
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py --mode grasp --supply basic --skip-home --wrist-forward --planning-time 8.0 --velocity-scale 0.1 --acceleration-scale 0.1 --grasp-x -0.045 --y-offset 0.025 --z-offset 0.08 --approach-axis z --approach-gap 0.02
-```
-
-脚本行为：
-
-- `--mode wrist_forward`：只设置 `joint5`，不打开吸泵。
-- `--wrist-forward`：在 `grasp / pick_place / pick_lift_place` 计算抓取目标前，先执行 `go_wrist_forward()`。
-- `--dry-run --wrist-forward` 同时使用时不会实际转腕部，会打印 warning；因为 dry-run 不执行真机动作。
-
-已做过 WSL 检查：
+## 3. 无 Tag 当前架构
 
 ```text
-parse wrist_forward OK
-go_wrist_forward joint target OK
-python3 -m py_compile /home/zcy/eaibot/handeye-calib/src/mirobot_pick_test.py 通过
+/camera/rgb/image_rect_color + CameraInfo
+        |
+        v
+block_pick_main.py (Python3, ONNX Runtime, conda ww)
+        |
+        | pipe 传递当前 RGB 图像和 YOLO 结果
+        v
+mirobot_pick_test.py (Python2, rospy, TF, MoveIt, 泵)
 ```
 
-### 3.3 AprilTag 检测切换到 tag16h5
+主要文件：
 
-已在 WSL 修改：
+```text
+handeye-calib/src/block_pick_main.py
+handeye-calib/src/block_mono_vision.py
+handeye-calib/src/mirobot_pick_test.py
+handeye-calib/src/block_distance_collect.py
+handeye-calib/src/block_distance_calibrate.py
+handeye-calib/src/config/block_mono_grasp.yaml
+handeye-calib/config/block_mono_pick_place_presets.json
+```
 
-- `/home/zcy/eaibot/mirobot_ws/src/apriltag_ros/apriltag_ros/config/settings.yaml`
-- `/home/zcy/eaibot/mirobot_ws/src/apriltag_ros/apriltag_ros/config/tags.yaml`
+模型：
 
-当前配置：
+```text
+/home/eaibot/handeye-calib/src/model/yolov5/Block_v5n_yolov5n_640_best.onnx
+```
+
+模型的 WSL 训练/测试材料：
+
+```text
+数据集：/home/zcy/model_train/datasets/raicam/Block_v5n
+训练输出：/home/zcy/models/Block_v5n_yolov5n_640
+```
+
+历史离线评估仅作参考：`test` 集 36/36 分类正确；`valid` 在置信度 0.30 时有 1 个边缘误检，在 0.70 时漏 1 个 support。真机起步用 `--confidence 0.5`，不要把离线分类准确率当成定位精度。
+
+类别与显示缩写：
+
+```text
+power   -> POW，电力物资
+fire    -> FIR，消防物资
+gas     -> GAS，气体净化
+support -> SUP，支撑物资
+```
+
+定位路径：
+
+```text
+矫正 RGB -> YOLOv5 ONNX -> 只接受新时间戳
+-> ROI 门控 -> 多帧中位数/MAD 过滤
+-> 单目距离 -> CameraInfo 反投影
+-> TF 转到 base -> 示教偏移抓取 -> 固定点放置
+```
+
+抓取规则：
+
+```text
+抓取 XYZ = 当前过滤后物块 XYZ + 当前类别示教偏移
+吸盘姿态 = 首次抓取示教锁定的 base 姿态
+接近方向 = 首次抓取示教锁定的 base 方向
+放置姿态 = 当前类别在 base 下的固定示教姿态
+```
+
+不给 Joint6 添加硬路径约束，否则 RRT 容易无解。
+
+无 Tag 方案没有 AprilTag 那样的稳定 6D 姿态，只适合物块高度、正面朝向和车体偏航均在已标定范围内的场景。大角度倾斜、明显旋转或超出标定距离时应拒绝抓取，不要靠继续增加偏移参数掩盖。
+
+## 4. 已完成的无 Tag 改造
+
+- 完全不依赖 depth 话题。
+- 使用 `/camera/rgb/image_rect_color` 和有效 CameraInfo。
+- Python3 ONNX 与 Python2 ROS 分进程，避免 Melodic/Python 环境冲突。
+- 修复 Python2 ROS 日志遇到中文导致的 `UnicodeEncodeError/UnicodeDecodeError`。ROS 日志只输出 ASCII，中文用普通终端打印。
+- 实时显示和抓取命令可并行，ROS 节点使用 anonymous name。
+- 红色 ROI 共用于距离标定、dry-run、示教和抓取。
+- 可用 `--pregrasp-distance-mm` 从命令行设置预抓距离。
+- preset v2 已同步有 Tag 的四个放置位置和 idle。当前 preset 里还没有无 Tag 抓取示教数据。
+- 引导采集程序按距离优先采集：同一距离先完成 `power/fire/gas/support`，再改下一个距离；失败不会留下伪完成 CSV。
+- 每个距离使用多帧框宽/高的中位数，不是算术平均。各距离中位点再用于拟合。
+- 无 Tag 抓取示教不再自动移动到所谓“前方安全点”，避免工具长度未计入和 MoveIt IK 改变 joint5；示教接触姿态完全由用户在 RViz 中 Plan/Execute。
+
+## 5. 当前最高优先级：把 RGB 距离标定续采到 480mm
+
+距离采集已在真机完成，四类物块均覆盖 `280~480mm`、间隔 `20mm` 的 11 个距离点。配置现已切换为：
 
 ```yaml
-tag_family: "tag16h5"
+distance_method: calibrated
+fixed_z_mm: 330.0
+frames_required: 5
+observation_timeout: 50.0
 ```
 
-`tags.yaml` 中只允许真实比赛 ID 1-4。不要把误识别出来的 `15、26、12、18` 映射成 `tag_1` 到 `tag_4`，否则会把错误识别合法化。看到这些 ID 时，应处理图像质量、距离、光照、分辨率或重新打印更清晰的 tag16h5 1-4。
+四类拟合的 RMSE 为 `5.19~7.49mm`，最大残差为 `8.81~15.24mm`。参数已经写入 `block_mono_grasp.yaml`；`fixed_z_mm` 仅保留为切回 `fixed_plane` 时的备用值。
 
-尺寸均为：
+正式示教/抓取的稳定观测数已从 10 改为 5，与有 Tag 链路的 `DEFAULT_TAG_MIN_SAMPLES=5` 一致。标定命令显式使用 `--frames 10`，因此标定数据质量不受影响。
+
+标定距离是 **RGB 镜头光心到物块正面的垂直 Z 距离**，不是深度相机读数，不是到物块中心的斜距离。
+
+真机已经完成四类物块 `280~380mm` 的采集。下一步保留这些 CSV，并续采 `400、420、440、460、480mm`。使用完整距离列表运行，程序会自动跳过旧数据，采完后用全部 11 个距离点重新拟合：
+
+```bash
+python3 /home/eaibot/handeye-calib/src/block_distance_collect.py \
+  --targets power,fire,gas,support \
+  --distances 280,300,320,340,360,380,400,420,440,460,480 \
+  --frames 10 \
+  --confidence 0.5 \
+  --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml
+```
+
+每类物块要单独摆放，框中心放入红色 ROI，物块正面与相机尽量平行。
+默认不要加 `--overwrite`。启动时应显示“续采模式”，并逐个打印“跳过已有样本”；随后从 `400mm` 开始采集四类物块，依次到 `480mm`。原有 `280~380mm` CSV 不会被改写。
+
+输出目录：
+
+```text
+/home/eaibot/handeye-calib/config/block_distance_samples/
+```
+
+每类至少需要 3 个不同距离，当前目标是 11 个距离。生成 `power_model.yaml` 等文件后，把四类的 `width/height` 参数写入 `block_mono_grasp.yaml`，然后改为：
 
 ```yaml
-size: 0.0145
+distance_method: calibrated
 ```
 
-`0.0145m` 来自用户实测：tag16h5 黑色码块外边长 `1.45cm`。这个尺寸不是整张纸，也不是白边，是黑色大正方形的外边长。
+## 6. 最新真机故障：实际仍要求 20 帧
 
-为降低小码误识别影响，`tag_0` 和旧的 `tag_10` bundle 已取消配置，`tag_bundles: []`。这样 `/tag_detections` 和 TF 只会继续处理配置内的 1-4。注意：`apriltag_ros` 内部会先对原始检测结果做 duplicate pruning，再按 `tags.yaml` 过滤，所以终端里仍可能短暂看到 “Pruning tag ID 12/22/25...” 这类原始误检警告；关键看 `/tag_detections` 是否只输出 1-4。
-
-`settings.yaml` 里的 `max_hamming_dist` 当前使用 `1`。现场测试发现改成 `2` 后近距离糊图会带来明显误识别，因此比赛优先用 `1` 降低 false positive。代价是 1.45cm 小码在近距离失焦时可能漏检，解决方向应是让相机在更清晰距离识别，然后再调机械臂抓取偏移/手眼标定。
-
-`continuous_detection.launch` 默认发布并打开 `/tag_detections_image` 预览窗口，方便看检测框：
-
-```bash
-roslaunch apriltag_ros continuous_detection.launch
-```
-
-也可以显式打开：
-
-```bash
-roslaunch apriltag_ros continuous_detection.launch publish_tag_detections_image:=true show_image:=true
-```
-
-当前 `astrapro.launch` 默认 RGB 输入仍是 `640x480@30`、`mjpeg`，AprilTag 识别吃的是 `/camera/rgb/image_raw`。已给它加了可选参数：
-
-```bash
-roslaunch astra_camera astrapro.launch rgb_width:=1280 rgb_height:=720 rgb_video_mode:=mjpeg rgb_frame_rate:=30
-```
-
-提高分辨率可能改善 1.45cm 小码识别，但会更吃 CPU，并且可能和原相机内参标定分辨率不一致。正式用前必须在真机上确认 `/camera/rgb/image_raw` 实际 width/height、`/tag_detections` 是否稳定，以及抓取位姿是否偏。
-
-### 3.4 front 模式曾经改过，但当前不要优先用它
-
-脚本里现在仍有 `--approach-axis front`，并且曾经修过一个逻辑问题：
-
-- 旧问题：`front` 模式下 `grasp` 是按 AprilTag 局部正面算的，但 `pre_grasp` 偏移用了末端旋转后的姿态，导致不是“码前方再向前伸”。
-- 已改成：`pre_grasp` 和 `grasp` 都沿 AprilTag 正面法线计算位置，末端姿态只负责吸盘朝向。
-
-但是实际调试中 `front-tool-pitch-deg 90 / -90 / yaw 180` 等都没得到用户想要的姿态。用户最后明确说想要的是照片中那种固定腕部形态，并确认 `joint5=-1.5709534265016345` 的姿态就是想要的。
-
-所以当前下一步不要继续盲调 `front-tool-*`。优先用 `wrist_forward` 这条线。
-
-## 4. 当前卡在哪
-
-当前卡点不是“找不到 joint5 姿态”了，这个已经找到了。
-
-当前真正未完成的是：
-
-1. WSL 改动是否已经全部同步到真机 `/home/eaibot`，需要确认。
-2. 真机上需要重新跑新增的 `--mode wrist_forward`，确认脚本内置动作和之前临时 Python 片段效果一致。
-3. 需要验证“先 wrist_forward，再按 AprilTag 抓取”的完整链路是否能稳定吸住物体。
-
-也就是说，代码层面的入口已经加好，真机验证还没完成。
-
-## 5. 下一步计划
-
-### 第一步：同步文件到真机
-
-必须同步这些文件：
+真机最新日志：
 
 ```text
-/home/zcy/eaibot/handeye-calib/src/mirobot_pick_test.py
--> /home/eaibot/handeye-calib/src/mirobot_pick_test.py
-
-/home/zcy/eaibot/zcy/机械臂操作.txt
--> /home/eaibot/zcy/机械臂操作.txt
-
-/home/zcy/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot.launch
--> /home/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot.launch
-
-/home/zcy/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot_moveit.launch
--> /home/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot_moveit.launch
+Could not collect 20 stable fresh YOLO observations within 25.0s;
+collected 14 unique frames.
 ```
 
-改的是 Python 和 launch，不需要重新构建包。同步后重新启动相关 launch 即可。
+这不是目标不稳定。`Last filter error: none` 说明程序因为没到 20 帧，还没进入稳定性判断。
 
-### 第二步：启动机械臂后端，可不开 RViz
+WSL 最新代码已确认：
 
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-roslaunch mirobot_moveit_config mirobot.launch start_rviz:=false
-```
+- `block_distance_collect.py` 默认 `--frames 10`。
+- 它会向 `block_pick_main.py` 显式传递 `--frames 10`。
+- `block_pick_main.py` 会继续传给 Python2 `mirobot_pick_test.py`。
+- 日志当时的超时是 25 秒；最新代码已调整为 50 秒。
 
-如果需要看姿态，再开 RViz 或直接不传 `start_rviz:=false`。
+因此真机是 **文件只同步了一部分**，至少 `block_distance_collect.py` 还是旧版，或真机命令仍显式写了 `--frames 20`。
 
-### 第三步：单独验证 wrist_forward
-
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py --mode wrist_forward --velocity-scale 0.05 --acceleration-scale 0.05 --planning-time 8.0
-```
-
-期望效果：吸盘水平朝前，类似用户发的第二张确认图。
-
-如果动作失败，先看：
-
-```bash
-rostopic echo -n 1 /joint_states
-rosnode list
-```
-
-确认 `/move_group`、`mirobot` 相关节点存在，且 `/joint_states` 正常更新。
-
-### 第四步：基于已有 z 模式抓取，加 wrist_forward
-
-目前最稳的抓取路线仍建议先用 `z` 模式，只是在抓取前先把吸盘调成水平朝前：
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py --mode grasp --supply basic --skip-home --wrist-forward --planning-time 8.0 --velocity-scale 0.1 --acceleration-scale 0.1 --grasp-x -0.045 --y-offset 0.025 --z-offset 0.08 --approach-axis z --approach-gap 0.02
-```
-
-如果只想看坐标，不动机械臂：
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py --mode grasp --supply basic --skip-home --dry-run --planning-time 2.0 --disable-replanning --velocity-scale 0.1 --acceleration-scale 0.1 --grasp-x -0.045 --y-offset 0.025 --z-offset 0.08 --approach-axis z --approach-gap 0.02 --debug-hold-seconds 30
-```
-
-注意：`--dry-run --wrist-forward` 不会真的转腕部，所以如果要观察转腕后的当前末端姿态，先单独跑 `--mode wrist_forward`，再跑 dry-run。
-
-### 第五步：如果要进一步自动化
-
-后续可以考虑新增更明确的模式，例如：
-
-```bash
---approach-axis wrist_z
-```
-
-或者把 `--wrist-forward` 和 `z` 模式封装成一个专门比赛演示命令。但目前先不要扩大改动，先验证现有小改动。
-
-## 6. 踩过的坑，绝对不要再踩
-
-### 6.1 不要把 WSL 当真机
-
-WSL 里没有真实串口、机械臂、相机、吸泵链路。WSL 只能做：
-
-- 读代码
-- 改代码
-- 语法检查
-- launch/XML 静态检查
-- 离线逻辑断言
-
-真机动作必须回到 `/home/eaibot` 上执行。
-
-### 6.2 WSL 修改后必须同步
-
-只改 `/home/zcy/eaibot/...` 不会影响真机运行。真机跑的是 `/home/eaibot/...`。
-
-### 6.3 不要为了 WSL 适配乱改 `/home/eaibot` 硬编码
-
-很多路径是给真机跑的，看到 `/home/eaibot` 不一定是错。除非明确要做双环境兼容，否则优先保留真机路径语义。
-
-### 6.4 抓取脚本必须 Python 2
-
-`mirobot_pick_test.py` 必须用：
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py ...
-```
-
-不要用 Python 3 跑真机脚本。
-
-### 6.5 Python 2 stdin 片段不要写中文
-
-之前临时运行：
-
-```bash
-python2 - <<'PY'
-...
-PY
-```
-
-如果里面有中文注释，会报：
+已给最新采集程序加启动自检输出：
 
 ```text
-SyntaxError: Non-ASCII character '\xe8' ... but no encoding declared
+采集配置：每个类别/距离 10 帧，置信度 0.500
+采集入口：/home/eaibot/handeye-calib/src/block_pick_main.py
+配置文件：/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml
 ```
 
-临时 Python 2 片段要么纯英文，要么第一行加编码声明。但现在已经不需要临时片段了，直接用 `--mode wrist_forward`。
-
-### 6.6 `rosdep view is empty` 不是抓取失败主因
-
-真机日志里经常出现：
+真机下一步必须先同步以下文件：
 
 ```text
-the rosdep view is empty: call 'sudo rosdep init' and 'rosdep update'
+/home/eaibot/handeye-calib/src/block_distance_collect.py
+/home/eaibot/handeye-calib/src/block_distance_calibrate.py
+/home/eaibot/handeye-calib/src/block_pick_main.py
+/home/eaibot/handeye-calib/src/mirobot_pick_test.py
+/home/eaibot/handeye-calib/src/block_mono_vision.py
+/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml
 ```
 
-这不是 MoveIt 规划失败的直接原因。不要被它带偏。
+同步后运行采集，第一屏必须明确显示 `10 帧`。若仍显示 20，检查执行的绝对路径和实际命令行，不要继续放宽过滤阈值。
 
-### 6.7 不要继续盲调 `front-tool-pitch-deg`
+## 7. 无 Tag 真机运行顺序
 
-用户想要的不是“跟随 tag 姿态的完整末端姿态”，而是照片里固定的“吸盘水平朝前”。已经确认核心是：
+完整命令以 `zcy/无tag的机械臂操作.md` 为准，简化顺序如下：
+
+1. 启动 Astra RGB，确认 `/camera/rgb/image_rect_color` 为 `640x480`。
+2. 启动 Mirobot + MoveIt。示教时开 RViz，比赛时可 `start_rviz:=false`。
+3. 发布 eye-on-base 手眼 TF。
+4. 在 conda `ww` 中运行 `block_pick_main.py --live-preview`。
+5. 先做纯视觉 dry-run。
+6. 完成四类单目距离标定，启用 `calibrated`。
+7. 示教无 Tag 抓取；放置点和 idle 已有。
+8. 先 `--preview-taught-block`，再 `--stop-at-taught-pre-grasp`，最后 `--run-taught-block`。
+
+红色 ROI 当前为：
+
+```yaml
+grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
+```
+
+在 `640x480` 中约为 `x=38..154`。
+
+## 8. preset 当前状态
+
+无 Tag preset：
 
 ```text
-joint5 = -1.5709534265016345
+/home/zcy/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
 ```
 
-`front-tool-pitch-deg 90 / -90 / yaw 180` 这条路线已经试过不理想。后续优先走 `wrist_forward`。
+当前是 `version: 2`，已包含：
 
-### 6.8 不要误以为最后一个关节 joint6 能解决朝向
+- `idle_joint_values`
+- power/fire/gas/support 的 `place_ee_in_base`
 
-`joint6` 主要绕末端轴旋转，不能把吸盘从朝下变成朝前。吸盘从朝下到水平朝前主要靠 `joint5`。
+抓取后的 `carry_joint_values` 也应直接复用有 Tag preset 的现有中间过渡点，不重新示教。当前 WSL 镜像中的旧 Tag preset 尚未包含该字段；真机运行前应从真机的 `tag_pick_place_presets.json` 复制到无 Tag preset。
 
-### 6.9 `--dry-run` 不会执行腕部动作
+映射：
 
-`--dry-run` 只算位姿，不动机械臂。即使加了 `--wrist-forward`，也不会真的转腕部。要验证腕部姿态，单独跑：
+```text
+power   -> 原 Tag 仓位 1
+fire    -> 原 Tag 仓位 2
+gas     -> 原 Tag 仓位 3
+support -> 原 Tag 仓位 4
+```
+
+它尚未包含完整的无 Tag 抓取模型，必须等距离标定完成后在真机重新示教。示教时不要手掰机械臂，用 RViz Plan/Execute 到位后再回终端确认。
+
+## 9. 有 Tag 链路的背景
+
+有 Tag 详细命令在 `zcy/机械臂操作.md`。当前重要结论：
+
+- 使用 1.45cm `tag16h5` ID 1-4，标签不能加大。
+- YOLO 补白后给 AprilTag，补白和检测是实时的。
+- Tag 位姿需要多帧新时间戳过滤。
+- 新抓取模型不让小 Tag 的旋转抖动直接控制吸盘姿态。
+- 放置点稳定，已被复用到无 Tag preset。
+- 机械臂是开环步进机，每次上电后正确回零很重要。
+- 不要恢复曾经导致 RRT 无解的 Joint6 硬约束。
+
+## 10. 底层驱动结论
+
+已对比过参考/原始工作区和现有 `mirobot_arm_controller.cpp`。官方/原始实现本质也是简单 GCode 开环控制，不能直接替换来获得真正编码器闭环。
+
+当前底层安全方向是：
+
+- 只在固件状态为 Idle 且关节角在容差内时返回成功。
+- 串口查询失败不能给缓存关节状态重新盖新时间戳。
+- 上一个 goal 真正结束前不发下一个。
+- 查询失败、超时、Alarm 或关节超差必须 ABORTED，不能伪装 SUCCEEDED。
+
+不要把官方或原始工作区解压到当前 `mirobot_ws/src`，会产生同名 ROS 包冲突。参考包应放在 `/home/eaibot/reference/`。
+
+## 11. 验证状态
+
+最新 WSL 针对性测试：
+
+```text
+58 passed
+```
+
+覆盖：
+
+- 单目视觉数学和稳定性过滤
+- Python3 主进程参数/子进程协议
+- Python2 MoveIt 子进程的无 Tag 路径
+- 距离采集和拟合
+
+执行过的命令：
 
 ```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test.py --mode wrist_forward
+python3 -m py_compile \
+  handeye-calib/src/block_distance_collect.py \
+  handeye-calib/src/block_distance_calibrate.py \
+  handeye-calib/src/block_pick_main.py \
+  handeye-calib/src/block_mono_vision.py
+
+python3 -m pytest -q \
+  handeye-calib/tests/test_block_distance_collect.py \
+  handeye-calib/tests/test_block_distance_calibrate.py \
+  handeye-calib/tests/test_block_pick_main.py \
+  handeye-calib/tests/test_mirobot_block_mono.py \
+  handeye-calib/tests/test_block_mono_vision.py
 ```
 
-### 6.10 front 模式的 `z-offset` 符号容易反
+最新输出为 `58 passed in 0.55s`，`git diff --check` 通过。这不代表真机动作已验证。
 
-在 `front` 模式下，`z-offset` 是按 AprilTag 局部坐标换算，不等同于 base 坐标 Z。之前 `--z-offset 0.0` 导致目标太低，`--z-offset -0.08` 才把目标抬高到约 9 到 13cm。现在如果不是明确要调 front 模式，不要继续在这里浪费时间。
+## 12. 下一个 AI 的建议开工顺序
 
-### 6.11 改 launch 不需要构建
+1. 先读本文和 `zcy/无tag的机械臂操作.md`。
+2. 检查 `git status`，不要回退已有未提交工作。
+3. 让用户先同步第 6 节的 6 个文件到真机。
+4. 确认采集程序启动时显示 `10 帧`。
+5. 距离采集和拟合已经完成，不要使用 `--overwrite` 重采现有数据。
+6. 同步最新 `block_mono_grasp.yaml` 到真机。
+7. 用 `--dry-run --show-rgb` 在不同距离检查单目距离误差，不要直接进入真机抓取。
+8. 距离误差合格后才开始四类无 Tag 抓取示教。
+9. 先验证单个物块，再做连续抓取。
 
-只改 `.launch` 文件不需要 `catkin_make`。重新 roslaunch 即可。
-
-## 7. 当前关键文件速览
-
-### `/home/zcy/eaibot/handeye-calib/src/mirobot_pick_test.py`
-
-当前新增点：
-
-- `WRIST_FORWARD_JOINT5 = -1.5709534265016345`
-- `--mode wrist_forward`
-- `--wrist-forward`
-- `--wrist-forward-joint5`
-- `go_wrist_forward(arm, joint5_target)`
-
-### `/home/zcy/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot.launch`
-
-当前新增点：
-
-- `start_rviz` 参数
-- 转发给 `mirobot_moveit.launch`
-
-### `/home/zcy/eaibot/mirobot_ws/src/mirobot_moveit_config/launch/mirobot_moveit.launch`
-
-当前新增点：
-
-- `start_rviz` 参数
-- `moveit_rviz.launch` 受 `if="$(arg start_rviz)"` 控制
-
-### `/home/zcy/eaibot/zcy/机械臂操作.txt`
-
-已更新常用命令和参数说明。后续如果再改脚本入口，必须同步更新这个文档。
-
-## 8. 建议给下个会话的第一句话
-
-如果新会话继续接手，可以先说：
-
-```text
-请先阅读 /home/zcy/HANDOFF.md 和 /home/zcy/eaibot/zcy/WSL协作说明.md。当前重点是把 WSL 中 mirobot_pick_test.py 的 wrist_forward 改动同步到真机，然后验证 --mode wrist_forward 和 --wrist-forward 抓取链路。
-```
+遇到新故障时，先分类为“视觉没有产生可用定位”、“TF/标定误差”、“MoveIt 无解”或“底层没有真正到位”，不要同时修改视觉、抓取偏移和底层驱动。

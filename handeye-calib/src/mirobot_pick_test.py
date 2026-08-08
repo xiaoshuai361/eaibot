@@ -11,6 +11,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 
 if sys.version_info[0] != 2:
     sys.stderr.write(
@@ -33,9 +34,10 @@ from block_mono_vision import (
     deproject_pixel_to_camera_mm,
     draw_debug_detections,
     draw_debug_image,
-    estimate_distance_mm,
+    estimate_distance_from_box_mm,
     is_detection_usable,
     load_config,
+    observation_in_roi,
     stable_median_observation,
 )
 
@@ -47,7 +49,8 @@ except NameError:
 
 
 WRIST_FORWARD_JOINT5 = -1.5709534265016345
-BLOCK_PRESET_VERSION = 1
+BLOCK_PRESET_VERSION = 2
+MOTION_SETTLE_SECONDS = 0.25
 DEFAULT_BLOCK_PRESET_FILE = (
     "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json"
 )
@@ -92,16 +95,23 @@ def parse_args(argv):
     parser.add_argument("--detector-request-fd", type=int)
     parser.add_argument("--detector-response-fd", type=int)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--stop-at-pre-grasp", action="store_true")
-    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--live-preview", action="store_true")
     parser.add_argument("--calib-record", action="store_true")
-    parser.add_argument("--teach-block", action="store_true")
+    parser.add_argument("--teach-block-grasp", action="store_true")
+    parser.add_argument("--teach-block-place", action="store_true")
+    parser.add_argument("--teach-block-idle", action="store_true")
+    parser.add_argument("--teach-block-carry", action="store_true")
+    parser.add_argument("--preview-taught-block", action="store_true")
+    parser.add_argument("--stop-at-taught-pre-grasp", action="store_true")
     parser.add_argument("--run-taught-block", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--reset-pickup-model", action="store_true")
     parser.add_argument("--place-approach-gap", type=float, default=0.02)
     parser.add_argument("--known-z-mm", type=float)
     parser.add_argument("--frames", type=int)
+    parser.add_argument("--preview-hz", type=float, default=1.0)
+    parser.add_argument("--pregrasp-distance-mm", type=float)
     parser.add_argument("--confidence", type=float)
     parser.add_argument("--show-rgb", action="store_true")
     ros_argv = rospy.myargv(argv)[1:]
@@ -133,58 +143,49 @@ def normalize_vector(values, name):
     return (x / length, y / length, z / length)
 
 
-def build_block_motion_points(surface_base_mm, camera_forward_base,
-                              tool_offset_base_mm, target_offset_mm,
-                              pregrasp_distance_mm, suction_compression_mm):
-    surface = finite_vector3(surface_base_mm, "surface_base_mm")
-    forward = normalize_vector(camera_forward_base, "camera_forward_base")
-    tool_offset = finite_vector3(tool_offset_base_mm, "tool_offset_base_mm")
-    target_offset = finite_vector3(target_offset_mm, "target_offset_mm")
-    pregrasp_distance_mm = finite_scalar(pregrasp_distance_mm, "pregrasp_distance_mm")
-    suction_compression_mm = finite_scalar(suction_compression_mm, "suction_compression_mm")
-    if pregrasp_distance_mm <= 0.0:
-        raise RuntimeError("pregrasp_distance_mm must be positive.")
-    if suction_compression_mm < 0.0:
-        raise RuntimeError("suction_compression_mm must be non-negative.")
-
-    surface_tcp = tuple(surface[i] + target_offset[i] for i in range(3))
-    pregrasp_tcp = tuple(surface_tcp[i] - forward[i] * pregrasp_distance_mm
-                         for i in range(3))
-    contact_tcp = tuple(surface_tcp[i] + forward[i] * suction_compression_mm
-                        for i in range(3))
-    pregrasp_link = tuple(pregrasp_tcp[i] - tool_offset[i] for i in range(3))
-    contact_link = tuple(contact_tcp[i] - tool_offset[i] for i in range(3))
-    return {
-        "surface_tcp_mm": surface_tcp,
-        "pregrasp_link_mm": pregrasp_link,
-        "contact_link_mm": contact_link,
-    }
-
-
-def require_motion_config(config, action):
-    method = str(config.get("distance_method", "theory")).lower()
-    if action in ("stop_at_pre_grasp", "execute") and method == "theory":
-        raise RuntimeError("distance_method=theory is not allowed for motion.")
-    if action in ("stop_at_pre_grasp", "execute"):
-        if config.get("tool_offset_mm") is None:
-            raise RuntimeError("tool_offset_mm is required for motion.")
-        finite_vector3(config.get("tool_offset_mm"), "tool_offset_mm")
-    return config
-
-
 def format_triplet(values):
     return "({:.2f},{:.2f},{:.2f})".format(values[0], values[1], values[2])
 
 
+def safe_log_text(value):
+    try:
+        text_type = unicode
+    except NameError:
+        text_type = str
+    if isinstance(value, text_type):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    try:
+        return text_type(value)
+    except (TypeError, ValueError, UnicodeError):
+        return text_type(repr(value))
+
+
+def ascii_log_text(value):
+    encoded = safe_log_text(value).encode("ascii", "backslashreplace")
+    if isinstance(encoded, str):
+        return encoded
+    return encoded.decode("ascii")
+
+
+def print_utf8(value):
+    text = safe_log_text(value)
+    if sys.version_info[0] < 3:
+        sys.stdout.write(text.encode("utf-8", "replace") + "\n")
+    else:
+        print(text)
+
+
 def format_localization_summary(localization):
     return (
-        "目标={target} 置信度={confidence:.3f} "
-        "检测框=({x1:.2f},{y1:.2f},{x2:.2f},{y2:.2f}) "
-        "框中心=({u:.2f},{v:.2f}) 框宽px={w:.2f} 框高px={h:.2f} "
-        "距离方法={distance_method} 单目距离Z_mm={z_mm:.2f} "
-        "相机坐标mm={camera_xyz} 机械臂坐标mm={base_xyz}"
+        u"目标={target} 置信度={confidence:.3f} "
+        u"检测框=({x1:.2f},{y1:.2f},{x2:.2f},{y2:.2f}) "
+        u"框中心=({u:.2f},{v:.2f}) 框宽px={w:.2f} 框高px={h:.2f} "
+        u"距离方法={distance_method} 单目距离Z_mm={z_mm:.2f} "
+        u"相机坐标mm={camera_xyz} 机械臂坐标mm={base_xyz}"
     ).format(
-        target=localization["target"],
+        target=safe_log_text(localization["target"]),
         confidence=localization["confidence"],
         x1=localization["box"][0],
         y1=localization["box"][1],
@@ -211,121 +212,6 @@ def normalize_quaternion(values):
     return [value / length for value in components]
 
 
-def quaternion_to_matrix(values):
-    x, y, z, w = normalize_quaternion(values)
-    xx = x * x
-    yy = y * y
-    zz = z * z
-    xy = x * y
-    xz = x * z
-    yz = y * z
-    wx = w * x
-    wy = w * y
-    wz = w * z
-    return [
-        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
-        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
-        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
-    ]
-
-
-def quaternion_from_matrix(matrix):
-    trace = matrix[0][0] + matrix[1][1] + matrix[2][2]
-    if trace > 0.0:
-        scale = math.sqrt(trace + 1.0) * 2.0
-        qw = 0.25 * scale
-        qx = (matrix[2][1] - matrix[1][2]) / scale
-        qy = (matrix[0][2] - matrix[2][0]) / scale
-        qz = (matrix[1][0] - matrix[0][1]) / scale
-    elif matrix[0][0] > matrix[1][1] and matrix[0][0] > matrix[2][2]:
-        scale = math.sqrt(1.0 + matrix[0][0] - matrix[1][1] - matrix[2][2]) * 2.0
-        qw = (matrix[2][1] - matrix[1][2]) / scale
-        qx = 0.25 * scale
-        qy = (matrix[0][1] + matrix[1][0]) / scale
-        qz = (matrix[0][2] + matrix[2][0]) / scale
-    elif matrix[1][1] > matrix[2][2]:
-        scale = math.sqrt(1.0 + matrix[1][1] - matrix[0][0] - matrix[2][2]) * 2.0
-        qw = (matrix[0][2] - matrix[2][0]) / scale
-        qx = (matrix[0][1] + matrix[1][0]) / scale
-        qy = 0.25 * scale
-        qz = (matrix[1][2] + matrix[2][1]) / scale
-    else:
-        scale = math.sqrt(1.0 + matrix[2][2] - matrix[0][0] - matrix[1][1]) * 2.0
-        qw = (matrix[1][0] - matrix[0][1]) / scale
-        qx = (matrix[0][2] + matrix[2][0]) / scale
-        qy = (matrix[1][2] + matrix[2][1]) / scale
-        qz = 0.25 * scale
-    return normalize_quaternion([qx, qy, qz, qw])
-
-
-def pose_to_matrix(pose_stamped):
-    rotation = quaternion_to_matrix(quaternion_msg_to_tuple(pose_stamped.pose.orientation))
-    position = pose_stamped.pose.position
-    return [
-        [rotation[0][0], rotation[0][1], rotation[0][2], float(position.x)],
-        [rotation[1][0], rotation[1][1], rotation[1][2], float(position.y)],
-        [rotation[2][0], rotation[2][1], rotation[2][2], float(position.z)],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def transform_to_matrix(transform):
-    rotation = quaternion_to_matrix(transform["orientation_xyzw"])
-    position = transform["position"]
-    return [
-        [rotation[0][0], rotation[0][1], rotation[0][2], float(position[0])],
-        [rotation[1][0], rotation[1][1], rotation[1][2], float(position[1])],
-        [rotation[2][0], rotation[2][1], rotation[2][2], float(position[2])],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def matrix_multiply(first, second):
-    result = [[0.0 for _column in range(4)] for _row in range(4)]
-    for row in range(4):
-        for column in range(4):
-            result[row][column] = sum(
-                first[row][index] * second[index][column]
-                for index in range(4))
-    return result
-
-
-def inverse_rigid_matrix(matrix):
-    result = [
-        [matrix[0][0], matrix[1][0], matrix[2][0], 0.0],
-        [matrix[0][1], matrix[1][1], matrix[2][1], 0.0],
-        [matrix[0][2], matrix[1][2], matrix[2][2], 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-    translation = [matrix[0][3], matrix[1][3], matrix[2][3]]
-    for row in range(3):
-        result[row][3] = -sum(result[row][index] * translation[index]
-                              for index in range(3))
-    return result
-
-
-def matrix_to_pose(frame_id, matrix):
-    pose = PoseStamped()
-    pose.header.frame_id = frame_id
-    pose.header.stamp = rospy.Time.now() if "rospy" in globals() else None
-    pose.pose.position.x = matrix[0][3]
-    pose.pose.position.y = matrix[1][3]
-    pose.pose.position.z = matrix[2][3]
-    qx, qy, qz, qw = quaternion_from_matrix(matrix)
-    pose.pose.orientation.x = qx
-    pose.pose.orientation.y = qy
-    pose.pose.orientation.z = qz
-    pose.pose.orientation.w = qw
-    return pose
-
-
-def matrix_to_transform(matrix):
-    return {
-        "position": [matrix[0][3], matrix[1][3], matrix[2][3]],
-        "orientation_xyzw": quaternion_from_matrix(matrix),
-    }
-
-
 def pose_to_transform(pose_stamped):
     pose = pose_stamped.pose
     return {
@@ -339,21 +225,15 @@ def pose_to_transform(pose_stamped):
 
 
 def transform_to_pose(frame_id, transform):
-    return matrix_to_pose(frame_id, transform_to_matrix(transform))
-
-
-def compute_grasp_ee_in_block(block_anchor_pose, ee_base_pose):
-    block_in_base = pose_to_matrix(block_anchor_pose)
-    ee_in_base = pose_to_matrix(ee_base_pose)
-    ee_in_block = matrix_multiply(inverse_rigid_matrix(block_in_base), ee_in_base)
-    return matrix_to_transform(ee_in_block)
-
-
-def compute_taught_grasp_pose(block_anchor_pose, grasp_ee_in_block, base_frame):
-    grasp_matrix = matrix_multiply(
-        pose_to_matrix(block_anchor_pose),
-        transform_to_matrix(grasp_ee_in_block))
-    return matrix_to_pose(base_frame, grasp_matrix)
+    position = finite_vector3(transform.get("position"), "position")
+    orientation = normalize_quaternion(transform.get("orientation_xyzw"))
+    pose = PoseStamped()
+    pose.header.frame_id = frame_id
+    pose.header.stamp = rospy.Time.now() if "rospy" in globals() else None
+    pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = position
+    pose.pose.orientation.x, pose.pose.orientation.y = orientation[:2]
+    pose.pose.orientation.z, pose.pose.orientation.w = orientation[2:]
+    return pose
 
 
 def block_anchor_pose_from_localization(localization, config):
@@ -373,6 +253,71 @@ def block_anchor_pose_from_localization(localization, config):
     pose.pose.orientation.y = qy
     pose.pose.orientation.z = qz
     pose.pose.orientation.w = qw
+    return pose
+
+
+def create_block_pickup_model(grasp_pose, camera_forward_base):
+    forward = normalize_vector(camera_forward_base, "camera_forward_base")
+    return {
+        "orientation_xyzw_base": list(normalize_quaternion(
+            quaternion_msg_to_tuple(grasp_pose.pose.orientation))),
+        # This axis points from contact back toward the camera/safe side.
+        "approach_axis_xyz_base": [-forward[0], -forward[1], -forward[2]],
+    }
+
+
+def compute_block_grasp_offset(anchor_pose, grasp_pose):
+    return [
+        float(grasp_pose.pose.position.x - anchor_pose.pose.position.x),
+        float(grasp_pose.pose.position.y - anchor_pose.pose.position.y),
+        float(grasp_pose.pose.position.z - anchor_pose.pose.position.z),
+    ]
+
+
+def require_block_pickup_model(preset):
+    model = preset.get("pickup_model")
+    if not isinstance(model, dict):
+        raise RuntimeError(
+            "Preset has no pickup_model. Re-teach one block grasp with the new workflow.")
+    normalize_quaternion(model.get("orientation_xyzw_base"))
+    normalize_vector(model.get("approach_axis_xyz_base"),
+                     "approach_axis_xyz_base")
+    return model
+
+
+def compute_constrained_block_grasp_pose(anchor_pose, pickup_model, entry,
+                                         base_frame):
+    offset = finite_vector3(entry.get("grasp_offset_xyz_base"),
+                            "grasp_offset_xyz_base")
+    orientation = normalize_quaternion(
+        pickup_model.get("orientation_xyzw_base"))
+    pose = copy.deepcopy(anchor_pose)
+    pose.header.frame_id = base_frame
+    pose.header.stamp = rospy.Time.now() if "rospy" in globals() else None
+    pose.pose.position.x += offset[0]
+    pose.pose.position.y += offset[1]
+    pose.pose.position.z += offset[2]
+    pose.pose.orientation.x = orientation[0]
+    pose.pose.orientation.y = orientation[1]
+    pose.pose.orientation.z = orientation[2]
+    pose.pose.orientation.w = orientation[3]
+    return pose
+
+
+def build_constrained_block_pregrasp(grasp_pose, pickup_model, gap_mm,
+                                     base_frame):
+    axis = normalize_vector(
+        pickup_model.get("approach_axis_xyz_base"),
+        "approach_axis_xyz_base")
+    gap_m = finite_scalar(gap_mm, "pregrasp_distance_mm") * 0.001
+    if gap_m <= 0.0:
+        raise RuntimeError("pregrasp_distance_mm must be positive.")
+    pose = copy.deepcopy(grasp_pose)
+    pose.header.frame_id = base_frame
+    pose.header.stamp = rospy.Time.now() if "rospy" in globals() else None
+    pose.pose.position.x += axis[0] * gap_m
+    pose.pose.position.y += axis[1] * gap_m
+    pose.pose.position.z += axis[2] * gap_m
     return pose
 
 
@@ -401,7 +346,10 @@ def load_block_preset(path):
     except IOError as exc:
         raise RuntimeError("Could not read preset file: %s" % exc)
     if preset.get("version") != BLOCK_PRESET_VERSION:
-        raise RuntimeError("Unsupported preset version.")
+        raise RuntimeError(
+            "Unsupported block preset version; version %d is required. "
+            "The old full-transform grasp cannot be used safely and must be re-taught."
+            % BLOCK_PRESET_VERSION)
     if not isinstance(preset.get("targets"), dict):
         raise RuntimeError("Preset file must contain a targets object.")
     return preset
@@ -455,35 +403,13 @@ def pose_to_text(name, pose_stamped):
 
 
 def prompt_enter(message):
-    print(message)
+    print_utf8(message)
     try:
         text = raw_input("> ")
     except NameError:
         text = input("> ")
     if text.strip().lower() in ("q", "quit", "exit"):
         raise RuntimeError("User aborted taught block workflow.")
-
-
-def apply_fixed_orientation_if_configured(pose_stamped, config):
-    if config.get("fixed_orientation_xyzw") is None:
-        return pose_stamped
-    qx, qy, qz, qw = normalize_quaternion(config["fixed_orientation_xyzw"])
-    pose_stamped.pose.orientation.x = qx
-    pose_stamped.pose.orientation.y = qy
-    pose_stamped.pose.orientation.z = qz
-    pose_stamped.pose.orientation.w = qw
-    return pose_stamped
-
-
-def build_teach_assist_pose(localization, orientation, config):
-    surface_pose = pose_from_base_mm(
-        localization["base_frame"], localization["base_xyz_mm"], orientation)
-    return build_pregrasp_from_grasp(
-        surface_pose,
-        localization["camera_forward_base"],
-        config.get("pregrasp_distance_mm", 80.0),
-        localization["base_frame"],
-    )
 
 
 def build_pre_place_pose(place_pose, place_gap_m, base_frame):
@@ -546,10 +472,14 @@ def open_detector_streams(args):
 def get_action(args):
     actions = [
         ("dry_run", args.dry_run),
-        ("stop_at_pre_grasp", args.stop_at_pre_grasp),
-        ("execute", args.execute),
+        ("live_preview", args.live_preview),
         ("calib_record", args.calib_record),
-        ("teach_block", args.teach_block),
+        ("teach_block_grasp", args.teach_block_grasp),
+        ("teach_block_place", args.teach_block_place),
+        ("teach_block_idle", args.teach_block_idle),
+        ("teach_block_carry", args.teach_block_carry),
+        ("preview_taught_block", args.preview_taught_block),
+        ("stop_at_taught_pre_grasp", args.stop_at_taught_pre_grasp),
         ("run_taught_block", args.run_taught_block),
     ]
     enabled = [name for name, selected in actions if selected]
@@ -573,15 +503,40 @@ def capture_rgb_once(config):
         rgb = bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
     except Exception as exc:
         raise RuntimeError("cv_bridge RGB conversion failed: %s" % exc)
-    return {"rgb": rgb, "camera_info": camera_info, "header": copy.deepcopy(image_msg.header)}
+    if int(camera_info.width) != int(image_msg.width) or int(camera_info.height) != int(image_msg.height):
+        raise RuntimeError(
+            "CameraInfo size %dx%d does not match RGB image %dx%d."
+            % (camera_info.width, camera_info.height, image_msg.width, image_msg.height))
+    stamp = image_msg.header.stamp
+    stamp_ns = int(stamp.to_nsec())
+    if stamp_ns <= 0:
+        raise RuntimeError("RGB image has an invalid zero timestamp.")
+    age = max(0.0, (rospy.Time.now() - stamp).to_sec())
+    max_age = finite_scalar(
+        config.get("image_max_age_seconds", 1.0), "image_max_age_seconds")
+    if age > max_age:
+        raise RuntimeError(
+            "RGB image is stale: age %.3fs exceeds %.3fs." % (age, max_age))
+    return {
+        "rgb": rgb,
+        "camera_info": camera_info,
+        "header": copy.deepcopy(image_msg.header),
+        "stamp_ns": stamp_ns,
+    }
 
 
 def camera_info_intrinsics(camera_info):
-    k = list(camera_info.K)
-    if len(k) != 9:
-        raise RuntimeError("CameraInfo.K must contain 9 values.")
-    fx, fy, cx, cy = [finite_scalar(value, "CameraInfo.K")
-                     for value in (k[0], k[4], k[2], k[5])]
+    projection = list(getattr(camera_info, "P", []))
+    if len(projection) == 12 and projection[0] > 0.0 and projection[5] > 0.0:
+        source = "CameraInfo.P"
+        values = (projection[0], projection[5], projection[2], projection[6])
+    else:
+        matrix = list(camera_info.K)
+        if len(matrix) != 9:
+            raise RuntimeError("CameraInfo.K must contain 9 values.")
+        source = "CameraInfo.K"
+        values = (matrix[0], matrix[4], matrix[2], matrix[5])
+    fx, fy, cx, cy = [finite_scalar(value, source) for value in values]
     if fx <= 0.0 or fy <= 0.0:
         raise RuntimeError("CameraInfo focal lengths must be positive.")
     return fx, fy, cx, cy
@@ -611,16 +566,45 @@ def response_detections(response):
     return [response]
 
 
-def show_rgb_debug(image, detection, observation, milliseconds=1):
+def new_live_preview_labels(detections, reported_targets):
+    abbreviations = {
+        "power": "POW",
+        "fire": "FIR",
+        "gas": "GAS",
+        "support": "SUP",
+    }
+    labels = []
+    for detection in detections:
+        if not isinstance(detection, dict):
+            continue
+        target = detection.get("target", "")
+        if not isinstance(target, STRING_TYPES):
+            continue
+        target = target.strip().lower()
+        if not target or target in reported_targets:
+            continue
+        confidence = finite_scalar(
+            detection.get("confidence", 0.0), "preview confidence")
+        short_name = abbreviations.get(target, target[:3].upper())
+        labels.append(u"%s %s%d" % (
+            target, short_name, int(round(confidence * 100.0))))
+        reported_targets.add(target)
+    return labels
+
+
+def show_rgb_debug(
+        image, detection, observation, milliseconds=1, roi_ratio=None):
     try:
         import cv2
         if isinstance(detection, (list, tuple)):
-            debug = draw_debug_detections(image, detection, observation)
+            debug = draw_debug_detections(
+                image, detection, observation, roi_ratio=roi_ratio)
         else:
-            debug = draw_debug_image(image, detection, observation)
+            debug = draw_debug_image(
+                image, detection, observation, roi_ratio=roi_ratio)
         cv2.imshow("Block mono RGB - q/Esc to close", debug)
         if int(milliseconds) == 0:
-            rospy.loginfo("RGB检测窗口已保持显示：按 q 或 Esc 退出窗口并结束 dry-run。")
+            rospy.loginfo("RGB debug window is open; press q or Esc to close it.")
             while True:
                 key = cv2.waitKey(100) & 0xFF
                 if key in (27, ord("q")):
@@ -630,8 +614,41 @@ def show_rgb_debug(image, detection, observation, milliseconds=1):
             if key in (27, ord("q")):
                 return False
     except Exception as exc:
-        rospy.logwarn("Could not show RGB debug image: %s", exc)
+        rospy.logwarn("Could not show RGB debug image: %s", ascii_log_text(exc))
     return True
+
+
+def run_live_preview(args, config, detector):
+    preview_hz = finite_scalar(args.preview_hz, "preview_hz")
+    if preview_hz <= 0.0:
+        raise RuntimeError("preview_hz must be positive.")
+    period = 1.0 / preview_hz
+    rospy.loginfo("Live YOLO preview started at up to %.2f Hz.", preview_hz)
+    reported_targets = set()
+    while not rospy.is_shutdown():
+        started = time.time()
+        try:
+            capture = capture_rgb_once(config)
+            response = request_detection(
+                detector, args.block_target, capture["rgb"])
+            detections = response_detections(response)
+            observations = [detection_to_observation(item) for item in detections]
+            new_labels = new_live_preview_labels(detections, reported_targets)
+            if new_labels:
+                print_utf8(u"检测到：" + u"，".join(new_labels))
+            if not show_rgb_debug(
+                    capture["rgb"], detections, observations, milliseconds=1,
+                    roi_ratio=config.get(
+                        "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"])):
+                return
+        except Exception as exc:
+            error_text = safe_log_text(exc)
+            if "No usable YOLO detections" not in error_text:
+                rospy.logwarn(
+                    "Live preview frame failed: %s", ascii_log_text(error_text))
+        remaining = period - (time.time() - started)
+        if remaining > 0.0:
+            rospy.sleep(remaining)
 
 
 def collect_all_observations(args, config, detector):
@@ -657,7 +674,8 @@ def collect_all_observations(args, config, detector):
             detector_response = request_detection(detector, None, capture["rgb"])
             detections = response_detections(detector_response)
         except Exception as exc:
-            rospy.logwarn("YOLO all-target detection failed: %s", exc)
+            rospy.logwarn(
+                "YOLO all-target detection failed: %s", ascii_log_text(exc))
             continue
         for detection in detections:
             try:
@@ -667,19 +685,34 @@ def collect_all_observations(args, config, detector):
                     continue
                 usable, reason = is_detection_usable(detection, rules)
                 if not usable:
-                    rospy.logwarn("Rejected YOLO detection %s: %s", target, reason)
+                    rospy.logwarn(
+                        "Rejected YOLO detection %s: %s",
+                        ascii_log_text(target), ascii_log_text(reason))
                     continue
                 observation = detection_to_observation(detection)
                 observation["target"] = target
+                inside, reason = observation_in_roi(
+                    observation, capture["rgb"].shape,
+                    config.get(
+                        "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"]))
+                if not inside:
+                    rospy.logwarn(
+                        "Rejected YOLO detection %s: %s",
+                        ascii_log_text(target), ascii_log_text(reason))
+                    continue
             except Exception as exc:
-                rospy.logwarn("YOLO detection parse failed: %s", exc)
+                rospy.logwarn(
+                    "YOLO detection parse failed: %s", ascii_log_text(exc))
                 continue
             observations_by_target.setdefault(target, []).append(observation)
             frame_detections.append(detection)
             frame_observations.append(observation)
         user_requested_stop = False
         if args.show_rgb and frame_detections:
-            if not show_rgb_debug(capture["rgb"], frame_detections, frame_observations, 1):
+            if not show_rgb_debug(
+                    capture["rgb"], frame_detections, frame_observations, 1,
+                    roi_ratio=config.get(
+                        "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"])):
                 user_requested_stop = True
         if attempt + 1 >= frames_required:
             break
@@ -702,27 +735,51 @@ def collect_observations(args, config, detector):
         "box_aspect_ratio_max": config["box_aspect_ratio_max"],
     }
     observations = []
+    seen_stamps = set()
     last_capture = None
-    max_attempts = max(frames_required * 4, frames_required + 10)
+    timeout = finite_scalar(
+        config.get("observation_timeout", 12.0), "observation_timeout")
+    deadline = time.time() + timeout
+    latest_filter_error = None
+    max_attempts = max(frames_required * 8, frames_required + 20)
     if action == "calib_record":
         print("known_z_mm,target,conf,x1,y1,x2,y2,u,v,w,h")
     for _attempt in range(max_attempts):
+        if time.time() >= deadline:
+            break
         capture = capture_rgb_once(config)
+        if capture["stamp_ns"] in seen_stamps:
+            rospy.logwarn("Rejected duplicate RGB frame timestamp: %d", capture["stamp_ns"])
+            continue
+        seen_stamps.add(capture["stamp_ns"])
         last_capture = capture
         try:
             detection = request_detection(detector, args.block_target, capture["rgb"])
             usable, reason = is_detection_usable(detection, rules)
             if not usable:
-                rospy.logwarn("Rejected YOLO detection: %s", reason)
+                rospy.logwarn(
+                    "Rejected YOLO detection: %s", ascii_log_text(reason))
                 continue
             observation = detection_to_observation(detection)
+            observation["stamp_ns"] = capture["stamp_ns"]
+            inside, reason = observation_in_roi(
+                observation, capture["rgb"].shape,
+                config.get(
+                    "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"]))
+            if not inside:
+                rospy.logwarn(
+                    "Rejected YOLO detection: %s", ascii_log_text(reason))
+                continue
         except Exception as exc:
-            rospy.logwarn("YOLO detection failed: %s", exc)
+            rospy.logwarn("YOLO detection failed: %s", ascii_log_text(exc))
             continue
         observations.append(observation)
         user_requested_stop = False
         if args.show_rgb:
-            if not show_rgb_debug(capture["rgb"], detection, observation, 1):
+            if not show_rgb_debug(
+                    capture["rgb"], detection, observation, 1,
+                    roi_ratio=config.get(
+                        "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"])):
                 user_requested_stop = True
         if action == "calib_record":
             print("{:.2f},{},{:.6f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}".format(
@@ -731,12 +788,23 @@ def collect_observations(args, config, detector):
                 observation["box"][2], observation["box"][3],
                 observation["u"], observation["v"], observation["w"], observation["h"]))
         if len(observations) >= frames_required:
-            return observations, last_capture
+            try:
+                stable_median_observation(
+                    observations,
+                    frames_required,
+                    config["center_std_max_px"],
+                    config["width_cv_max"],
+                )
+                return observations, last_capture
+            except LocalizationError as exc:
+                latest_filter_error = str(exc)
+                observations = observations[-frames_required * 3:]
         if user_requested_stop:
             break
     raise RuntimeError(
-        "Only collected %d valid YOLO observations, need %d." %
-        (len(observations), frames_required)
+        "Could not collect %d stable fresh YOLO observations within %.1fs; "
+        "collected %d unique frames. Last filter error: %s" %
+        (frames_required, timeout, len(observations), latest_filter_error or "none")
     )
 
 
@@ -777,14 +845,16 @@ def compute_block_localization(args, config, detector):
     localization = build_localization_from_observations(
         args.block_target, observations, capture, args, config, listener)
     summary = format_localization_summary(localization)
-    rospy.loginfo(summary)
-    print(summary)
+    rospy.loginfo("Localized target %s.", ascii_log_text(args.block_target))
+    print_utf8(summary)
     if args.show_rgb and action == "dry_run":
         show_rgb_debug(
             capture["rgb"],
             localization_debug_detection(localization),
             localization_debug_observation(localization),
             0,
+            roi_ratio=config.get(
+                "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"]),
         )
     return localization
 
@@ -797,14 +867,18 @@ def build_localization_from_observations(target, observations, capture, args, co
         config["width_cv_max"],
     )
     fx, fy, cx, cy = camera_info_intrinsics(capture["camera_info"])
-    z_mm = estimate_distance_mm(
+    z_mm = estimate_distance_from_box_mm(
         config.get("distance_method", "theory"),
         stable["w"],
+        stable["h"],
         fx,
+        fy,
         config["target_size_mm"],
+        config.get("target_height_mm", config["target_size_mm"]),
         target,
         config.get("distance_models", {}),
         config.get("fixed_z_mm"),
+        config.get("max_axis_distance_disagreement_mm", 20.0),
     )
     camera_xyz = deproject_pixel_to_camera_mm(
         stable["u"], stable["v"], z_mm, fx, fy, cx, cy)
@@ -876,55 +950,40 @@ def compute_all_block_localizations(args, config, detector):
         observations = observations_by_target[target]
         if len(observations) < frames_required:
             rospy.logwarn(
-                "目标=%s 有效帧不足：%d/%d，跳过坐标计算。",
-                target, len(observations), frames_required)
+                "Target %s has insufficient valid frames: %d/%d; skipping.",
+                ascii_log_text(target), len(observations), frames_required)
             continue
         try:
             localization = build_localization_from_observations(
                 target, observations, capture, args, config, listener)
         except Exception as exc:
-            rospy.logwarn("目标=%s 坐标计算失败：%s", target, exc)
+            rospy.logwarn(
+                "Target %s localization failed: %s",
+                ascii_log_text(target), ascii_log_text(exc))
             continue
         localizations.append(localization)
         summary = format_localization_summary(localization)
-        rospy.loginfo(summary)
-        print(summary)
+        rospy.loginfo("Localized target %s.", ascii_log_text(target))
+        print_utf8(summary)
     if not localizations:
         raise RuntimeError("No target had enough stable observations for localization.")
-    count_text = "YOLO稳定识别到{}个目标。".format(len(localizations))
-    rospy.loginfo(count_text)
-    print(count_text)
+    count_text = u"YOLO稳定识别到{}个目标。".format(len(localizations))
+    rospy.loginfo("Localized %d stable YOLO targets.", len(localizations))
+    print_utf8(count_text)
     if args.show_rgb:
         show_rgb_debug(
             capture["rgb"],
             [localization_debug_detection(item) for item in localizations],
             [localization_debug_observation(item) for item in localizations],
             0,
+            roi_ratio=config.get(
+                "grasp_roi_ratio", DEFAULT_CONFIG["grasp_roi_ratio"]),
         )
     return localizations
 
 
 def quaternion_msg_to_tuple(quaternion):
     return (quaternion.x, quaternion.y, quaternion.z, quaternion.w)
-
-
-def rotate_vector_by_quaternion(vector, quaternion_xyzw):
-    vector = finite_vector3(vector, "vector")
-    qx, qy, qz, qw = [finite_scalar(value, "quaternion")
-                     for value in quaternion_xyzw]
-    length = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-    if length <= 0.0:
-        raise RuntimeError("quaternion must be non-zero.")
-    qx, qy, qz, qw = qx / length, qy / length, qz / length, qw / length
-    vx, vy, vz = vector
-    tx = 2.0 * (qy * vz - qz * vy)
-    ty = 2.0 * (qz * vx - qx * vz)
-    tz = 2.0 * (qx * vy - qy * vx)
-    return (
-        vx + qw * tx + (qy * tz - qz * ty),
-        vy + qw * ty + (qz * tx - qx * tz),
-        vz + qw * tz + (qx * ty - qy * tx),
-    )
 
 
 def pose_from_base_mm(base_frame, xyz_mm, orientation):
@@ -948,6 +1007,15 @@ def validate_workspace(point_mm, config, label):
         raise RuntimeError("%s radius exceeds %.2f mm." % (label, radius_max))
 
 
+def validate_pose_workspace(pose_stamped, config, label):
+    position = pose_stamped.pose.position
+    validate_workspace(
+        (position.x * 1000.0, position.y * 1000.0, position.z * 1000.0),
+        config,
+        label,
+    )
+
+
 def build_move_group(config, group_name):
     arm = moveit_commander.MoveGroupCommander(group_name)
     arm.set_pose_reference_frame(config.get("base_frame", "base"))
@@ -960,27 +1028,74 @@ def build_move_group(config, group_name):
 
 def execute_pose(arm, target_pose, label):
     rospy.loginfo("Executing %s", label)
-    arm.set_start_state_to_current_state()
-    arm.set_pose_target(target_pose)
-    success = arm.go(wait=True)
-    arm.stop()
-    arm.clear_pose_targets()
-    if not success:
-        raise RuntimeError("MoveIt failed during %s." % label)
+    for attempt in range(2):
+        arm.set_start_state_to_current_state()
+        arm.set_pose_target(target_pose)
+        success = arm.go(wait=True)
+        arm.stop()
+        arm.clear_pose_targets()
+        if success:
+            if MOTION_SETTLE_SECONDS > 0.0:
+                rospy.sleep(MOTION_SETTLE_SECONDS)
+            return
+        if attempt == 0:
+            rospy.logwarn("MoveIt failed during %s; retrying once from current state.", label)
+            rospy.sleep(0.4)
+    raise RuntimeError("MoveIt failed during %s." % label)
 
 
-def execute_cartesian_pose(arm, target_pose, label):
+def execute_joint_values(arm, joint_values, label):
+    rospy.loginfo("Executing %s joint_values=%s", label, joint_values)
+    for attempt in range(2):
+        arm.set_start_state_to_current_state()
+        arm.set_joint_value_target([float(value) for value in joint_values])
+        success = arm.go(wait=True)
+        arm.stop()
+        arm.clear_pose_targets()
+        if success:
+            if MOTION_SETTLE_SECONDS > 0.0:
+                rospy.sleep(MOTION_SETTLE_SECONDS)
+            return
+        if attempt == 0:
+            rospy.logwarn("MoveIt failed during %s; retrying once from current state.", label)
+            rospy.sleep(0.5)
+    raise RuntimeError("MoveIt failed during %s." % label)
+
+
+def execute_cartesian_pose(arm, target_pose, label,
+                           retry_without_collisions=False,
+                           fallback_to_pose=False):
     rospy.loginfo("Executing cartesian %s", label)
-    arm.set_start_state_to_current_state()
-    plan, fraction = arm.compute_cartesian_path(
-        [copy.deepcopy(target_pose.pose)], 0.003, 0.0, True)
-    if fraction < 0.999:
-        raise RuntimeError("MoveIt cartesian path failed during %s." % label)
-    success = arm.execute(plan, wait=True)
-    arm.stop()
-    arm.clear_pose_targets()
-    if not success:
-        raise RuntimeError("MoveIt execute failed during %s." % label)
+    for attempt in range(2):
+        arm.set_start_state_to_current_state()
+        plan, fraction = arm.compute_cartesian_path(
+            [copy.deepcopy(target_pose.pose)], 0.005, 0.0, True)
+        if fraction < 0.999 and retry_without_collisions:
+            arm.set_start_state_to_current_state()
+            plan, fraction = arm.compute_cartesian_path(
+                [copy.deepcopy(target_pose.pose)], 0.005, 0.0, False)
+        if fraction < 0.999:
+            if fallback_to_pose:
+                execute_pose(arm, target_pose, label + "_pose_fallback")
+                return
+            raise RuntimeError(
+                "MoveIt cartesian path failed during %s (fraction=%.3f)."
+                % (label, fraction))
+        if not plan.joint_trajectory.points:
+            raise RuntimeError("MoveIt returned an empty cartesian plan for %s." % label)
+        success = arm.execute(plan, wait=True)
+        arm.stop()
+        arm.clear_pose_targets()
+        if success:
+            if MOTION_SETTLE_SECONDS > 0.0:
+                rospy.sleep(MOTION_SETTLE_SECONDS)
+            return
+        if attempt == 0:
+            rospy.logwarn(
+                "MoveIt execute failed during %s; retrying once from current state.",
+                label)
+            rospy.sleep(0.5)
+    raise RuntimeError("MoveIt execute failed during %s." % label)
 
 
 def get_mirobot_pump_type():
@@ -988,7 +1103,8 @@ def get_mirobot_pump_type():
         from mirobot_urdf_2.srv import mirobotPump
         return mirobotPump
     except ImportError:
-        raise RuntimeError("未加载 mirobot_urdf_2.srv，请先 source 机械臂工作空间。")
+        raise RuntimeError(
+            "mirobot_urdf_2.srv is unavailable; source the robot workspace first.")
 
 
 def get_pump_proxy():
@@ -1043,59 +1159,100 @@ def do_wrist_forward(config, group_name, joint5_target):
         raise RuntimeError("Failed to move wrist forward.")
 
 
-def do_teach_block_mono(args, config, localization):
-    target = require_taught_target(args, "teach_block")
-    arm = build_move_group(config, args.group)
-    current_pose = apply_fixed_orientation_if_configured(arm.get_current_pose(), config)
-    assist_pose = build_teach_assist_pose(
-        localization, current_pose.pose.orientation, config)
-    rospy.loginfo(pose_to_text("block_teach_assist_front", assist_pose))
-    prompt_enter(
-        "步骤 1：准备移动到目标 %s 前方安全点。\n"
-        "确认路径安全后按 Enter；输入 q 取消。" % target)
-    execute_pose(arm, assist_pose, "block_teach_assist_front")
-
-    prompt_enter(
-        "步骤 2：请在 RViz 里微调吸盘到真正能吸住 %s 的接触姿态。\n"
-        "Plan/Execute 到位后回到这里按 Enter 记录抓取姿态；输入 q 取消。" % target)
-    grasp_pose = arm.get_current_pose()
-    rospy.loginfo(pose_to_text("block_taught_grasp", grasp_pose))
-
-    prompt_enter(
-        "步骤 3：请在 RViz 里把吸盘移动到该物资的载物仓释放位置。\n"
-        "Plan/Execute 到位后回到这里按 Enter 记录放置姿态；输入 q 取消。")
-    place_pose = arm.get_current_pose()
-    rospy.loginfo(pose_to_text("block_taught_place", place_pose))
-
-    anchor_pose = block_anchor_pose_from_localization(localization, config)
-    preset = load_or_create_block_preset(args.preset_file, config)
-    targets = preset.setdefault("targets", {})
-    if target in targets and not args.overwrite:
+def _require_overwrite(entry, field, args, target):
+    if field in entry and not args.overwrite:
         raise RuntimeError(
-            "Preset already contains target %s. Use --overwrite to replace it." % target)
-    targets[target] = {
-        "grasp_ee_in_block": compute_grasp_ee_in_block(anchor_pose, grasp_pose),
-        "place_ee_in_base": pose_to_transform(place_pose),
-    }
-    preset["base_frame"] = config.get("base_frame", localization["base_frame"])
+            "Preset target %s already contains %s. Use --overwrite to update it."
+            % (target, field))
+
+
+def record_block_grasp(args, config, localization, arm, preset):
+    target = require_taught_target(args, "teach_block_grasp")
+    targets = preset.setdefault("targets", {})
+    entry = targets.setdefault(target, {})
+    _require_overwrite(entry, "grasp_offset_xyz_base", args, target)
+
+    pickup_model = preset.get("pickup_model")
+    prompt_enter(
+        u"示教模式不会自动移动机械臂，也不会自动改变 joint5。\n"
+        u"请在 RViz 中 Plan/Execute 到能可靠吸住 %s 的接触姿态，"
+        u"确认到位后按 Enter 记录；不要用手掰机械臂。" %
+        safe_log_text(target))
+    grasp_pose = arm.get_current_pose()
+    anchor_pose = block_anchor_pose_from_localization(localization, config)
+    if not isinstance(pickup_model, dict) or args.reset_pickup_model:
+        preset["pickup_model"] = create_block_pickup_model(
+            grasp_pose, localization["camera_forward_base"])
+        rospy.loginfo("Locked the shared suction orientation and approach axis.")
+    entry["grasp_offset_xyz_base"] = compute_block_grasp_offset(
+        anchor_pose, grasp_pose)
+    rospy.loginfo(pose_to_text("block_taught_grasp", grasp_pose))
+    return entry
+
+
+def record_block_place(args, config, arm, preset):
+    target = require_taught_target(args, "teach_block_place")
+    entry = preset.setdefault("targets", {}).setdefault(target, {})
+    _require_overwrite(entry, "place_ee_in_base", args, target)
+    prompt_enter(
+        u"请在 RViz 中移动到 %s 对应载物仓的释放姿态。\n"
+        u"Plan/Execute 到位后按 Enter 记录；不要用手掰机械臂。" %
+        safe_log_text(target))
+    place_pose = arm.get_current_pose()
+    entry["place_ee_in_base"] = pose_to_transform(place_pose)
+    rospy.loginfo(pose_to_text("block_taught_place", place_pose))
+    return entry
+
+
+def do_teach_block_mono(args, config, localization, action):
+    arm = build_move_group(config, args.group)
+    preset = load_or_create_block_preset(args.preset_file, config)
+    target = args.block_target
+    if action == "teach_block_grasp":
+        record_block_grasp(args, config, localization, arm, preset)
+    else:
+        record_block_place(args, config, arm, preset)
+    preset["base_frame"] = config.get("base_frame", "base")
     save_block_preset(args.preset_file, preset, overwrite=True)
-    rospy.loginfo("Saved taught block preset for %s: %s", target, args.preset_file)
-    print("已保存无Tag示教：目标={} preset={}".format(target, args.preset_file))
+    rospy.loginfo(
+        "Saved taught block preset for %s: %s",
+        ascii_log_text(target), ascii_log_text(args.preset_file))
 
 
-def do_run_taught_block_mono(args, config, localization):
-    target = require_taught_target(args, "run_taught_block")
+def do_teach_block_joints(args, config, action):
+    arm = build_move_group(config, args.group)
+    preset = load_or_create_block_preset(args.preset_file, config)
+    if action == "teach_block_idle":
+        field = "idle_joint_values"
+        prompt = u"请在 RViz 中移动到比赛等待/空闲姿态，Plan/Execute 后按 Enter 记录。"
+    else:
+        field = "carry_joint_values"
+        prompt = u"请在 RViz 中移动到抓起物块后的安全搬运姿态，Plan/Execute 后按 Enter 记录。"
+    if field in preset and not args.overwrite:
+        raise RuntimeError("Preset already contains %s. Use --overwrite to update it." % field)
+    prompt_enter(prompt)
+    preset[field] = [float(value) for value in arm.get_current_joint_values()]
+    save_block_preset(args.preset_file, preset, overwrite=True)
+    rospy.loginfo("Saved %s=%s", field, preset[field])
+
+
+def do_run_taught_block_mono(args, config, localization, action):
+    target = require_taught_target(args, action)
     preset = load_block_preset(args.preset_file)
     entry = preset.get("targets", {}).get(target)
     if not isinstance(entry, dict):
         raise RuntimeError("Preset file is missing target %s." % target)
+    if "grasp_offset_xyz_base" not in entry or "place_ee_in_base" not in entry:
+        raise RuntimeError(
+            "Preset target %s must contain grasp_offset_xyz_base and place_ee_in_base."
+            % target)
+    pickup_model = require_block_pickup_model(preset)
     arm = build_move_group(config, args.group)
     anchor_pose = block_anchor_pose_from_localization(localization, config)
-    grasp_pose = compute_taught_grasp_pose(
-        anchor_pose, entry["grasp_ee_in_block"], localization["base_frame"])
-    pre_grasp_pose = build_pregrasp_from_grasp(
-        grasp_pose,
-        localization["camera_forward_base"],
+    grasp_pose = compute_constrained_block_grasp_pose(
+        anchor_pose, pickup_model, entry, localization["base_frame"])
+    pre_grasp_pose = build_constrained_block_pregrasp(
+        grasp_pose, pickup_model,
         config.get("pregrasp_distance_mm", 80.0),
         localization["base_frame"],
     )
@@ -1104,37 +1261,82 @@ def do_run_taught_block_mono(args, config, localization):
     pre_place_pose = build_pre_place_pose(
         place_pose, args.place_approach_gap, localization["base_frame"])
 
+    for label, pose in (
+        ("taught_block_pre_grasp", pre_grasp_pose),
+        ("taught_block_grasp", grasp_pose),
+        ("taught_block_pre_place", pre_place_pose),
+        ("taught_block_place", place_pose),
+    ):
+        validate_pose_workspace(pose, config, label)
+
     rospy.loginfo(pose_to_text("taught_block_pre_grasp", pre_grasp_pose))
     rospy.loginfo(pose_to_text("taught_block_grasp", grasp_pose))
     rospy.loginfo(pose_to_text("taught_block_pre_place", pre_place_pose))
     rospy.loginfo(pose_to_text("taught_block_place", place_pose))
 
+    if action == "preview_taught_block":
+        rospy.logwarn("Preview only: no arm motion or pump command executed.")
+        return
+    if action == "stop_at_taught_pre_grasp":
+        execute_pose(arm, pre_grasp_pose, "taught_block_pre_grasp")
+        rospy.logwarn("Stopped at taught pre-grasp; pump was not enabled.")
+        return
+
     pump_proxy = get_pump_proxy()
-    execute_pose(arm, pre_grasp_pose, "taught_block_pre_grasp")
-    execute_cartesian_pose(arm, grasp_pose, "taught_block_grasp")
-    set_pump(pump_proxy, True)
-    rospy.sleep(0.8)
-    execute_cartesian_pose(arm, pre_grasp_pose, "taught_block_retreat")
-    execute_pose(arm, pre_place_pose, "taught_block_pre_place")
-    execute_cartesian_pose(arm, place_pose, "taught_block_place")
-    set_pump(pump_proxy, False)
-    rospy.sleep(0.5)
-    execute_cartesian_pose(arm, pre_place_pose, "taught_block_place_retreat")
+    holding_object = False
+    try:
+        execute_pose(arm, pre_grasp_pose, "taught_block_pre_grasp")
+        execute_cartesian_pose(arm, grasp_pose, "taught_block_grasp")
+        set_pump(pump_proxy, True)
+        holding_object = True
+        rospy.sleep(0.8)
+        execute_cartesian_pose(arm, pre_grasp_pose, "taught_block_retreat")
+        if preset.get("carry_joint_values"):
+            execute_joint_values(arm, preset["carry_joint_values"], "block_carry")
+        execute_pose(arm, pre_place_pose, "taught_block_pre_place")
+        execute_cartesian_pose(
+            arm, place_pose, "taught_block_place",
+            retry_without_collisions=True, fallback_to_pose=True)
+        set_pump(pump_proxy, False)
+        holding_object = False
+        rospy.sleep(0.5)
+        execute_cartesian_pose(
+            arm, pre_place_pose, "taught_block_place_retreat",
+            retry_without_collisions=True, fallback_to_pose=True)
+        if preset.get("idle_joint_values"):
+            execute_joint_values(arm, preset["idle_joint_values"], "block_idle")
+    except Exception:
+        if holding_object:
+            try:
+                rospy.logwarn("Motion failed while pump was ON; turning pump OFF before aborting.")
+                set_pump(pump_proxy, False)
+            except Exception as pump_error:
+                rospy.logerr(
+                    "Failed to turn pump OFF after motion error: %s",
+                    ascii_log_text(pump_error))
+        raise
 
 
 def do_block_mono(args, config):
     action = get_action(args)
     if action == "calib_record" and args.known_z_mm is None:
         raise RuntimeError("--calib-record requires --known-z-mm.")
-    if action in ("teach_block", "run_taught_block"):
+    if action in ("teach_block_grasp", "teach_block_place",
+                  "preview_taught_block", "stop_at_taught_pre_grasp",
+                  "run_taught_block"):
         require_taught_target(args, action)
-    if action in ("stop_at_pre_grasp", "execute"):
-        require_motion_config(config, action)
 
     request_stream, response_stream = open_detector_streams(args)
     try:
-        detector = DetectorClient(request_stream, response_stream)
-        localization = compute_block_localization(args, config, detector)
+        if action == "live_preview":
+            detector = DetectorClient(request_stream, response_stream)
+            run_live_preview(args, config, detector)
+            return
+        if action in ("teach_block_place", "teach_block_idle", "teach_block_carry"):
+            localization = None
+        else:
+            detector = DetectorClient(request_stream, response_stream)
+            localization = compute_block_localization(args, config, detector)
     finally:
         try:
             request_stream.close()
@@ -1150,56 +1352,22 @@ def do_block_mono(args, config):
     if action == "dry_run":
         rospy.logwarn("Dry run: no arm motion or pump command executed.")
         return
-    if action == "teach_block":
-        do_teach_block_mono(args, config, localization)
+    if action in ("teach_block_grasp", "teach_block_place"):
+        do_teach_block_mono(args, config, localization, action)
         return
-    if action == "run_taught_block":
-        do_run_taught_block_mono(args, config, localization)
+    if action in ("teach_block_idle", "teach_block_carry"):
+        do_teach_block_joints(args, config, action)
         return
-
-    group_name = args.group
-    arm = build_move_group(config, group_name)
-    current_pose = arm.get_current_pose()
-    if config.get("fixed_orientation_xyzw") is not None:
-        q = config["fixed_orientation_xyzw"]
-        current_pose.pose.orientation.x = q[0]
-        current_pose.pose.orientation.y = q[1]
-        current_pose.pose.orientation.z = q[2]
-        current_pose.pose.orientation.w = q[3]
-    orientation = current_pose.pose.orientation
-    tool_offset_base = rotate_vector_by_quaternion(
-        config["tool_offset_mm"], quaternion_msg_to_tuple(orientation))
-    points = build_block_motion_points(
-        localization["base_xyz_mm"],
-        localization["camera_forward_base"],
-        tool_offset_base,
-        config.get("target_offset_mm", [0.0, 0.0, 0.0]),
-        config.get("pregrasp_distance_mm", 50.0),
-        config.get("suction_compression_mm", 3.0),
-    )
-    validate_workspace(points["pregrasp_link_mm"], config, "pregrasp")
-    validate_workspace(points["contact_link_mm"], config, "contact")
-    pregrasp = pose_from_base_mm(
-        localization["base_frame"], points["pregrasp_link_mm"], orientation)
-    contact = pose_from_base_mm(
-        localization["base_frame"], points["contact_link_mm"], orientation)
-
-    execute_pose(arm, pregrasp, "block_pre_grasp")
-    if action == "stop_at_pre_grasp":
-        rospy.logwarn("Stopped at pre-grasp. Pump was not enabled.")
+    if action in ("preview_taught_block", "stop_at_taught_pre_grasp",
+                  "run_taught_block"):
+        do_run_taught_block_mono(args, config, localization, action)
         return
 
-    pump_proxy = get_pump_proxy()
-    set_pump(pump_proxy, False)
-    rospy.sleep(0.3)
-    execute_cartesian_pose(arm, contact, "block_contact")
-    rospy.sleep(0.2)
-    set_pump(pump_proxy, True)
-    rospy.sleep(0.8)
-    execute_cartesian_pose(arm, pregrasp, "block_retreat")
+    raise RuntimeError("Unsupported block action: %s" % action)
 
 
 def main():
+    global MOTION_SETTLE_SECONDS
     args = parse_args(sys.argv)
     config = load_config(args.config)
     if args.base_frame:
@@ -1212,13 +1380,21 @@ def main():
         config["planning_time"] = args.planning_time
     if args.tf_timeout is not None:
         config["tf_timeout"] = args.tf_timeout
+    if args.pregrasp_distance_mm is not None:
+        distance = finite_scalar(
+            args.pregrasp_distance_mm, "--pregrasp-distance-mm")
+        if distance <= 0.0:
+            raise RuntimeError("--pregrasp-distance-mm must be positive.")
+        config["pregrasp_distance_mm"] = distance
     if args.confidence is not None:
         confidence = finite_scalar(args.confidence, "--confidence")
         if not 0.0 < confidence <= 1.0:
             raise RuntimeError("--confidence must be in (0, 1].")
         config["confidence_min"] = confidence
+    MOTION_SETTLE_SECONDS = finite_scalar(
+        config.get("motion_settle_seconds", 0.25), "motion_settle_seconds")
 
-    rospy.init_node("mirobot_pick_test", anonymous=False)
+    rospy.init_node("mirobot_pick_test", anonymous=True)
     moveit_commander.roscpp_initialize(sys.argv)
     try:
         if args.mode == "home":
@@ -1238,7 +1414,7 @@ def main():
             raise RuntimeError("Unsupported mode: %s" % args.mode)
         rospy.loginfo("Test finished.")
     except Exception as exc:
-        rospy.logerr(str(exc))
+        rospy.logerr("%s", ascii_log_text(exc))
         raise
     finally:
         moveit_commander.roscpp_shutdown()

@@ -31,8 +31,11 @@ DEFAULT_CONFIG = {
     ),
     "target_classes": DEFAULT_TARGET_CLASSES,
     "target_size_mm": 30.0,
+    "target_height_mm": 30.0,
     "distance_method": "theory",
-    "frames_required": 10,
+    "frames_required": 5,
+    "observation_timeout": 50.0,
+    "image_max_age_seconds": 1.0,
     "confidence_min": 0.70,
     "nms_iou": 0.45,
     "input_size": 640,
@@ -41,7 +44,9 @@ DEFAULT_CONFIG = {
     "box_aspect_ratio_max": 1.30,
     "center_std_max_px": 2.0,
     "width_cv_max": 0.03,
-    "rgb_topic": "/camera/rgb/image_raw",
+    "grasp_roi_ratio": [0.06, 0.0, 0.24, 1.0],
+    "max_axis_distance_disagreement_mm": 20.0,
+    "rgb_topic": "/camera/rgb/image_rect_color",
     "camera_info_topic": "/camera/rgb/camera_info",
     "camera_frame": "camera_rgb_optical_frame",
     "base_frame": "base",
@@ -52,14 +57,11 @@ DEFAULT_CONFIG = {
         "support": {"a": None, "b": None},
     },
     "fixed_z_mm": None,
-    "target_offset_mm": [0.0, 0.0, 0.0],
-    "tool_offset_mm": None,
-    "fixed_orientation_xyzw": None,
     "pregrasp_distance_mm": 50.0,
-    "suction_compression_mm": 3.0,
     "velocity_scale": 0.05,
     "acceleration_scale": 0.05,
     "planning_time": 5.0,
+    "motion_settle_seconds": 0.25,
     "tf_timeout": 5.0,
     "base_min_z_mm": 40.0,
     "base_max_radius_mm": 500.0,
@@ -110,6 +112,37 @@ def box_geometry(box):
     }
 
 
+def roi_box_pixels(image_shape, roi_ratio):
+    if len(image_shape) < 2:
+        raise LocalizationError("image shape must contain height and width")
+    height = int(image_shape[0])
+    width = int(image_shape[1])
+    if height <= 0 or width <= 0:
+        raise LocalizationError("image dimensions must be positive")
+    x1, y1, x2, y2 = finite_vector(
+        roi_ratio, "grasp_roi_ratio", 4).tolist()
+    if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+        raise LocalizationError(
+            "grasp_roi_ratio must satisfy 0<=x1<x2<=1 and 0<=y1<y2<=1")
+    return (
+        int(round(x1 * width)),
+        int(round(y1 * height)),
+        int(round(x2 * width)),
+        int(round(y2 * height)),
+    )
+
+
+def observation_in_roi(observation, image_shape, roi_ratio):
+    x1, y1, x2, y2 = roi_box_pixels(image_shape, roi_ratio)
+    u = finite_scalar(observation.get("u"), "observation u")
+    v = finite_scalar(observation.get("v"), "observation v")
+    if x1 <= u <= x2 and y1 <= v <= y2:
+        return True, ""
+    return False, (
+        "center (%.1f, %.1f) outside grasp ROI [%d, %d, %d, %d]"
+        % (u, v, x1, y1, x2, y2))
+
+
 def is_detection_usable(detection, rules):
     try:
         confidence = finite_scalar(detection.get("confidence"), "confidence")
@@ -153,7 +186,8 @@ def detection_to_observation(detection):
 
 
 def stable_median_observation(
-    observations, frames_required, center_std_max_px, width_cv_max
+    observations, frames_required, center_std_max_px, width_cv_max,
+    mad_scale=3.5, mad_floor_px=1.0
 ):
     if isinstance(frames_required, bool) or int(frames_required) <= 0:
         raise LocalizationError("frames_required must be a positive integer")
@@ -167,19 +201,38 @@ def stable_median_observation(
     if center_std_max_px <= 0.0 or width_cv_max <= 0.0:
         raise LocalizationError("stability limits must be positive")
 
-    recent = observations[-frames_required:]
+    recent = observations[-max(frames_required * 3, frames_required):]
     matrix = np.asarray(
         [[item["u"], item["v"], item["w"], item["h"], item["confidence"]] for item in recent],
         dtype=np.float64,
     )
-    if matrix.shape != (frames_required, 5) or not np.all(np.isfinite(matrix)):
+    if matrix.ndim != 2 or matrix.shape[1] != 5 or not np.all(np.isfinite(matrix)):
         raise LocalizationError("observations must contain finite u/v/w/h/confidence")
 
-    center_std = max(float(np.std(matrix[:, 0])), float(np.std(matrix[:, 1])))
-    width_mean = float(np.mean(matrix[:, 2]))
+    mad_scale = finite_scalar(mad_scale, "mad_scale")
+    mad_floor_px = finite_scalar(mad_floor_px, "mad_floor_px")
+    if mad_scale <= 0.0 or mad_floor_px <= 0.0:
+        raise LocalizationError("MAD limits must be positive")
+    median_geometry = np.median(matrix[:, :4], axis=0)
+    axis_mad = np.median(np.abs(matrix[:, :4] - median_geometry), axis=0)
+    limits = np.maximum(axis_mad * mad_scale, mad_floor_px)
+    inlier_mask = np.all(
+        np.abs(matrix[:, :4] - median_geometry) <= limits,
+        axis=1,
+    )
+    inliers = matrix[inlier_mask]
+    if len(inliers) < frames_required:
+        raise LocalizationError(
+            "only %d stable inliers after MAD filtering, need %d"
+            % (len(inliers), frames_required)
+        )
+    inliers = inliers[-frames_required:]
+
+    center_std = max(float(np.std(inliers[:, 0])), float(np.std(inliers[:, 1])))
+    width_mean = float(np.mean(inliers[:, 2]))
     if width_mean <= 0.0:
         raise LocalizationError("width mean must be positive")
-    width_cv = float(np.std(matrix[:, 2]) / width_mean)
+    width_cv = float(np.std(inliers[:, 2]) / width_mean)
     if center_std > center_std_max_px:
         raise LocalizationError(
             "center std %.3f px exceeds %.3f px" % (center_std, center_std_max_px)
@@ -189,7 +242,7 @@ def stable_median_observation(
             "width cv %.5f exceeds %.5f" % (width_cv, width_cv_max)
         )
 
-    median = np.median(matrix, axis=0)
+    median = np.median(inliers, axis=0)
     return {
         "u": float(median[0]),
         "v": float(median[1]),
@@ -199,6 +252,9 @@ def stable_median_observation(
         "center_std_px": center_std,
         "width_cv": width_cv,
         "frames_used": frames_required,
+        "sample_count": int(len(matrix)),
+        "inlier_count": int(np.count_nonzero(inlier_mask)),
+        "axis_mad_px": [float(value) for value in axis_mad.tolist()],
     }
 
 
@@ -235,6 +291,81 @@ def estimate_distance_mm(
             raise LocalizationError("fixed_z_mm must be positive")
         return fixed
     raise LocalizationError("unsupported distance method: %s" % method)
+
+
+def _calibrated_axis_distance(model, axis, pixels):
+    axis_model = model.get(axis)
+    if isinstance(axis_model, dict):
+        a_value = axis_model.get("a")
+        b_value = axis_model.get("b")
+    elif axis == "width":
+        # Backward compatibility with the original {a, b} width-only model.
+        a_value = model.get("a")
+        b_value = model.get("b")
+    else:
+        return None
+    try:
+        a_value = finite_scalar(a_value, "%s calibration a" % axis)
+        b_value = finite_scalar(b_value, "%s calibration b" % axis)
+    except LocalizationError:
+        return None
+    if a_value <= 0.0:
+        return None
+    return a_value / pixels + b_value
+
+
+def estimate_distance_from_box_mm(
+    method, width_px, height_px, fx_px, fy_px,
+    target_width_mm, target_height_mm, target, distance_models,
+    fixed_z_mm=None, max_axis_disagreement_mm=20.0
+):
+    """Estimate optical depth without a depth image.
+
+    Calibrated mode can combine independent width and height models. A large
+    disagreement indicates perspective, a partial box, or an out-of-range
+    sample and is rejected instead of sending a bad grasp pose to the arm.
+    """
+    method = str(method).strip().lower()
+    width_px = finite_scalar(width_px, "width_px")
+    height_px = finite_scalar(height_px, "height_px")
+    if width_px <= 0.0 or height_px <= 0.0:
+        raise LocalizationError("box width and height must be positive")
+    if method == "fixed_plane":
+        return estimate_distance_mm(
+            method, width_px, fx_px, target_width_mm, target,
+            distance_models, fixed_z_mm)
+    if method == "theory":
+        width_distance = finite_scalar(fx_px, "fx_px") * finite_scalar(
+            target_width_mm, "target_width_mm") / width_px
+        height_distance = finite_scalar(fy_px, "fy_px") * finite_scalar(
+            target_height_mm, "target_height_mm") / height_px
+        return float(np.median([width_distance, height_distance]))
+    if method != "calibrated":
+        raise LocalizationError("unsupported distance method: %s" % method)
+
+    model = (distance_models or {}).get(target) or {}
+    estimates = []
+    width_distance = _calibrated_axis_distance(model, "width", width_px)
+    height_distance = _calibrated_axis_distance(model, "height", height_px)
+    if width_distance is not None:
+        estimates.append(width_distance)
+    if height_distance is not None:
+        estimates.append(height_distance)
+    if not estimates:
+        raise LocalizationError(
+            "missing distance calibration for %s; provide width and/or height models"
+            % target
+        )
+    if len(estimates) == 2:
+        disagreement = abs(estimates[0] - estimates[1])
+        limit = finite_scalar(
+            max_axis_disagreement_mm, "max_axis_disagreement_mm")
+        if disagreement > limit:
+            raise LocalizationError(
+                "width/height distance disagreement %.2f mm exceeds %.2f mm"
+                % (disagreement, limit)
+            )
+    return float(np.median(estimates))
 
 
 def deproject_pixel_to_camera_mm(u, v, z_mm, fx_px, fy_px, cx_px, cy_px):
@@ -528,7 +659,9 @@ class OnnxYoloDetector(object):
         return self.detect(image)
 
 
-def draw_debug_detections(image_bgr, detections, observations=None, text_lines=None):
+def draw_debug_detections(
+        image_bgr, detections, observations=None, text_lines=None,
+        roi_ratio=None):
     try:
         import cv2
     except ImportError as exc:
@@ -537,6 +670,9 @@ def draw_debug_detections(image_bgr, detections, observations=None, text_lines=N
     if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
         raise LocalizationError("debug image must be BGR uint8")
     output = image.copy()
+    if roi_ratio is not None:
+        roi = roi_box_pixels(output.shape, roi_ratio)
+        cv2.rectangle(output, (roi[0], roi[1]), (roi[2], roi[3]), (0, 0, 255), 2)
     if isinstance(detections, dict):
         detections = [detections]
     detections = list(detections or [])
@@ -555,6 +691,12 @@ def draw_debug_detections(image_bgr, detections, observations=None, text_lines=N
         (255, 0, 255),
         (255, 255, 0),
     ]
+    abbreviations = {
+        "power": "POW",
+        "fire": "FIR",
+        "gas": "GAS",
+        "support": "SUP",
+    }
     for index, detection in enumerate(detections):
         if not isinstance(detection, dict):
             continue
@@ -565,19 +707,22 @@ def draw_debug_detections(image_bgr, detections, observations=None, text_lines=N
         if len(box) == 4:
             cv2.rectangle(output, (box[0], box[1]), (box[2], box[3]), color, 2)
         cv2.drawMarker(output, center, (255, 0, 0), cv2.MARKER_CROSS, 18, 2)
-        label = "%s %.2f w=%.1f" % (
-            detection.get("class_name", detection.get("class_id", "?")),
-            float(detection.get("confidence", obs.get("confidence", 0.0))),
-            obs["w"],
-        )
+        target = str(detection.get(
+            "target", detection.get("class_name", detection.get("class_id", "?"))))
+        short_name = abbreviations.get(target.lower(), target[:3].upper() or "?")
+        confidence_percent = int(round(
+            100.0 * float(detection.get("confidence", obs.get("confidence", 0.0)))))
+        label = "%s%d" % (short_name, confidence_percent)
+        label_x = max(0, box[0] if len(box) == 4 else center[0])
+        label_y = max(12, (box[1] - 5) if len(box) == 4 else center[1] - 12)
         cv2.putText(
             output,
             label,
-            (max(0, box[0] if len(box) == 4 else center[0]), max(20, center[1] - 12)),
+            (label_x, label_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.38,
             color,
-            2,
+            1,
             cv2.LINE_AA,
         )
     for index, line in enumerate(text_lines or []):
@@ -588,7 +733,9 @@ def draw_debug_detections(image_bgr, detections, observations=None, text_lines=N
     return output
 
 
-def draw_debug_image(image_bgr, detection, observation=None, text_lines=None):
+def draw_debug_image(
+        image_bgr, detection, observation=None, text_lines=None,
+        roi_ratio=None):
     return draw_debug_detections(
         image_bgr, [detection], [observation] if observation is not None else None,
-        text_lines=text_lines)
+        text_lines=text_lines, roi_ratio=roi_ratio)

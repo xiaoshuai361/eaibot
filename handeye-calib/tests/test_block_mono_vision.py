@@ -1,18 +1,27 @@
 import math
+import sys
 
 import numpy as np
 import pytest
 
 from block_mono_vision import (
+    DEFAULT_CONFIG,
     LocalizationError,
     box_geometry,
     decode_yolov5_output,
     deproject_pixel_to_camera_mm,
     draw_debug_detections,
+    estimate_distance_from_box_mm,
     estimate_distance_mm,
     is_detection_usable,
+    observation_in_roi,
+    roi_box_pixels,
     stable_median_observation,
 )
+
+
+def test_default_grasp_uses_same_five_stable_samples_as_tag_workflow():
+    assert DEFAULT_CONFIG["frames_required"] == 5
 
 
 def test_box_geometry_returns_center_size_and_aspect():
@@ -23,6 +32,25 @@ def test_box_geometry_returns_center_size_and_aspect():
     assert result["w"] == pytest.approx(30.0)
     assert result["h"] == pytest.approx(60.0)
     assert result["aspect"] == pytest.approx(0.5)
+
+
+def test_grasp_roi_converts_ratios_and_rejects_outside_center():
+    roi = roi_box_pixels((480, 640, 3), [0.06, 0.0, 0.24, 1.0])
+
+    assert roi == (38, 0, 154, 480)
+    assert observation_in_roi(
+        {"u": 100, "v": 240}, (480, 640, 3), [0.06, 0.0, 0.24, 1.0]
+    ) == (True, "")
+    usable, reason = observation_in_roi(
+        {"u": 200, "v": 240}, (480, 640, 3), [0.06, 0.0, 0.24, 1.0]
+    )
+    assert usable is False
+    assert "outside grasp ROI" in reason
+
+
+def test_grasp_roi_rejects_invalid_ratios():
+    with pytest.raises(LocalizationError, match="grasp_roi_ratio"):
+        roi_box_pixels((480, 640, 3), [0.4, 0.0, 0.2, 1.0])
 
 
 @pytest.mark.parametrize(
@@ -86,6 +114,25 @@ def test_stable_median_observation_rejects_unstable_width():
         )
 
 
+def test_stable_median_observation_rejects_outlier_and_keeps_fresh_cluster():
+    observations = [
+        {"u": 100.0 + delta, "v": 50.0, "w": 60.0, "h": 61.0,
+         "confidence": 0.9}
+        for delta in (-0.4, 0.0, 0.3, 0.2, -0.2)
+    ]
+    observations.insert(2, {
+        "u": 180.0, "v": 120.0, "w": 20.0, "h": 20.0,
+        "confidence": 0.95,
+    })
+
+    result = stable_median_observation(
+        observations, frames_required=5,
+        center_std_max_px=2.0, width_cv_max=0.03)
+
+    assert result["u"] == pytest.approx(100.0, abs=0.3)
+    assert result["inlier_count"] == 5
+
+
 def test_estimate_distance_supports_theory_and_calibrated_models():
     theory = estimate_distance_mm(
         method="theory",
@@ -117,6 +164,48 @@ def test_estimate_distance_rejects_missing_calibration_for_real_model():
             target_size_mm=30.0,
             target="fire",
             distance_models={"fire": {"a": None, "b": None}},
+        )
+
+
+def test_estimate_distance_from_box_combines_width_and_height_models():
+    distance = estimate_distance_from_box_mm(
+        method="calibrated",
+        width_px=60.0,
+        height_px=80.0,
+        fx_px=600.0,
+        fy_px=600.0,
+        target_width_mm=30.0,
+        target_height_mm=40.0,
+        target="fire",
+        distance_models={
+            "fire": {
+                "width": {"a": 18000.0, "b": 0.0},
+                "height": {"a": 24000.0, "b": 0.0},
+            }
+        },
+    )
+
+    assert distance == pytest.approx(300.0)
+
+
+def test_estimate_distance_from_box_rejects_axis_disagreement():
+    with pytest.raises(LocalizationError, match="disagreement"):
+        estimate_distance_from_box_mm(
+            method="calibrated",
+            width_px=60.0,
+            height_px=60.0,
+            fx_px=600.0,
+            fy_px=600.0,
+            target_width_mm=30.0,
+            target_height_mm=30.0,
+            target="fire",
+            distance_models={
+                "fire": {
+                    "width": {"a": 18000.0, "b": 0.0},
+                    "height": {"a": 24000.0, "b": 0.0},
+                }
+            },
+            max_axis_disagreement_mm=20.0,
         )
 
 
@@ -183,3 +272,36 @@ def test_draw_debug_detections_draws_multiple_boxes():
 
     assert output.shape == image.shape
     assert int(np.count_nonzero(output)) > 0
+
+
+def test_draw_debug_detections_uses_compact_non_overlapping_labels(monkeypatch):
+    labels = []
+
+    class FakeCv2:
+        MARKER_CROSS = 0
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 0
+
+        @staticmethod
+        def rectangle(*_args):
+            pass
+
+        @staticmethod
+        def drawMarker(*_args):
+            pass
+
+        @staticmethod
+        def putText(_image, label, position, *_args):
+            labels.append((label, position))
+
+    monkeypatch.setitem(sys.modules, "cv2", FakeCv2)
+    detections = [
+        {"target": "power", "class_id": 0, "confidence": 0.91,
+         "box": [10, 30, 45, 65]},
+        {"target": "fire", "class_id": 1, "confidence": 0.82,
+         "box": [55, 30, 90, 65]},
+    ]
+
+    draw_debug_detections(np.zeros((80, 100, 3), dtype=np.uint8), detections)
+
+    assert labels == [("POW91", (10, 25)), ("FIR82", (55, 25))]
