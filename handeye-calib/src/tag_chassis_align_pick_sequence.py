@@ -6,7 +6,6 @@ from __future__ import print_function
 import argparse
 import json
 import math
-import os
 import subprocess
 import sys
 

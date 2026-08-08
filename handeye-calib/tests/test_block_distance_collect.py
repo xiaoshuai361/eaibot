@@ -19,9 +19,11 @@ def test_default_collection_uses_ten_frames():
 
     assert args.frames == 10
     assert args.distances == [
-        280, 300, 320, 340, 360, 380,
-        400, 420, 440, 460, 480,
+        340, 360, 370, 380, 390, 400,
+        410, 420, 430, 440, 460,
     ]
+    assert args.output_dir.endswith(
+        "block_distance_samples_occlusion640_400")
     assert not args.overwrite
 
 

@@ -1,6 +1,5 @@
 from __future__ import absolute_import, division, print_function
 
-import math
 import os
 
 import numpy as np
@@ -16,56 +15,31 @@ class LocalizationError(RuntimeError):
     pass
 
 
-DEFAULT_TARGET_CLASSES = {
-    "power": {"class_id": 0, "class_name": "Emergency power supply device"},
-    "fire": {"class_id": 1, "class_name": "Fire extinguishing device"},
-    "gas": {"class_id": 2, "class_name": "Gas purification device"},
-    "support": {"class_id": 3, "class_name": "Structural support device"},
-}
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "config",
+    "block_mono_grasp.yaml",
+)
 
 
-DEFAULT_CONFIG = {
-    "model_path": (
-        "/home/eaibot/handeye-calib/src/model/yolov5/"
-        "Block_v5n_yolov5n_640_best.onnx"
-    ),
-    "target_classes": DEFAULT_TARGET_CLASSES,
-    "target_size_mm": 30.0,
-    "target_height_mm": 30.0,
-    "distance_method": "theory",
-    "frames_required": 5,
-    "observation_timeout": 50.0,
-    "image_max_age_seconds": 1.0,
-    "confidence_min": 0.70,
-    "nms_iou": 0.45,
-    "input_size": 640,
-    "box_width_min_px": 30.0,
-    "box_aspect_ratio_min": 0.75,
-    "box_aspect_ratio_max": 1.30,
-    "center_std_max_px": 2.0,
-    "width_cv_max": 0.03,
-    "grasp_roi_ratio": [0.06, 0.0, 0.24, 1.0],
-    "max_axis_distance_disagreement_mm": 20.0,
-    "rgb_topic": "/camera/rgb/image_rect_color",
-    "camera_info_topic": "/camera/rgb/camera_info",
-    "camera_frame": "camera_rgb_optical_frame",
-    "base_frame": "base",
-    "distance_models": {
-        "power": {"a": None, "b": None},
-        "fire": {"a": None, "b": None},
-        "gas": {"a": None, "b": None},
-        "support": {"a": None, "b": None},
-    },
-    "fixed_z_mm": None,
-    "pregrasp_distance_mm": 50.0,
-    "velocity_scale": 0.05,
-    "acceleration_scale": 0.05,
-    "planning_time": 5.0,
-    "motion_settle_seconds": 0.25,
-    "tf_timeout": 5.0,
-    "base_min_z_mm": 40.0,
-    "base_max_radius_mm": 500.0,
-}
+def _read_yaml_mapping(path):
+    if not os.path.isfile(path):
+        raise LocalizationError("config file does not exist: %s" % path)
+    try:
+        import yaml
+    except ImportError as exc:
+        raise LocalizationError("PyYAML is required to read config: %s" % exc)
+    with open(path, "r") as stream:
+        loaded = yaml.safe_load(stream) or {}
+    if not isinstance(loaded, dict):
+        raise LocalizationError("config file must contain a YAML mapping")
+    return loaded
+
+
+# All adjustable defaults live in this YAML file. Both the Python 3 detector
+# and Python 2 ROS child import this same mapping.
+DEFAULT_CONFIG = _read_yaml_mapping(DEFAULT_CONFIG_PATH)
+DEFAULT_TARGET_CLASSES = DEFAULT_CONFIG["target_classes"]
 
 
 def _isfinite(value):
@@ -317,13 +291,12 @@ def _calibrated_axis_distance(model, axis, pixels):
 def estimate_distance_from_box_mm(
     method, width_px, height_px, fx_px, fy_px,
     target_width_mm, target_height_mm, target, distance_models,
-    fixed_z_mm=None, max_axis_disagreement_mm=20.0
+    fixed_z_mm=None, max_axis_disagreement_mm=None
 ):
     """Estimate optical depth without a depth image.
 
-    Calibrated mode can combine independent width and height models. A large
-    disagreement indicates perspective, a partial box, or an out-of-range
-    sample and is rejected instead of sending a bad grasp pose to the arm.
+    Calibrated mode combines independent width and height models. Set
+    max_axis_disagreement_mm to zero to accept their median without a gate.
     """
     method = str(method).strip().lower()
     width_px = finite_scalar(width_px, "width_px")
@@ -358,12 +331,27 @@ def estimate_distance_from_box_mm(
         )
     if len(estimates) == 2:
         disagreement = abs(estimates[0] - estimates[1])
+        if max_axis_disagreement_mm is None:
+            max_axis_disagreement_mm = DEFAULT_CONFIG[
+                "max_axis_distance_disagreement_mm"]
         limit = finite_scalar(
             max_axis_disagreement_mm, "max_axis_disagreement_mm")
-        if disagreement > limit:
+        if limit < 0.0:
             raise LocalizationError(
-                "width/height distance disagreement %.2f mm exceeds %.2f mm"
-                % (disagreement, limit)
+                "max_axis_disagreement_mm must be non-negative")
+        if limit > 0.0 and disagreement > limit:
+            raise LocalizationError(
+                "width/height distance disagreement %.2f mm exceeds %.2f mm "
+                "(box_width=%.2f px, box_height=%.2f px, "
+                "width_distance=%.2f mm, height_distance=%.2f mm)"
+                % (
+                    disagreement,
+                    limit,
+                    width_px,
+                    height_px,
+                    width_distance,
+                    height_distance,
+                )
             )
     return float(np.median(estimates))
 
@@ -401,17 +389,7 @@ def merge_config(base, override):
 def load_config(path=None):
     config = merge_config(DEFAULT_CONFIG, {})
     if path:
-        if not os.path.isfile(path):
-            raise LocalizationError("config file does not exist: %s" % path)
-        try:
-            import yaml
-        except ImportError as exc:
-            raise LocalizationError("PyYAML is required to read config: %s" % exc)
-        with open(path, "r") as stream:
-            loaded = yaml.safe_load(stream) or {}
-        if not isinstance(loaded, dict):
-            raise LocalizationError("config file must contain a YAML mapping")
-        config = merge_config(config, loaded)
+        config = merge_config(config, _read_yaml_mapping(path))
     return normalize_config(config)
 
 
@@ -426,9 +404,54 @@ def normalize_config(config):
             }
     for target, metadata in DEFAULT_TARGET_CLASSES.items():
         configured = result["target_classes"].setdefault(target, {})
+        configured.setdefault("target_id", metadata["target_id"])
         configured.setdefault("class_id", metadata["class_id"])
         configured.setdefault("class_name", metadata["class_name"])
     return result
+
+
+def target_aliases(config=None):
+    aliases = {}
+    classes = normalize_config(config or DEFAULT_CONFIG)["target_classes"]
+    for target, metadata in classes.items():
+        target_name = str(target)
+        try:
+            target_id = int(metadata.get("target_id"))
+        except (TypeError, ValueError, OverflowError):
+            raise LocalizationError("target_id for %s must be a positive integer" % target)
+        if target_id <= 0:
+            raise LocalizationError("target_id for %s must be a positive integer" % target)
+        alias = str(target_id)
+        if alias in aliases and aliases[alias] != target_name:
+            raise LocalizationError("duplicate target_id: %s" % alias)
+        aliases[target_name] = target_name
+        aliases[alias] = target_name
+    return aliases
+
+
+def resolve_target_alias(value, config=None):
+    alias = str(value).strip()
+    target = target_aliases(config).get(alias)
+    if target is None:
+        raise LocalizationError("unknown target or target ID: %s" % alias)
+    return target
+
+
+def parse_target_sequence(text, config=None):
+    if not isinstance(text, STRING_TYPES) or not text.strip():
+        raise LocalizationError("target sequence must be comma separated IDs or names")
+    targets = []
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        target = resolve_target_alias(item, config)
+        if target in targets:
+            raise LocalizationError("target sequence contains a duplicate: %s" % item)
+        targets.append(target)
+    if not targets:
+        raise LocalizationError("target sequence must contain at least one target")
+    return targets
 
 
 def target_metadata(config, target):
@@ -595,7 +618,7 @@ class OnnxYoloDetector(object):
             raise LocalizationError("ONNX model file does not exist: %s" % model_path)
         self.model_path = model_path
         self.config = normalize_config(config)
-        self.input_size = int(self.config.get("input_size", 640))
+        self.input_size = int(self.config["input_size"])
         self.class_count = class_count_from_config(self.config)
         self._runtime = None
         self._session = None
@@ -635,8 +658,8 @@ class OnnxYoloDetector(object):
             (self.input_size, self.input_size),
             scale,
             pad,
-            self.config.get("confidence_min", 0.70),
-            self.config.get("nms_iou", 0.45),
+            self.config["confidence_min"],
+            self.config["nms_iou"],
             self.class_count,
         )
         class_names = {}

@@ -12,11 +12,14 @@ import sys
 
 TARGETS = ("power", "fire", "gas", "support")
 DEFAULT_DISTANCES = (
-    280, 300, 320, 340, 360, 380,
-    400, 420, 440, 460, 480,
+    340, 360, 370, 380, 390, 400,
+    410, 420, 430, 440, 460,
 )
 DEFAULT_CONFIG = "/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml"
-DEFAULT_OUTPUT_DIR = "/home/eaibot/handeye-calib/config/block_distance_samples"
+DEFAULT_OUTPUT_DIR = (
+    "/home/eaibot/handeye-calib/config/"
+    "block_distance_samples_occlusion640_400"
+)
 
 
 def parse_targets(value):

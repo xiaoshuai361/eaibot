@@ -513,13 +513,17 @@ def filter_tag_translation_samples(samples, min_samples=10,
         median([abs(float(value) - center) for value in axis])
         for axis, center in zip(axes, centers)
     ]
+    max_axis_mad_m = float(max_axis_mad_m)
+    if any(axis_mad > max_axis_mad_m for axis_mad in mads):
+        raise RuntimeError(
+            'Tag translation is unstable: axis MAD %s exceeds %.4f m.'
+            % (mads, max_axis_mad_m))
     inliers = []
     for sample in samples:
         keep = True
         for value, center, axis_mad in zip(
                 sample['position'], centers, mads):
-            limit = max(float(axis_mad) * float(mad_scale),
-                        float(max_axis_mad_m))
+            limit = max(float(axis_mad) * float(mad_scale), max_axis_mad_m)
             if abs(float(value) - center) > limit:
                 keep = False
                 break

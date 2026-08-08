@@ -1,6 +1,6 @@
 # Mirobot 抓取项目交接文档
 
-> 更新日期：2026-08-06
+> 更新日期：2026-08-07
 > 写给没有上下文的新 AI，请先读本文，再读对应操作文档和代码。
 
 ## 1. 当前任务和结论
@@ -18,7 +18,7 @@
 - 只允许红色 ROI 中的物块进入定位、标定和抓取。
 - 四类物块分别标定距离，不对四个不同框求共同平均。
 - 放置点与有 Tag 链路共用，无 Tag 只需重新示教抓取。
-- 代码要精简，旧实现只能留在 `src/old/` 参考，不要再接回主路径。
+- 运行目录只保留当前实现；旧实现由 Git 历史保留，不在 `src/old/` 或主路径堆放备份副本。
 
 ## 2. 工作环境
 
@@ -74,17 +74,18 @@ handeye-calib/config/block_mono_pick_place_presets.json
 模型：
 
 ```text
-/home/eaibot/handeye-calib/src/model/yolov5/Block_v5n_yolov5n_640_best.onnx
+/home/eaibot/handeye-calib/src/model/yolov5/block_occlusion_yolov5n_640_best.onnx
 ```
 
 模型的 WSL 训练/测试材料：
 
 ```text
-数据集：/home/zcy/model_train/datasets/raicam/Block_v5n
-训练输出：/home/zcy/models/Block_v5n_yolov5n_640
+原始数据集：/home/zcy/model_train/datasets/raicam/Block_v5n
+遮挡增强数据集：/home/zcy/model_train/datasets/raicam/Block_v5n_occlusion_aug
+训练输出：/home/zcy/models/block_occlusion_yolov5n_640
 ```
 
-历史离线评估仅作参考：`test` 集 36/36 分类正确；`valid` 在置信度 0.30 时有 1 个边缘误检，在 0.70 时漏 1 个 support。真机起步用 `--confidence 0.5`，不要把离线分类准确率当成定位精度。
+当前模型固定输入为 `640x640`，输出为 `[1,25200,9]`，类别顺序仍为 power/fire/gas/support。增强集包含空背景、单物块及两/三/四物块组合，用于修复 power/support 共现混淆。离线验证集 `mAP50=0.995`、`mAP50-95=0.747`；真机仍从 `--confidence 0.5` 起步，不要把离线指标当成定位精度。
 
 类别与显示缩写：
 
@@ -129,50 +130,40 @@ support -> SUP，支撑物资
 - preset v2 已同步有 Tag 的四个放置位置和 idle。当前 preset 里还没有无 Tag 抓取示教数据。
 - 引导采集程序按距离优先采集：同一距离先完成 `power/fire/gas/support`，再改下一个距离；失败不会留下伪完成 CSV。
 - 每个距离使用多帧框宽/高的中位数，不是算术平均。各距离中位点再用于拟合。
-- 无 Tag 抓取示教不再自动移动到所谓“前方安全点”，避免工具长度未计入和 MoveIt IK 改变 joint5；示教接触姿态完全由用户在 RViz 中 Plan/Execute。
+- 无 Tag 抓取示教先保持当前末端姿态，自动移动到检测表面前 `110mm`，再由用户在 RViz 中 Plan/Execute 到接触姿态。该距离使用独立的 `teach_assist_distance_mm`，不影响正式预抓距离。
+- `src/config/block_mono_grasp.yaml` 现在是无 Tag 参数的唯一来源；Python 3 检测端和 Python 2 ROS 端读取同一份 YAML，Python 文件不再各自保存一套可调默认值。
+- 无 Tag 目标编号与有 Tag 放置点一致：`1=power`、`2=fire`、`3=gas`、`4=support`。`block_pick_main.py --target` 同时接受数字和英文。
+- 无 Tag 已增加 `--run-chassis-sequence --sequence 1,2,3,4`：复用有 Tag 的红框对准逻辑，按“最左可见剩余目标 → 低速对准 → 停稳新帧确认 → 抓放 → idle → 启动回零”逐个处理。底盘参数集中在 YAML 的 `chassis_sequence` 段。
+- 无 Tag 的 MoveIt 动作使用 `/tmp/mirobot_arm_motion.lock` 跨进程互斥，避免多个残留 `mirobot_pick_test` 客户端互相 PREEMPT；纯 live-preview、dry-run 和标定不再初始化 MoveIt。
+- 无 Tag 抓取点允许直接重复示教，不再要求 `--overwrite`；只有完整示教成功后才替换旧偏移，中途失败保留旧 preset。终端确认提示只接受空 Enter，防止误粘贴命令触发运动。
 
-## 5. 当前最高优先级：把 RGB 距离标定续采到 480mm
+## 5. 当前最高优先级：围绕 400mm 重新标定 RGB 距离
 
-距离采集已在真机完成，四类物块均覆盖 `280~480mm`、间隔 `20mm` 的 11 个距离点。配置现已切换为：
+当前使用 `block_occlusion_yolov5n_640_best.onnx`，实际抓取距离约为 `400mm`。旧的 `280~480mm` 等间隔标定点在工作区附近不够密，并且旧参数不应直接沿用到新检测模型。
 
-```yaml
-distance_method: calibrated
-fixed_z_mm: 330.0
-frames_required: 5
-observation_timeout: 50.0
+新采集点为：
+
+```text
+340、360、370、380、390、400、410、420、430、440、460mm
 ```
 
-四类拟合的 RMSE 为 `5.19~7.49mm`，最大残差为 `8.81~15.24mm`。参数已经写入 `block_mono_grasp.yaml`；`fixed_z_mm` 仅保留为切回 `fixed_plane` 时的备用值。
+`360~440mm` 每 `10mm` 一点，端点覆盖约 `400±60mm`；每类每点采集 `10` 帧。标定距离是 RGB 镜头光心到物块正面的垂直 Z 距离。
 
-正式示教/抓取的稳定观测数已从 10 改为 5，与有 Tag 链路的 `DEFAULT_TAG_MIN_SAMPLES=5` 一致。标定命令显式使用 `--frames 10`，因此标定数据质量不受影响。
+采集时配置曾暂时设为 `distance_method: theory`，避免旧拟合参数驱动机械臂。采集命令和完整环境初始化见 `zcy/无tag的机械臂操作.md`。
 
-标定距离是 **RGB 镜头光心到物块正面的垂直 Z 距离**，不是深度相机读数，不是到物块中心的斜距离。
-
-真机已经完成四类物块 `280~380mm` 的采集。下一步保留这些 CSV，并续采 `400、420、440、460、480mm`。使用完整距离列表运行，程序会自动跳过旧数据，采完后用全部 11 个距离点重新拟合：
-
-```bash
-python3 /home/eaibot/handeye-calib/src/block_distance_collect.py \
-  --targets power,fire,gas,support \
-  --distances 280,300,320,340,360,380,400,420,440,460,480 \
-  --frames 10 \
-  --confidence 0.5 \
-  --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml
-```
-
-每类物块要单独摆放，框中心放入红色 ROI，物块正面与相机尽量平行。
-默认不要加 `--overwrite`。启动时应显示“续采模式”，并逐个打印“跳过已有样本”；随后从 `400mm` 开始采集四类物块，依次到 `480mm`。原有 `280~380mm` CSV 不会被改写。
-
-输出目录：
+旧数据保留在：
 
 ```text
 /home/eaibot/handeye-calib/config/block_distance_samples/
 ```
 
-每类至少需要 3 个不同距离，当前目标是 11 个距离。生成 `power_model.yaml` 等文件后，把四类的 `width/height` 参数写入 `block_mono_grasp.yaml`，然后改为：
+新数据及拟合结果写入独立目录：
 
-```yaml
-distance_method: calibrated
+```text
+/home/eaibot/handeye-calib/config/block_distance_samples_occlusion640_400/
 ```
+
+四个 `*_model.yaml` 已在 `2026-08-08` 生成，参数已经写入 `block_mono_grasp.yaml`，并切换为 `distance_method: calibrated`。power/fire/support 拟合可接受；gas 的宽/高 RMSE 为 `11.86mm/13.72mm`，最大残差为 `27.56mm`，是当前风险项。下一步必须对四类分别使用未参与拟合的 `350、405、450mm` 三点做 `--dry-run --show-rgb` 独立验证，尤其检查 gas；通过后才进行示教或抓取。
 
 ## 6. 最新真机故障：实际仍要求 20 帧
 
@@ -249,7 +240,7 @@ grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
 - `idle_joint_values`
 - power/fire/gas/support 的 `place_ee_in_base`
 
-抓取后的 `carry_joint_values` 也应直接复用有 Tag preset 的现有中间过渡点，不重新示教。当前 WSL 镜像中的旧 Tag preset 尚未包含该字段；真机运行前应从真机的 `tag_pick_place_presets.json` 复制到无 Tag preset。
+抓取后的 `carry_joint_values` 也应直接复用有 Tag preset 的现有中间过渡点，不重新示教。当前 WSL 镜像中的旧 Tag preset 尚未包含该字段；真机运行前应从真机的 `tag_pick_place_presets.json` 复制到无 Tag preset。正式抓取现在强制校验六个关节值，缺失时会在运动和开泵前报错，不再静默跳过。
 
 映射：
 

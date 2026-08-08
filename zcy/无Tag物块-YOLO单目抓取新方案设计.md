@@ -10,7 +10,7 @@
 - 模型使用 ONNX：
 
 ```bash
-/home/eaibot/handeye-calib/src/model/yolov5/Block_v5n_yolov5n_640_best.onnx
+/home/eaibot/handeye-calib/src/model/yolov5/block_occlusion_yolov5n_640_best.onnx
 ```
 
 - 之前 ArUco / easy_handeye 手眼标定结果可以继续使用，用来做：
@@ -47,26 +47,10 @@ AprilTag检测 → 直接得到相机里的3D位置/姿态 → 手眼转换 → 
 YOLO检测框 → 用框宽w估距离Z → 相机内参算3D位置 → 手眼转换 → 机械臂抓
 ```
 
-## 3. 旧代码归档
+## 3. 旧代码处理
 
-把旧深度方案相关代码放到：
-
-```bash
-/home/zcy/eaibot/handeye-calib/src/old/
-```
-
-归档文件：
-
-```text
-block_detector_protocol.py
-block_grasp_sequence.py
-block_grasp_vision.py
-block_pick_main.py
-block_yolo_preview.py
-mirobot_pick_test.py
-```
-
-其中 `mirobot_pick_test.py` 先完整备份，再重写/清理无 Tag 部分，避免原始功能丢失。
+旧深度方案已经从运行目录删除，需要追溯时使用 Git 历史。不要在 `src/old/`
+或主路径保留旧实现、日期备份等副本，避免真机同步时误运行过期代码。
 
 ## 4. 新代码结构
 
@@ -196,7 +180,7 @@ YOLO只负责图像方向/XY，Z由固定物资架平面或示教高度给出
 建议内容：
 
 ```yaml
-model_path: /home/eaibot/handeye-calib/src/model/yolov5/Block_v5n_yolov5n_640_best.onnx
+model_path: /home/eaibot/handeye-calib/src/model/yolov5/block_occlusion_yolov5n_640_best.onnx
 
 target_classes:
   power:

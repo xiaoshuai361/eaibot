@@ -17,7 +17,7 @@ def traffic_camera_command(camera_index):
     return [
         "v4l2-ctl", "-d", "/dev/video%d" % int(camera_index),
         "-c", "exposure_auto=1",
-        "-c", "exposure_absolute=40",
+        "-c", "exposure_absolute=30",
         "-c", "white_balance_temperature_auto=0",
         "-c", "white_balance_temperature=4600",
         "-c", "exposure_auto_priority=0",

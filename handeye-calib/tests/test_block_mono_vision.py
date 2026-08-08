@@ -1,11 +1,14 @@
 import math
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from block_mono_vision import (
     DEFAULT_CONFIG,
+    DEFAULT_CONFIG_PATH,
     LocalizationError,
     box_geometry,
     decode_yolov5_output,
@@ -15,13 +18,30 @@ from block_mono_vision import (
     estimate_distance_mm,
     is_detection_usable,
     observation_in_roi,
+    parse_target_sequence,
+    resolve_target_alias,
     roi_box_pixels,
     stable_median_observation,
 )
 
 
+def test_default_config_is_loaded_from_the_canonical_yaml():
+    with Path(DEFAULT_CONFIG_PATH).open(encoding="utf-8") as stream:
+        assert DEFAULT_CONFIG == yaml.safe_load(stream)
+
+
 def test_default_grasp_uses_same_five_stable_samples_as_tag_workflow():
     assert DEFAULT_CONFIG["frames_required"] == 5
+    assert DEFAULT_CONFIG["max_axis_distance_disagreement_mm"] == 0.0
+
+
+def test_numeric_target_ids_map_to_existing_block_targets():
+    assert [resolve_target_alias(str(index)) for index in range(1, 5)] == [
+        "power", "fire", "gas", "support"]
+    assert resolve_target_alias("gas") == "gas"
+    assert parse_target_sequence("4,2,1") == ["support", "fire", "power"]
+    with pytest.raises(LocalizationError, match="duplicate"):
+        parse_target_sequence("1,power")
 
 
 def test_box_geometry_returns_center_size_and_aspect():
@@ -188,8 +208,8 @@ def test_estimate_distance_from_box_combines_width_and_height_models():
     assert distance == pytest.approx(300.0)
 
 
-def test_estimate_distance_from_box_rejects_axis_disagreement():
-    with pytest.raises(LocalizationError, match="disagreement"):
+def test_estimate_distance_from_box_rejects_axis_disagreement_with_details():
+    with pytest.raises(LocalizationError) as error:
         estimate_distance_from_box_mm(
             method="calibrated",
             width_px=60.0,
@@ -207,6 +227,35 @@ def test_estimate_distance_from_box_rejects_axis_disagreement():
             },
             max_axis_disagreement_mm=20.0,
         )
+
+    message = str(error.value)
+    assert "disagreement 100.00 mm exceeds 20.00 mm" in message
+    assert "box_width=60.00 px" in message
+    assert "box_height=60.00 px" in message
+    assert "width_distance=300.00 mm" in message
+    assert "height_distance=400.00 mm" in message
+
+
+def test_estimate_distance_from_box_accepts_axis_disagreement_when_gate_is_zero():
+    distance = estimate_distance_from_box_mm(
+        method="calibrated",
+        width_px=60.0,
+        height_px=60.0,
+        fx_px=600.0,
+        fy_px=600.0,
+        target_width_mm=30.0,
+        target_height_mm=30.0,
+        target="fire",
+        distance_models={
+            "fire": {
+                "width": {"a": 18000.0, "b": 0.0},
+                "height": {"a": 24000.0, "b": 0.0},
+            }
+        },
+        max_axis_disagreement_mm=0.0,
+    )
+
+    assert distance == pytest.approx(350.0)
 
 
 def test_deproject_pixel_to_camera_mm_uses_rgb_intrinsics():

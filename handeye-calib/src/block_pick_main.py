@@ -7,100 +7,34 @@ import argparse
 import json
 import math
 import os
+import signal
+import shutil
 import subprocess
 import sys
 
 from block_mono_vision import (
     DEFAULT_CONFIG,
+    DEFAULT_CONFIG_PATH as PACKAGED_CONFIG_PATH,
     DEFAULT_TARGET_CLASSES,
-    LocalizationError,
     OnnxYoloDetector,
     is_detection_usable,
     load_config,
     normalize_config,
+    parse_target_sequence,
+    resolve_target_alias,
     select_target_detection,
+    target_aliases,
 )
 
 
-DEFAULT_MODEL = (
-    "/home/eaibot/handeye-calib/src/model/yolov5/"
-    "Block_v5n_yolov5n_640_best.onnx"
-)
 DEFAULT_CONFIG_PATH = "/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml"
 DEFAULT_ARM_SCRIPT = "/home/eaibot/handeye-calib/src/mirobot_pick_test.py"
 DEFAULT_BLOCK_PRESET_FILE = (
     "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json"
 )
 DEFAULT_PYTHON2 = "/usr/bin/python2"
-DEFAULT_CONFIDENCE_MIN = 0.60
 NORMAL_CHILD_TIMEOUT = 180.0
 STOP_CHILD_TIMEOUT = 3.0
-DEFAULT_CONFIG_TEXT = """model_path: /home/eaibot/handeye-calib/src/model/yolov5/Block_v5n_yolov5n_640_best.onnx
-
-target_classes:
-  power:
-    class_id: 0
-    class_name: Emergency power supply device
-  fire:
-    class_id: 1
-    class_name: Fire extinguishing device
-  gas:
-    class_id: 2
-    class_name: Gas purification device
-  support:
-    class_id: 3
-    class_name: Structural support device
-
-target_size_mm: 30.0
-target_height_mm: 30.0
-distance_method: theory
-
-input_size: 640
-confidence_min: %.2f
-nms_iou: 0.45
-frames_required: 5
-observation_timeout: 50.0
-image_max_age_seconds: 1.0
-box_width_min_px: 30.0
-box_aspect_ratio_min: 0.75
-box_aspect_ratio_max: 1.30
-center_std_max_px: 2.0
-width_cv_max: 0.03
-grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
-
-rgb_topic: /camera/rgb/image_rect_color
-camera_info_topic: /camera/rgb/camera_info
-rgb_timeout: 5.0
-camera_frame: camera_rgb_optical_frame
-base_frame: base
-tf_timeout: 5.0
-
-distance_models:
-  power:
-    width: {a: null, b: null}
-    height: {a: null, b: null}
-  fire:
-    width: {a: null, b: null}
-    height: {a: null, b: null}
-  gas:
-    width: {a: null, b: null}
-    height: {a: null, b: null}
-  support:
-    width: {a: null, b: null}
-    height: {a: null, b: null}
-
-max_axis_distance_disagreement_mm: 20.0
-
-fixed_z_mm: null
-
-pregrasp_distance_mm: 50.0
-velocity_scale: 0.05
-acceleration_scale: 0.05
-planning_time: 5.0
-motion_settle_seconds: 0.25
-base_min_z_mm: 40.0
-base_max_radius_mm: 500.0
-""" % DEFAULT_CONFIDENCE_MIN
 
 
 class DetectorError(RuntimeError):
@@ -113,8 +47,7 @@ def ensure_config_file(path):
     directory = os.path.dirname(os.path.abspath(path))
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
-    with open(path, "w") as stream:
-        stream.write(DEFAULT_CONFIG_TEXT)
+    shutil.copyfile(PACKAGED_CONFIG_PATH, path)
     return True
 
 
@@ -144,11 +77,11 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--target",
-        choices=sorted(DEFAULT_TARGET_CLASSES),
+        choices=sorted(target_aliases(DEFAULT_CONFIG)),
         help="Target to localize/grasp. Omit in --dry-run to print every detected block.",
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default=DEFAULT_CONFIG["model_path"])
     parser.add_argument("--python2", default=DEFAULT_PYTHON2)
     parser.add_argument("--arm-script", default=DEFAULT_ARM_SCRIPT)
     action = parser.add_mutually_exclusive_group(required=True)
@@ -162,6 +95,15 @@ def parse_args(argv=None):
     action.add_argument("--preview-taught-block", action="store_true")
     action.add_argument("--stop-at-taught-pre-grasp", action="store_true")
     action.add_argument("--run-taught-block", action="store_true")
+    action.add_argument("--run-chassis-sequence", action="store_true")
+    parser.add_argument(
+        "--sequence",
+        default="1,2,3,4",
+        help="Comma-separated target IDs or names for chassis/place teaching sequence.",
+    )
+    parser.add_argument("--wait-key-between-targets", action="store_true")
+    parser.add_argument("--align-only", action="store_true")
+    parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--reset-pickup-model", action="store_true")
@@ -197,15 +139,28 @@ def selected_action(args):
         ("preview_taught_block", bool(args.preview_taught_block)),
         ("stop_at_taught_pre_grasp", bool(args.stop_at_taught_pre_grasp)),
         ("run_taught_block", bool(args.run_taught_block)),
+        ("run_chassis_sequence", bool(args.run_chassis_sequence)),
     ]
     enabled = [name for name, is_enabled in actions if is_enabled]
     if len(enabled) != 1:
         raise ValueError(
             "choose exactly one action: --dry-run, --live-preview, --calib-record, "
             "a teach action, --preview-taught-block, "
-            "--stop-at-taught-pre-grasp, or --run-taught-block"
+            "--stop-at-taught-pre-grasp, --run-taught-block, "
+            "or --run-chassis-sequence"
         )
     return enabled[0]
+
+
+def child_wait_timeout(args):
+    if selected_action(args) in (
+        "teach_block_grasp",
+        "teach_block_place",
+        "teach_block_idle",
+        "teach_block_carry",
+    ):
+        return None
+    return args.arm_timeout
 
 
 def validate_runtime_args(args, config):
@@ -235,8 +190,16 @@ def validate_runtime_args(args, config):
         raise ValueError("--calib-record requires --known-z-mm")
     if args.reset_pickup_model and action != "teach_block_grasp":
         raise ValueError("--reset-pickup-model requires --teach-block-grasp")
+    if args.align_only and action != "run_chassis_sequence":
+        raise ValueError("--align-only requires --run-chassis-sequence")
+    if args.wait_key_between_targets and action != "run_chassis_sequence":
+        raise ValueError(
+            "--wait-key-between-targets requires --run-chassis-sequence")
+    if args.skip_startup_home and action != "run_chassis_sequence":
+        raise ValueError("--skip-startup-home requires --run-chassis-sequence")
     targetless_actions = (
-        "dry_run", "live_preview", "teach_block_idle", "teach_block_carry")
+        "dry_run", "live_preview", "teach_block_place", "teach_block_idle",
+        "teach_block_carry", "run_chassis_sequence")
     if action not in targetless_actions and args.target is None:
         raise ValueError("--target is required except for all-target --dry-run")
 
@@ -246,6 +209,7 @@ def validate_runtime_args(args, config):
         "preview_taught_block",
         "stop_at_taught_pre_grasp",
         "run_taught_block",
+        "run_chassis_sequence",
     ) and method == "theory":
         raise ValueError(
             "distance_method=theory is allowed for dry-run/calibration only; "
@@ -394,6 +358,8 @@ def build_child_command(args, request_fd, response_fd):
         str(request_fd),
         "--detector-response-fd",
         str(response_fd),
+        "--supervisor-pid",
+        str(os.getpid()),
         "--config",
         args.config,
     ]
@@ -419,6 +385,16 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--stop-at-taught-pre-grasp")
     if args.run_taught_block:
         command.append("--run-taught-block")
+    if args.run_chassis_sequence:
+        command.append("--run-chassis-sequence")
+    if args.run_chassis_sequence or (args.teach_block_place and args.target is None):
+        command += ["--sequence", args.sequence]
+    if args.wait_key_between_targets:
+        command.append("--wait-key-between-targets")
+    if args.align_only:
+        command.append("--align-only")
+    if args.skip_startup_home:
+        command.append("--skip-startup-home")
     if args.preset_file:
         command += ["--preset-file", args.preset_file]
     if args.overwrite:
@@ -491,11 +467,25 @@ def stop_child(child):
     return None
 
 
+def request_shutdown(signum, _frame):
+    raise KeyboardInterrupt("received signal %d" % signum)
+
+
+def install_shutdown_handlers():
+    signal.signal(signal.SIGTERM, request_shutdown)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, request_shutdown)
+
+
 def run_parent(args):
     created_config = ensure_config_file(args.config)
     if created_config:
         sys.stderr.write("Created default config: %s\n" % args.config)
     config = load_config(args.config)
+    if args.target is not None:
+        args.target = resolve_target_alias(args.target, config)
+    if args.run_chassis_sequence or (args.teach_block_place and args.target is None):
+        args.sequence = ",".join(parse_target_sequence(args.sequence, config))
     if args.model:
         config["model_path"] = args.model
     if args.confidence is not None:
@@ -509,7 +499,6 @@ def run_parent(args):
     request_read = request_write = response_read = response_write = None
     request_stream = response_stream = None
     child = None
-    arm_phase_started = False
     try:
         request_read, request_write = os.pipe()
         response_read, response_write = os.pipe()
@@ -531,13 +520,7 @@ def run_parent(args):
         response_write = None
         serve_requests(detector, config, request_stream, response_stream)
 
-        arm_phase_started = (
-            args.teach_block_grasp
-            or args.teach_block_place or args.teach_block_idle
-            or args.teach_block_carry or args.stop_at_taught_pre_grasp
-            or args.run_taught_block
-        )
-        return_code = child.wait(timeout=args.arm_timeout)
+        return_code = child.wait(timeout=child_wait_timeout(args))
         if return_code != 0:
             raise RuntimeError("Arm child exited with status %d" % return_code)
         return 0
@@ -545,8 +528,6 @@ def run_parent(args):
         sys.stderr.write(
             "CRITICAL: arm child exceeded timeout; hardware state may be unknown.\n"
         )
-        if child is not None:
-            child.wait()
         return 1
     finally:
         _close_stream_safely(request_stream)
@@ -555,7 +536,7 @@ def run_parent(args):
         close_fd_safely(request_write)
         close_fd_safely(response_read)
         close_fd_safely(response_write)
-        if child is not None and child.poll() is None and not arm_phase_started:
+        if child is not None and child.poll() is None:
             cleanup_error = stop_child(child)
             if cleanup_error is not None:
                 sys.stderr.write("Failed to stop child: %s\n" % cleanup_error)
@@ -566,6 +547,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    install_shutdown_handlers()
     try:
         sys.exit(main())
     except KeyboardInterrupt:

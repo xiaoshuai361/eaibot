@@ -149,6 +149,25 @@ class LaneGeometryTests(unittest.TestCase):
             self.assertEqual(y, right_y)
             self.assertAlmostEqual(center_x, right_x - 120.0, delta=0.1)
 
+    def test_left_and_right_fill_widths_are_independent(self):
+        binary = np.zeros((480, 640), dtype=np.uint8)
+        cv2.line(binary, (140, 430), (200, 120), 255, 13)
+        cv2.line(binary, (500, 430), (440, 120), 255, 13)
+
+        for module in (line_new, line_task):
+            detector = module.LaneDetector(
+                fill_width=300.0,
+                left_fill_width=360.0,
+                right_fill_width=240.0,
+            )
+            left = detector.observe(binary, 320.0, follow_side="left")
+            right = detector.observe(binary, 320.0, follow_side="right")
+            mean_left = np.mean([x for x, _ in left.left_points])
+            mean_right = np.mean([x for x, _ in right.right_points])
+
+            self.assertAlmostEqual(left.center_x, mean_left + 180.0, delta=0.1)
+            self.assertAlmostEqual(right.center_x, mean_right - 120.0, delta=0.1)
+
     def test_single_left_lane_draw_data_contains_virtual_right_edge_and_centers(self):
         binary = np.zeros((480, 640), dtype=np.uint8)
         cv2.line(binary, (140, 430), (220, 120), 255, 13)
@@ -726,6 +745,22 @@ class CrosswalkTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_bridge_reports_the_single_side_selected_by_existing_logic(self):
+        left_points = [
+            (180, 150), (185, 220), (190, 290), (195, 360), (200, 430)
+        ]
+        right_points = [
+            (480, 150), (485, 220), (490, 290), (495, 360), (500, 430)
+        ]
+        for module in (line_new, line_task):
+            bridge = module.DualLineBridge(300.0, fill_width=300.0)
+            bridge.update(left_points, [], target_y=380)
+            self.assertEqual(bridge.selected_side, "left")
+
+            bridge.reset()
+            bridge.update([], right_points, target_y=380)
+            self.assertEqual(bridge.selected_side, "right")
+
     def test_new_right_model_cannot_extrapolate_across_vehicle_center(self):
         bridge = line_new.DualLineBridge(lane_width=300.0)
         zebra_edge = [(340, 300), (400, 340), (460, 380), (520, 420)]
@@ -1599,6 +1634,7 @@ class StateTests(unittest.TestCase):
         )
         for module in (line_new, line_task):
             self.assertEqual(module.CAMERA_INDEX, 4)
+            self.assertTrue(module.TRAFFIC_LIGHT_ENABLED)
             self.assertEqual(module.TRAFFIC_LIGHT_CAMERA_INDEX, 0)
             self.assertEqual(module.TRAFFIC_LIGHT_FRAME_WIDTH, 320)
             self.assertEqual(module.TRAFFIC_LIGHT_FRAME_HEIGHT, 240)
@@ -1794,6 +1830,10 @@ class TaskYoloTests(unittest.TestCase):
         follower.yolo_building_confidence = 0.4
         follower.yolo_center_band_ratio = 0.8
         follower.yolo_class_names = line_task.YOLO_CLASS_NAMES
+        follower.yolo_street_model_path = "/tmp/street.onnx"
+        follower.yolo_building_model_path = "/tmp/building.onnx"
+        follower.yolo_street_class_names = line_task.YOLO_STREET_CLASS_NAMES
+        follower.yolo_building_class_names = line_task.YOLO_BUILDING_CLASS_NAMES
         follower.yolo_image_size = 320
         follower.yolo_nms_threshold = 0.45
         follower.task_index = 0
@@ -1804,11 +1844,13 @@ class TaskYoloTests(unittest.TestCase):
         follower.yolo_stop_reported = False
         follower.yolo_stop_report_seq = 0
         follower.yolo_lock = threading.Lock()
+        follower.yolo_switch_lock = threading.Lock()
         follower.yolo_latest_seq = 0
         follower.yolo_read_seq = 0
         follower.yolo_latest_detections = []
         follower.yolo_latest_frame = None
         follower.yolo_ready = False
+        follower.yolo_active_profile = None
         follower.yolo_running = False
         follower.yolo_thread = None
         follower.yolo_worker_active = False
@@ -1836,17 +1878,24 @@ class TaskYoloTests(unittest.TestCase):
 
             self.assertEqual(line_task.resolve_yolo_model_path(root), preferred)
 
-    def test_default_yolo_model_uses_new_yolov5n_320_onnx(self):
+    def test_default_yolo_models_use_separate_yolov5n_320_onnx_files(self):
         self.assertEqual(
-            line_task.YOLO_MODEL_PATH,
+            line_task.YOLO_STREET_MODEL_PATH,
             "/home/eaibot/handeye-calib/src/model/yolov5/"
-            "merge_new_yolov5n_320_best.onnx",
+            "rubbish_doll_yolov5n_320_best.onnx",
         )
+        self.assertEqual(
+            line_task.YOLO_BUILDING_MODEL_PATH,
+            "/home/eaibot/handeye-calib/src/model/yolov5/"
+            "building_new_yolov5n_320_best.onnx",
+        )
+        self.assertEqual(line_task.YOLO_MODEL_PATH,
+                         line_task.YOLO_STREET_MODEL_PATH)
         self.assertEqual(line_task.YOLO_IMAGE_SIZE, 320)
         self.assertEqual(line_task.YOLO_CONFIDENCE, 0.60)
         self.assertEqual(line_task.YOLO_BUILDING_CONFIDENCE, 0.40)
 
-    def test_line_operation_doc_uses_new_yolo_model_only(self):
+    def test_line_operation_doc_uses_separate_task_models(self):
         doc_path = os.path.abspath(os.path.join(
             os.path.dirname(line_task.__file__), "..", "..",
             "zcy", "循迹操作.md",
@@ -1854,7 +1903,8 @@ class TaskYoloTests(unittest.TestCase):
         with open(doc_path, "r", encoding="utf-8") as handle:
             content = handle.read()
 
-        self.assertIn("merge_new_yolov5n_320_best.onnx", content)
+        self.assertIn("rubbish_doll_yolov5n_320_best.onnx", content)
+        self.assertIn("building_new_yolov5n_320_best.onnx", content)
         self.assertNotIn("merge_new_1_yolov5n_320_best.onnx", content)
         self.assertNotIn("merge_yolov5n_320_best.onnx", content)
         self.assertNotIn("_yolo_class_profile", content)
@@ -2150,7 +2200,49 @@ class TaskYoloTests(unittest.TestCase):
             {"kind": "off"},
         )
 
+    def test_yolo_model_profile_switches_after_third_right(self):
+        self.assertEqual(line_task.yolo_model_profile(0), "street")
+        self.assertEqual(line_task.yolo_model_profile(2), "street")
+        self.assertEqual(line_task.yolo_model_profile(3), "building")
+        self.assertEqual(line_task.yolo_model_profile(8), "building")
+
+    def test_third_right_completion_switches_before_fourth_left_follow(self):
+        follower = self._follower(now=20.0)
+        self._restore_rospy = follower._restore_rospy
+        follower.state = "EXIT_ALIGN"
+        follower.task_index = 2
+        follower.turn_cmd = "right"
+        switch_indices = []
+        follower._switch_yolo_profile_if_needed = lambda: (
+            switch_indices.append(follower.task_index) or True
+        )
+
+        follower._complete_intersection()
+
+        self.assertEqual(switch_indices, [3])
+        self.assertEqual(follower.task_index, 3)
+        self.assertEqual(follower.turn_cmd, "left")
+        self.assertEqual(follower.state, "FOLLOW")
+
     def test_yolo_target_classes_include_people_trash_and_buildings(self):
+        self.assertEqual(
+            line_task.YOLO_STREET_CLASS_NAMES,
+            (
+                "General population",
+                "Medical population",
+                "hazardous waste",
+                "recyclable material",
+            ),
+        )
+        self.assertEqual(
+            line_task.YOLO_BUILDING_CLASS_NAMES,
+            (
+                "Collapsed Building",
+                "Electrical Fault Building",
+                "Fire Building",
+                "Toxic Gas-contaminated Building",
+            ),
+        )
         self.assertEqual(
             line_task.YOLO_CLASS_NAMES,
             (
@@ -2498,7 +2590,7 @@ class TaskYoloTests(unittest.TestCase):
         self.assertEqual(building_event.kind, "building")
         self.assertIsNone(street_event)
 
-    def test_init_yolo_keeps_lower_building_candidates_from_detector(self):
+    def test_building_profile_uses_lower_confidence_and_building_classes(self):
         follower = self._follower(now=20.0)
         self._restore_rospy = follower._restore_rospy
         follower.yolo_confidence = 0.60
@@ -2506,52 +2598,71 @@ class TaskYoloTests(unittest.TestCase):
         kwargs_seen = []
 
         class FakeDetector(object):
-            model_path = "/tmp/fake.onnx"
-            backend_name = "opencv-dnn-onnx"
-
             def __init__(self, *args, **kwargs):
                 kwargs_seen.append(kwargs)
 
-            def load(self):
-                pass
-
-            def detect(self, frame):
-                return []
-
-        class FakeCamera(object):
-            def __init__(self, index, frame_width=None, frame_height=None):
-                self.cap = types.SimpleNamespace(isOpened=lambda: True)
-
-            def read(self, timeout=0.0):
-                return True, np.zeros((100, 200, 3), dtype=np.uint8)
-
-        class FakeThread(object):
-            daemon = False
-
-            def __init__(self, target):
-                pass
-
-            def start(self):
-                pass
-
         original_detector = line_task.YoloObstacleDetector
-        original_camera = line_task.CameraReader
-        original_thread = line_task.threading.Thread
         line_task.YoloObstacleDetector = FakeDetector
-        line_task.CameraReader = FakeCamera
-        line_task.threading.Thread = FakeThread
         try:
-            delattr(follower, "_poll_yolo_detections")
-            follower.yolo_model_path = "/tmp/fake.onnx"
-            follower.yolo_camera_index = 0
-            follower.yolo_frame_interval = 1
-            follower._init_yolo()
+            follower._create_yolo_detector("building")
         finally:
             line_task.YoloObstacleDetector = original_detector
-            line_task.CameraReader = original_camera
-            line_task.threading.Thread = original_thread
 
         self.assertEqual(kwargs_seen[0]["confidence"], 0.40)
+        self.assertEqual(kwargs_seen[0]["class_names"],
+                         line_task.YOLO_BUILDING_CLASS_NAMES)
+
+    def test_model_switch_releases_street_model_and_warms_building_model(self):
+        follower = self._follower(now=20.0)
+        self._restore_rospy = follower._restore_rospy
+        events = []
+
+        class OldDetector(object):
+            def close(self):
+                events.append("street_closed")
+
+        class FakeDetector(object):
+            backend_name = "opencv-dnn-onnx"
+
+            def __init__(self, model_path, **kwargs):
+                self.model_path = model_path
+                self.names = dict(enumerate(kwargs["class_names"]))
+                events.append(("created", model_path, kwargs["class_names"]))
+
+            def load(self):
+                events.append("building_loaded")
+
+            def detect(self, frame):
+                events.append("building_warmed")
+                return []
+
+            def close(self):
+                events.append("building_closed")
+
+        follower.task_index = 3
+        follower.yolo_active_profile = "street"
+        follower.yolo_detector = OldDetector()
+        follower.yolo_camera = types.SimpleNamespace(
+            read=lambda timeout=0.0: (
+                True, np.zeros((240, 320, 3), dtype=np.uint8)
+            )
+        )
+        original_detector = line_task.YoloObstacleDetector
+        line_task.YoloObstacleDetector = FakeDetector
+        try:
+            switched = follower._switch_yolo_profile_if_needed()
+        finally:
+            line_task.YoloObstacleDetector = original_detector
+
+        self.assertTrue(switched)
+        self.assertEqual(follower.yolo_active_profile, "building")
+        self.assertEqual(follower.yolo_model_path, "/tmp/building.onnx")
+        self.assertEqual(follower.yolo_class_names,
+                         line_task.YOLO_BUILDING_CLASS_NAMES)
+        self.assertTrue(follower.yolo_ready)
+        self.assertEqual(events[0], "street_closed")
+        self.assertIn("building_loaded", events)
+        self.assertIn("building_warmed", events)
 
     def test_disabled_yolo_route_does_not_poll_or_stop(self):
         follower = self._follower(now=20.0)

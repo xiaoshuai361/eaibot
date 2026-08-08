@@ -9,26 +9,68 @@ import cv2
 import numpy as np
 import rospy
 from geometry_msgs.msg import Twist
-from traffic_light_vision import (
-    TrafficLightDetector,
-    configure_traffic_camera,
-    draw_traffic_light,
-    set_capture_resolution,
-    update_green_hits,
-)
+
+try:
+    from traffic_light_vision import (
+        TrafficLightDetector,
+        configure_traffic_camera,
+        draw_traffic_light,
+        set_capture_resolution,
+        update_green_hits,
+    )
+    TRAFFIC_LIGHT_MODULE_AVAILABLE = True
+except ImportError as traffic_light_import_error:
+    # 允许只部署主程序；未部署红绿灯模块时仍可运行原巡线任务。
+    TRAFFIC_LIGHT_MODULE_AVAILABLE = False
+    TRAFFIC_LIGHT_IMPORT_ERROR = traffic_light_import_error
+    TrafficLightDetector = None
+
+    def configure_traffic_camera(_camera_index):
+        return False
+
+    def set_capture_resolution(capture, width, height):
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+
+    def draw_traffic_light(frame, _detections, _color, _green_hits,
+                           _green_required):
+        return frame
+
+    def update_green_hits(_detections, _current_hits, _required_hits):
+        return 0, False, None
 
 
-# ===== 摄像头与运行模式 =====
-CAMERA_INDEX = 4          # 巡线摄像头编号；红绿灯摄像头固定使用 0。
-PROCESS_WIDTH = 640       # 处理图宽度；通常保持 640，改动后 PID 和像素距离要重调。
-DRY_RUN = True            # True 只识别不发速度；实车确认画面正确后改 False。
-DEBUG_VIEW = True         # True 显示识别窗口；无显示器运行时可改 False。
+# ===== 现场启动、摄像头与功能开关（运行前优先检查） =====
+CAMERA_INDEX = 4          # 巡线摄像头：/dev/video4。
+TRAFFIC_LIGHT_CAMERA_INDEX = 0 # 红绿灯识别摄像头：/dev/video0，仅停止线等待时使用。
+PROCESS_WIDTH = 640       # 巡线处理图宽度；改动后 PID 和像素距离需要重调。
+TRAFFIC_LIGHT_FRAME_WIDTH = 320 # 红绿灯摄像头采集宽度。
+TRAFFIC_LIGHT_FRAME_HEIGHT = 240 # 红绿灯摄像头采集高度。
+DRY_RUN = True            # True 只识别不动车；实车运行改为 False。
+DEBUG_VIEW = True         # True 显示巡线和红绿灯调试窗口。
 TURN_CMD = "straight"    # 路口方向：left/straight/right；ROS ~turn_cmd 可覆盖。
+TRAFFIC_LIGHT_ENABLED = True # True 时入口横条摆正后必须确认绿灯。
+TRAFFIC_LIGHT_CONFIDENCE = 0.55 # 红绿灯单帧最低置信度；漏检可降，误检可加。
+
+# ===== 模型路径（部署前检查） =====
+TRAFFIC_LIGHT_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/traffic_lights_yolov5n_320_best.onnx"
+
+# ===== 场地光照快速调参（固定曝光后再调整） =====
+BLACK_V_MAX = 160         # 黑线断裂就加；阴影和地面杂物变多就降。
+ADAPTIVE_BLOCK_SIZE = 31  # 局部阈值窗口，必须为大于 1 的奇数；光照变化范围大可加。
+ADAPTIVE_C = 5            # 自适应阈值偏移；噪声多可加，细黑线漏检可减。
+MORPH_KERNEL_SIZE = 3     # 开闭运算核；噪点多可加，细线被吃掉就减。
+STRIPE_MIN_AREA = 25      # 斑马条断裂或远处漏检就减；噪点多就加。
+STRIPE_MIN_FILL = 0.25    # 斑马条破碎漏检就减；空心杂物误识别就加。
+BAR_HOUGH_THRESHOLD_RATIO = 0.055 # 横条断裂漏检就减；杂线多就加。
+BAR_HOUGH_MAX_GAP_RATIO = 0.05 # 横条受反光断开就加；杂线被乱连就减。
+BAR_THICKNESS_MIN_OCCUPANCY = 0.35 # 横条断裂就减；噪声使横条虚增厚就加。
 
 # ===== 速度与转向 =====
 FOLLOW_SPEED = 0.16       # 普通巡线 linear.x 前进速度(m/s)；整车过弯慢可小幅加。
 APPROACH_SPEED = 0.16     # 靠近横条 linear.x 前进速度(m/s)；冲过横条就降。
 MANEUVER_SPEED = 0.16     # 路口内 linear.x 前进速度(m/s)；路口通过慢可小幅加。
+MANEUVER_CENTER_BIAS_PIXELS = 40.0 # 直行路口避障量；只填正数，数值越大避让越多。
 MAX_ANGULAR = 0.50       # angular.z 偏航角速度上限(rad/s)；只影响转头快慢，不提高前进速度。
 
 # 左右转只需要调整下面四项；直行路口和普通巡线不使用这些参数。！！！
@@ -44,14 +86,13 @@ LARGE_ERROR_KP = 0.0024 # 大误差比例；急弯拐不过就加，转得过猛
 LARGE_ERROR_KD = 0.01  # 大误差阻尼；急弯摆动就加，响应尖峰过大就减。
 ANGULAR_SMOOTH = 0.88    # 转向保留比例；加大更平稳但迟钝，减小更灵敏。
 
-# ===== 黑白二值图 =====
-BLACK_V_MAX = 160         # 黑色亮度上限；黑线断裂就加，阴影/杂物太多就降。
-
 # ===== 车道边线 =====
 ROI_TOP = 0.2           # 识别区域上边界；减小看得更远，但更容易收到远处干扰。
 ROI_BOTTOM = 0.92       # 识别区域下边界；增大看得更近，车头遮挡或噪声多就减小。
 LANE_WIDTH_PIXELS = 620.0 # 车道内边缘间距；按当前 640 宽处理图估算，实测后可微调。
-FILL_WIDTH_PIXELS = 620.0 # 单边补线间距；增大时跟左线向右移、跟右线向左移。
+FILL_WIDTH_PIXELS = 620.0 # 路口直行模型补线间距；路口内偏移时再调。
+LEFT_FILL_WIDTH_PIXELS = 620.0 # 只看到左边线时使用；增大会让目标向右移。
+RIGHT_FILL_WIDTH_PIXELS = 580.0 # 只看到右边线时使用；减小会让目标向右移。
 FOLLOW_CENTER_BIAS_PIXELS = 0.0 # 巡线目标横向偏置；正数向右、负数向左，固定偏航先调这里。
 SCAN_ROWS = 9                 # 水平扫描行数；加大更稳但稍慢，过少容易漏线。
 MIN_SEGMENT_WIDTH = 4        # 最小黑段宽度；噪点多就加，细线漏检就减。
@@ -65,14 +106,12 @@ LANE_TRACK_MAX_ERROR_RATIO = 0.025 # 边线拟合最大误差；弯道漏锁就�
 LANE_OUTSIDE_MARGIN_RATIO = 0.012 # 边线外侧裁剪余量；切掉真实元素就加，外侧干扰多就减。
 
 # ===== 斑马线竖条 =====
-STRIPE_MIN_AREA = 25          # 单根竖条最小面积；噪点多就加，远处竖条漏检就减。
 STRIPE_RATIO_MIN = 1.7        # 竖条最小长宽比；方块误识别就加。
 STRIPE_RATIO_MAX = 5.8        # 竖条最大长宽比；细长真实竖条漏检就加。
 STRIPE_SHORT_MIN_RATIO = 0.025 # 竖条短边最小图宽比例；小噪声多就加。
 STRIPE_SHORT_MAX_RATIO = 0.13 # 竖条短边最大图宽比例；大块误识别就减。
 STRIPE_LONG_MIN_RATIO = 0.055 # 竖条长边最小图高比例；远处竖条漏检就减。
 STRIPE_LONG_MAX_RATIO = 0.45  # 竖条长边最大图高比例；近景斑马条漏检就加。
-STRIPE_MIN_FILL = 0.25        # 竖条矩形填充率；空心杂物误识别就加。
 STRIPE_GROUP_Y_RATIO = 0.18   # 同组竖条中心最大纵向差；斜拍漏组就加，乱组就减。
 STRIPE_GROUP_ANGLE = 22.0     # 同组竖条最大角度差；透视大就加，乱组就减。
 STRIPE_GROUP_SIZE_MIN = 0.5   # 同组竖条最小尺寸倍数。
@@ -84,10 +123,7 @@ STRIPE_CENTER_X_MIN_RATIO = 0.04 # 竖条中心最小横坐标；画面边缘干
 STRIPE_CENTER_X_MAX_RATIO = 0.98 # 竖条中心最大横坐标；画面边缘干扰多就减。
 
 # ===== 停车横条几何 =====
-BAR_HOUGH_THRESHOLD_RATIO = 0.055 # Hough 投票阈值比例；杂线多就加，断线漏检就减。
 BAR_HOUGH_MIN_LENGTH_RATIO = 0.16 # 单个横条片段最小图宽比例；短杂线多就加。
-
-BAR_HOUGH_MAX_GAP_RATIO = 0.05 # Hough 内部允许断口；横条断裂就加，乱连就减。
 
 BAR_MAX_ABS_ANGLE = 45.0      # 横条相对画面水平最大角度；急斜拍漏检就加。
 BAR_LANE_PARALLEL_ANGLE = 10.0 # 横条与边线方向接近到此值时判为边线。
@@ -108,7 +144,6 @@ BAR_FRONT_MARGIN_RATIO = 0.30 # 横条必须覆盖车头中心附近的半宽比
 BAR_STRONG_AXIS_MARGIN_RATIO = 0.06 # 强竖条通道横条覆盖车头轴线余量。
 BAR_STRONG_MIN_MATCHED = 2    # 强通道横条至少匹配的竖条数；误识别就加，遮挡漏检就减。
 BAR_THICKNESS_SEARCH_RATIO = 0.055 # 横条法向厚度搜索范围；厚横条截断就加。
-BAR_THICKNESS_MIN_OCCUPANCY = 0.35 # 横条每层最小白像素占比；噪声变厚就加，断条就减。
 BAR_DEFAULT_THICKNESS_RATIO = 0.025 # 无法测厚时默认图宽比例。
 BAR_ONLY_MIN_THICKNESS_RATIO = 0.010 # 纯横条最小厚度；细线误报就加。
 BAR_ONLY_MAX_THICKNESS_RATIO = 0.075 # 纯横条最大厚度；大块误报就减。
@@ -146,7 +181,6 @@ MANEUVER_MAX_TIME = 14.0     # 未识别到出口横条时，超过此时间恢�
 MANEUVER_LOOKAHEAD_RATIO = 0.60 # 路口中心线前视控制行；减小看得更远，增大看得更近。
 ENTRY_CLEAR_FRAMES = 6       # 入口斑马线消失确认；入口被当出口就加。
 EXIT_BAR_FRAMES = 1          # 第二条横条连续确认帧数；误触发就加，退出太慢就减。
-RESTORE_DUAL_FRAMES = 4      # 仅保留兼容配置；双边线恢复不再作为路口退出条件。
 RANSAC_RESIDUAL_PIXELS = 12.0 # 直线内点容差像素；线断/抖就加，圆角混入就减。
 RANSAC_MIN_INLIERS = 4       # 直线最少内点数；误拟合就加，难锁定就减。
 MODEL_HOLD_FRAMES = 8        # 边线丢失后保持帧数；短暂丢线就加，旧线残留就减。
@@ -159,12 +193,6 @@ WINDOW_NAME = "line_cy_new" # 调试窗口名称；不影响算法。
 PROCESSED_WINDOW_NAME = "line_cy_new_processed" # 二值处理结果窗口名称。
 
 # ===== 红绿灯等待 =====
-TRAFFIC_LIGHT_ENABLED = True # 摆正入口横条后必须确认绿灯才进入路口。
-TRAFFIC_LIGHT_CAMERA_INDEX = 0 # 红绿灯摄像头编号。
-TRAFFIC_LIGHT_FRAME_WIDTH = 320 # 红绿灯摄像头采集宽度。
-TRAFFIC_LIGHT_FRAME_HEIGHT = 240 # 红绿灯摄像头采集高度。
-TRAFFIC_LIGHT_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/traffic_lights_yolov5n_320_best.onnx"
-TRAFFIC_LIGHT_CONFIDENCE = 0.55 # 单帧灯色最低置信度。
 TRAFFIC_GREEN_STABLE_FRAMES = 2 # 连续绿灯确认帧数，防止单帧误放行。
 TRAFFIC_LIGHT_RETRY_TIME = 2.0 # 摄像头或模型失败后的重试间隔(s)。
 TRAFFIC_LIGHT_WINDOW_NAME = "line_cy_new_traffic_light"
@@ -312,10 +340,6 @@ def turn_phase_next(phase, elapsed, entry_time, turn_time):
     return None
 
 
-def maneuver_observation_target(observation):
-    return observation.center_x if observation.valid else None
-
-
 def follow_entry_hits(candidate, current_hits):
     return current_hits + 1 if candidate else max(0, current_hits - 1)
 
@@ -354,11 +378,16 @@ class LaneObservation(object):
 
 class LaneDetector(object):
     def __init__(self, roi_top=ROI_TOP, roi_bottom=ROI_BOTTOM, scan_rows=SCAN_ROWS,
-                 fill_width=0.0):
+                 fill_width=0.0, left_fill_width=None,
+                 right_fill_width=None):
         self.roi_top = float(roi_top)
         self.roi_bottom = float(roi_bottom)
         self.scan_rows = int(scan_rows)
         self.fill_width = float(fill_width)
+        self.left_fill_width = (self.fill_width if left_fill_width is None
+                                else float(left_fill_width))
+        self.right_fill_width = (self.fill_width if right_fill_width is None
+                                 else float(right_fill_width))
 
     def points(self, binary, center_x=None):
         height, width = binary.shape[:2]
@@ -402,7 +431,10 @@ class LaneDetector(object):
         left_by_y = {y: x for x, y in left_points}
         right_by_y = {y: x for x, y in right_points}
         expected = float(lane_width) if lane_width > 0 else width * DEFAULT_LANE_WIDTH_RATIO
-        fill_width = self.fill_width if self.fill_width > 0 else expected
+        left_fill_width = (self.left_fill_width
+                           if self.left_fill_width > 0 else expected)
+        right_fill_width = (self.right_fill_width
+                            if self.right_fill_width > 0 else expected)
         all_rows = sorted(set(left_by_y).union(right_by_y), reverse=True)
         center_points = []
         virtual_left, virtual_right = [], []
@@ -424,13 +456,13 @@ class LaneDetector(object):
             else:
                 candidates = []
                 if left_x is not None and follow_side in (None, "left"):
-                    offset = fill_width * 0.5
+                    offset = left_fill_width * 0.5
                     if follow_side == "left" and side_center_transform is not None:
                         offset = (side_center_transform[0] * y
                                   + side_center_transform[1])
                     candidates.append((left_x + offset, "left", offset))
                 if right_x is not None and follow_side in (None, "right"):
-                    offset = -fill_width * 0.5
+                    offset = -right_fill_width * 0.5
                     if follow_side == "right" and side_center_transform is not None:
                         offset = (side_center_transform[0] * y
                                   + side_center_transform[1])
@@ -532,6 +564,7 @@ class DualLineBridge(object):
         self.center_model = None
         self.left_to_center = None
         self.right_to_center = None
+        self.selected_side = None
 
     def reset(self, lane_width=None):
         if lane_width is not None:
@@ -544,6 +577,7 @@ class DualLineBridge(object):
         self.center_model = None
         self.left_to_center = None
         self.right_to_center = None
+        self.selected_side = None
 
     def _learn_center_geometry(self):
         left = self.left_model
@@ -636,12 +670,15 @@ class DualLineBridge(object):
         candidates = fresh_candidates if fresh_candidates else held_candidates
         if not candidates:
             self.last_center = None
+            self.selected_side = None
             return None, None, None
 
         if len(candidates) == 1:
             center = candidates[0][0]
             center_model = candidates[0][2]
+            self.selected_side = candidates[0][1]
         else:
+            self.selected_side = None
             left_center, right_center = candidates[0][0], candidates[1][0]
             consistent = abs(left_center - right_center) \
                 <= fill_width * MODEL_CENTER_CONSISTENCY_RATIO
@@ -662,36 +699,11 @@ class DualLineBridge(object):
                 else:
                     chosen = min(candidates, key=lambda item: abs(item[0] - reference))
                     center, center_model = chosen[0], chosen[2]
+                    self.selected_side = chosen[1]
         self.last_center = float(center)
         if center_model is not None:
             self.center_model = center_model
         return self.last_center, self.left_model, self.right_model
-
-
-class RightLineBridge(object):
-    """兼容旧调用；新路口控制使用 DualLineBridge。"""
-    def __init__(self, lane_width, fill_width=0.0,
-                 hold_frames=MODEL_HOLD_FRAMES):
-        self.bridge = DualLineBridge(lane_width, fill_width, hold_frames)
-
-    @property
-    def lane_width(self):
-        return self.bridge.lane_width
-
-    @lane_width.setter
-    def lane_width(self, value):
-        self.bridge.lane_width = float(value)
-
-    @property
-    def model(self):
-        return self.bridge.right_model
-
-    def reset(self, lane_width=None):
-        self.bridge.reset(lane_width)
-
-    def update(self, right_points, target_y):
-        center, _, model = self.bridge.update([], right_points, target_y)
-        return center, model
 
 
 class CrosswalkResult(object):
@@ -1316,9 +1328,10 @@ class BinaryVision(object):
                             np.array([180, 255, self.black_v_max], np.uint8))
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
         adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY_INV, 31, 5)
+                                         cv2.THRESH_BINARY_INV,
+                                         ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C)
         binary = cv2.bitwise_and(color, adaptive)
-        kernel = np.ones((3, 3), np.uint8)
+        kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
         return cv2.morphologyEx(cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel),
                                cv2.MORPH_CLOSE, kernel)
 
@@ -1402,9 +1415,15 @@ class LaneFollower(object):
         self.process_width = int(rospy.get_param("~process_width", PROCESS_WIDTH))
         self.dry_run = bool(rospy.get_param("~dry_run", DRY_RUN))
         self.debug_view = bool(rospy.get_param("~debug_view", DEBUG_VIEW))
-        self.traffic_light_enabled = bool(rospy.get_param(
+        requested_traffic_light = bool(rospy.get_param(
             "~traffic_light_enabled", TRAFFIC_LIGHT_ENABLED
         ))
+        self.traffic_light_enabled = requested_traffic_light
+        if requested_traffic_light and not TRAFFIC_LIGHT_MODULE_AVAILABLE:
+            message = "未找到 traffic_light_vision，禁止绕过红绿灯：%s" % \
+                TRAFFIC_LIGHT_IMPORT_ERROR
+            rospy.logerr("line_cy_new %s", message)
+            rospy.signal_shutdown(message)
         self.traffic_light_camera_index = int(rospy.get_param(
             "~traffic_light_camera_index", TRAFFIC_LIGHT_CAMERA_INDEX
         ))
@@ -1440,7 +1459,11 @@ class LaneFollower(object):
         )
         self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self.vision = BinaryVision()
-        self.lanes = LaneDetector(fill_width=FILL_WIDTH_PIXELS)
+        self.lanes = LaneDetector(
+            fill_width=FILL_WIDTH_PIXELS,
+            left_fill_width=LEFT_FILL_WIDTH_PIXELS,
+            right_fill_width=RIGHT_FILL_WIDTH_PIXELS,
+        )
         self.crosswalk = CrosswalkDetector()
         self.camera = CameraReader(self.camera_index)
         self.traffic_camera = None
@@ -1455,9 +1478,8 @@ class LaneFollower(object):
         self.state_started = rospy.get_time()
         self.stop_hits = self.lost_hits = self.align_hits = 0
         self.wait_recover_hits = 0
-        self.clear_hits = self.exit_hits = self.dual_hits = 0
+        self.clear_hits = self.exit_hits = 0
         self.entry_cleared = False
-        self.maneuver_timeout_warned = False
         self.maneuver_phase = "NONE"
         self.maneuver_phase_started = self.state_started
         self.entry_accept_after = 0.0
@@ -1647,8 +1669,7 @@ class LaneFollower(object):
             self.traffic_last_color = None
         if state == "MANEUVER":
             self.entry_cleared = False
-            self.clear_hits = self.exit_hits = self.dual_hits = 0
-            self.maneuver_timeout_warned = False
+            self.clear_hits = self.exit_hits = 0
             self.maneuver_phase = (
                 "ENTRY" if maneuver_follow_side(self.turn_cmd) is not None
                 else "STRAIGHT"
@@ -1837,7 +1858,14 @@ class LaneFollower(object):
                 )
                 if center is None:
                     center = frame.shape[1] * 0.5
-                self._control(center, frame.shape[1], MANEUVER_SPEED)
+                bias = 0.0
+                if self.bridge.selected_side == "left":
+                    bias = abs(MANEUVER_CENTER_BIAS_PIXELS)
+                elif self.bridge.selected_side == "right":
+                    bias = -abs(MANEUVER_CENTER_BIAS_PIXELS)
+                self._control(
+                    center, frame.shape[1], MANEUVER_SPEED, bias,
+                )
             else:
                 self.last_binary = lane_binary
                 self._run_timed_turn_phase(now)
@@ -1862,7 +1890,6 @@ class LaneFollower(object):
                 self._set_state("EXIT_ALIGN")
             elif maneuver_timeout_exits_to_follow(now - self.state_started):
                 rospy.logwarn("maneuver timeout, resume normal lane following")
-                self.maneuver_timeout_warned = True
                 self._set_state("FOLLOW")
                 if observation.valid:
                     self._control(observation.center_x, frame.shape[1], FOLLOW_SPEED,

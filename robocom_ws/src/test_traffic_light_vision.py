@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 import traffic_light_vision as traffic
+import traffic_light_test as traffic_test
 
 
 class FakeDetection(object):
@@ -38,6 +39,16 @@ class FakeNet(object):
 
 
 class TrafficLightVisionTests(unittest.TestCase):
+    def test_visual_test_script_uses_camera_zero_and_required_model(self):
+        self.assertEqual(traffic_test.CAMERA_INDEX, 0)
+        self.assertEqual((traffic_test.FRAME_WIDTH,
+                          traffic_test.FRAME_HEIGHT), (320, 240))
+        self.assertEqual(
+            traffic_test.MODEL_PATH,
+            "/home/eaibot/handeye-calib/src/model/yolov5/"
+            "traffic_lights_yolov5n_320_best.onnx",
+        )
+
     def test_camera_command_matches_required_controls(self):
         calls = []
 
@@ -48,7 +59,7 @@ class TrafficLightVisionTests(unittest.TestCase):
         expected = [
             "v4l2-ctl", "-d", "/dev/video0",
             "-c", "exposure_auto=1",
-            "-c", "exposure_absolute=40",
+            "-c", "exposure_absolute=30",
             "-c", "white_balance_temperature_auto=0",
             "-c", "white_balance_temperature=4600",
             "-c", "exposure_auto_priority=0",

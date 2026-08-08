@@ -6,9 +6,11 @@ from __future__ import absolute_import, division, print_function
 
 import argparse
 import copy
+import fcntl
 import json
 import math
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -25,7 +27,13 @@ if sys.version_info[0] != 2:
 import moveit_commander
 import rospy
 import tf
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
+from std_srvs.srv import Trigger
+
+from tag_chassis_align_pick_sequence import (
+    compute_drive_command,
+    roi_ratio_to_pixels,
+)
 
 from block_mono_vision import (
     DEFAULT_CONFIG,
@@ -38,6 +46,7 @@ from block_mono_vision import (
     is_detection_usable,
     load_config,
     observation_in_roi,
+    parse_target_sequence,
     stable_median_observation,
 )
 
@@ -50,10 +59,80 @@ except NameError:
 
 WRIST_FORWARD_JOINT5 = -1.5709534265016345
 BLOCK_PRESET_VERSION = 2
-MOTION_SETTLE_SECONDS = 0.25
+MOTION_SETTLE_SECONDS = DEFAULT_CONFIG["motion_settle_seconds"]
 DEFAULT_BLOCK_PRESET_FILE = (
     "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json"
 )
+MOTION_LOCK_PATH = "/tmp/mirobot_arm_motion.lock"
+
+
+class TerminationRequested(RuntimeError):
+    pass
+
+
+def raise_termination_requested(signum, _frame):
+    raise TerminationRequested("Received termination signal %d." % signum)
+
+
+def enable_parent_death_signal(expected_parent_pid, libc=None):
+    """Ask Linux to terminate this arm helper if its Python3 parent dies."""
+    if expected_parent_pid is None:
+        return
+    expected_parent_pid = int(expected_parent_pid)
+    if os.getppid() != expected_parent_pid:
+        raise TerminationRequested(
+            "Arm supervisor exited before the child initialized.")
+    if libc is None:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM) != 0:  # PR_SET_PDEATHSIG
+        raise RuntimeError("Could not enable the arm parent-death signal.")
+    # Close the race where the parent exits immediately before prctl().
+    if os.getppid() != expected_parent_pid:
+        raise TerminationRequested(
+            "Arm supervisor exited while the child initialized.")
+
+
+def action_uses_moveit(args):
+    if args.mode in ("home", "current_pose", "wrist_forward"):
+        return True
+    if args.mode != "block_mono":
+        return False
+    return get_action(args) in (
+        "teach_block_grasp",
+        "teach_block_place",
+        "teach_block_idle",
+        "teach_block_carry",
+        "stop_at_taught_pre_grasp",
+        "run_taught_block",
+        "run_chassis_sequence",
+    )
+
+
+def motion_action_label(args):
+    if args.mode == "block_mono":
+        return get_action(args)
+    return args.mode
+
+
+def acquire_motion_lock(args, path=MOTION_LOCK_PATH):
+    if not action_uses_moveit(args):
+        return None
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        handle.seek(0)
+        owner = handle.read().strip() or "unknown owner"
+        handle.close()
+        raise RuntimeError(
+            "Another mechanical-arm command is still active (%s). "
+            "Stop the old block_pick_main/mirobot_pick_test process first."
+            % owner)
+    os.ftruncate(handle.fileno(), 0)
+    handle.write("pid=%d action=%s\n" % (os.getpid(), motion_action_label(args)))
+    handle.flush()
+    return handle
 
 
 def _normalize_signed_args(argv):
@@ -94,6 +173,7 @@ def parse_args(argv):
     parser.add_argument("--block-target", choices=sorted(DEFAULT_CONFIG["target_classes"]))
     parser.add_argument("--detector-request-fd", type=int)
     parser.add_argument("--detector-response-fd", type=int)
+    parser.add_argument("--supervisor-pid", type=int)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--live-preview", action="store_true")
     parser.add_argument("--calib-record", action="store_true")
@@ -104,6 +184,11 @@ def parse_args(argv):
     parser.add_argument("--preview-taught-block", action="store_true")
     parser.add_argument("--stop-at-taught-pre-grasp", action="store_true")
     parser.add_argument("--run-taught-block", action="store_true")
+    parser.add_argument("--run-chassis-sequence", action="store_true")
+    parser.add_argument("--sequence", default="1,2,3,4")
+    parser.add_argument("--wait-key-between-targets", action="store_true")
+    parser.add_argument("--align-only", action="store_true")
+    parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--reset-pickup-model", action="store_true")
@@ -237,7 +322,7 @@ def transform_to_pose(frame_id, transform):
 
 
 def block_anchor_pose_from_localization(localization, config):
-    base_frame = localization.get("base_frame") or config.get("base_frame", "base")
+    base_frame = localization.get("base_frame") or config["base_frame"]
     xyz_mm = finite_vector3(localization.get("base_xyz_mm"), "base_xyz_mm")
     orientation = config.get("block_anchor_orientation_xyzw")
     if orientation is None:
@@ -283,6 +368,15 @@ def require_block_pickup_model(preset):
     normalize_vector(model.get("approach_axis_xyz_base"),
                      "approach_axis_xyz_base")
     return model
+
+
+def require_joint_values(preset, field):
+    values = preset.get(field)
+    if not isinstance(values, (list, tuple)) or len(values) != 6:
+        raise RuntimeError(
+            "Preset must contain six %s values; copy them from the Tag preset."
+            % field)
+    return [finite_scalar(value, field) for value in values]
 
 
 def compute_constrained_block_grasp_pose(anchor_pose, pickup_model, entry,
@@ -374,7 +468,7 @@ def load_or_create_block_preset(path, config):
         return load_block_preset(path)
     return {
         "version": BLOCK_PRESET_VERSION,
-        "base_frame": config.get("base_frame", "base"),
+        "base_frame": config["base_frame"],
         "targets": {},
     }
 
@@ -404,12 +498,34 @@ def pose_to_text(name, pose_stamped):
 
 def prompt_enter(message):
     print_utf8(message)
-    try:
-        text = raw_input("> ")
-    except NameError:
-        text = input("> ")
-    if text.strip().lower() in ("q", "quit", "exit"):
-        raise RuntimeError("User aborted taught block workflow.")
+    while True:
+        try:
+            text = raw_input("> ")
+        except NameError:
+            text = input("> ")
+        normalized = text.strip().lower()
+        if normalized in ("q", "quit", "exit"):
+            raise RuntimeError("User aborted taught block workflow.")
+        if not normalized:
+            return
+        print_utf8(
+            u"这里只接受空 Enter 确认，输入 q 可退出；粘贴的命令不会触发机械臂。")
+
+
+def build_teach_assist_pose(localization, orientation, config):
+    distance_mm = finite_scalar(
+        config["teach_assist_distance_mm"],
+        "teach_assist_distance_mm")
+    if distance_mm <= 0.0:
+        raise RuntimeError("teach_assist_distance_mm must be positive.")
+    surface_pose = pose_from_base_mm(
+        localization["base_frame"], localization["base_xyz_mm"], orientation)
+    return build_pregrasp_from_grasp(
+        surface_pose,
+        localization["camera_forward_base"],
+        distance_mm,
+        localization["base_frame"],
+    )
 
 
 def build_pre_place_pose(place_pose, place_gap_m, base_frame):
@@ -481,6 +597,7 @@ def get_action(args):
         ("preview_taught_block", args.preview_taught_block),
         ("stop_at_taught_pre_grasp", args.stop_at_taught_pre_grasp),
         ("run_taught_block", args.run_taught_block),
+        ("run_chassis_sequence", args.run_chassis_sequence),
     ]
     enabled = [name for name, selected in actions if selected]
     if len(enabled) != 1:
@@ -495,7 +612,7 @@ def capture_rgb_once(config):
     except ImportError as exc:
         raise RuntimeError("RGB ROS dependencies are unavailable: %s" % exc)
     bridge = CvBridge()
-    timeout = finite_scalar(config.get("rgb_timeout", 5.0), "rgb_timeout")
+    timeout = finite_scalar(config["rgb_timeout"], "rgb_timeout")
     camera_info = rospy.wait_for_message(
         config["camera_info_topic"], CameraInfo, timeout=timeout)
     image_msg = rospy.wait_for_message(config["rgb_topic"], Image, timeout=timeout)
@@ -513,7 +630,7 @@ def capture_rgb_once(config):
         raise RuntimeError("RGB image has an invalid zero timestamp.")
     age = max(0.0, (rospy.Time.now() - stamp).to_sec())
     max_age = finite_scalar(
-        config.get("image_max_age_seconds", 1.0), "image_max_age_seconds")
+        config["image_max_age_seconds"], "image_max_age_seconds")
     if age > max_age:
         raise RuntimeError(
             "RGB image is stale: age %.3fs exceeds %.3fs." % (age, max_age))
@@ -653,7 +770,7 @@ def run_live_preview(args, config, detector):
 
 def collect_all_observations(args, config, detector):
     action = get_action(args)
-    frames_required = int(args.frames or config.get("frames_required", 10))
+    frames_required = int(args.frames or config["frames_required"])
     if frames_required <= 0:
         raise RuntimeError("frames must be positive.")
     rules = {
@@ -725,7 +842,7 @@ def collect_all_observations(args, config, detector):
 
 def collect_observations(args, config, detector):
     action = get_action(args)
-    frames_required = int(args.frames or config.get("frames_required", 10))
+    frames_required = int(args.frames or config["frames_required"])
     if frames_required <= 0:
         raise RuntimeError("frames must be positive.")
     rules = {
@@ -738,7 +855,7 @@ def collect_observations(args, config, detector):
     seen_stamps = set()
     last_capture = None
     timeout = finite_scalar(
-        config.get("observation_timeout", 12.0), "observation_timeout")
+        config["observation_timeout"], "observation_timeout")
     deadline = time.time() + timeout
     latest_filter_error = None
     max_attempts = max(frames_required * 8, frames_required + 20)
@@ -808,6 +925,363 @@ def collect_observations(args, config, detector):
     )
 
 
+def target_number(config, target):
+    metadata = config["target_classes"].get(target) or {}
+    try:
+        return int(metadata["target_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise RuntimeError("Target %s has no valid target_id." % target)
+
+
+def make_chassis_twist(linear_x):
+    message = Twist()
+    message.linear.x = float(linear_x)
+    message.linear.y = message.linear.z = 0.0
+    message.angular.x = message.angular.y = message.angular.z = 0.0
+    return message
+
+
+def stop_chassis(publisher):
+    for _index in range(5):
+        publisher.publish(make_chassis_twist(0.0))
+        rospy.sleep(0.03)
+
+
+def chassis_alignment_error_px(result):
+    return max(
+        float(result.left) - float(result.center_x),
+        float(result.center_x) - float(result.right),
+        0.0,
+    )
+
+
+class ChassisVelocityKeeper(object):
+    """Refresh the latest fresh command while synchronous ONNX inference runs."""
+
+    def __init__(self, publisher, control_hz, command_max_age_seconds):
+        self._publisher = publisher
+        self._max_age = float(command_max_age_seconds)
+        self._speed = 0.0
+        self._updated_at = 0.0
+        self._closed = False
+        self._timer = rospy.Timer(
+            rospy.Duration(1.0 / float(control_hz)), self._refresh)
+
+    def publish(self, message):
+        self._speed = float(message.linear.x)
+        self._updated_at = time.time()
+        self._publisher.publish(message)
+
+    def _refresh(self, _event):
+        if self._closed:
+            return
+        speed = self._speed
+        if speed and time.time() - self._updated_at > self._max_age:
+            speed = 0.0
+            self._speed = 0.0
+        self._publisher.publish(make_chassis_twist(speed))
+
+    def shutdown(self):
+        self._closed = True
+        self._timer.shutdown()
+        stop_chassis(self._publisher)
+
+
+def require_chassis_sequence_config(config):
+    settings = config.get("chassis_sequence")
+    if not isinstance(settings, dict):
+        raise RuntimeError("Config must contain chassis_sequence settings.")
+    order = str(settings.get("order", "")).strip().lower()
+    if order not in ("left_to_right", "sequence"):
+        raise RuntimeError(
+            "chassis_sequence.order must be left_to_right or sequence.")
+    positive_fields = (
+        "drive_speed",
+        "stable_frames",
+        "max_align_seconds",
+        "progress_reset_px",
+        "control_hz",
+        "command_max_age_seconds",
+        "startup_home_wait_seconds",
+    )
+    for field in positive_fields:
+        if finite_scalar(settings.get(field), "chassis_sequence.%s" % field) <= 0.0:
+            raise RuntimeError("chassis_sequence.%s must be positive." % field)
+    stable_frames = finite_scalar(
+        settings.get("stable_frames"), "chassis_sequence.stable_frames")
+    if int(stable_frames) != stable_frames:
+        raise RuntimeError("chassis_sequence.stable_frames must be an integer.")
+    nonnegative_fields = (
+        "align_tolerance_px",
+        "chassis_settle_seconds",
+        "startup_home_settle_seconds",
+    )
+    for field in nonnegative_fields:
+        if finite_scalar(settings.get(field), "chassis_sequence.%s" % field) < 0.0:
+            raise RuntimeError(
+                "chassis_sequence.%s must be non-negative." % field)
+    if str(settings.get("target_right_motion")) not in ("forward", "backward"):
+        raise RuntimeError(
+            "chassis_sequence.target_right_motion must be forward or backward.")
+    for field in ("cmd_vel_topic", "startup_home_service"):
+        if not isinstance(settings.get(field), STRING_TYPES) or not settings[field].strip():
+            raise RuntimeError("chassis_sequence.%s must not be empty." % field)
+    return settings
+
+
+def validate_chassis_sequence_preset(path, targets):
+    preset = load_block_preset(path)
+    require_block_pickup_model(preset)
+    require_joint_values(preset, "carry_joint_values")
+    require_joint_values(preset, "idle_joint_values")
+    for target in targets:
+        entry = preset.get("targets", {}).get(target)
+        if not isinstance(entry, dict):
+            raise RuntimeError("Preset file is missing target %s." % target)
+        if "grasp_offset_xyz_base" not in entry or "place_ee_in_base" not in entry:
+            raise RuntimeError(
+                "Preset target %s must contain grasp_offset_xyz_base and "
+                "place_ee_in_base." % target)
+    return preset
+
+
+def request_sequence_detections(args, config, detector, remaining_targets):
+    capture = capture_rgb_once(config)
+    response = request_detection(detector, None, capture["rgb"])
+    rules = {
+        "confidence_min": config["confidence_min"],
+        "box_width_min_px": config["box_width_min_px"],
+        "box_aspect_ratio_min": config["box_aspect_ratio_min"],
+        "box_aspect_ratio_max": config["box_aspect_ratio_max"],
+    }
+    detections = []
+    for detection in response_detections(response):
+        target = detection.get("target") if isinstance(detection, dict) else None
+        if target not in remaining_targets:
+            continue
+        usable, _reason = is_detection_usable(detection, rules)
+        if usable:
+            detections.append(detection)
+    if args.show_rgb:
+        observations = [detection_to_observation(item) for item in detections]
+        show_rgb_debug(
+            capture["rgb"], detections, observations, 1,
+            roi_ratio=config["grasp_roi_ratio"])
+    return capture, detections
+
+
+def select_next_sequence_target(args, config, detector, remaining_targets,
+                                settings):
+    if settings["order"] == "sequence":
+        return remaining_targets[0]
+    rate = rospy.Rate(float(settings["control_hz"]))
+    while not rospy.is_shutdown():
+        try:
+            _capture, detections = request_sequence_detections(
+                args, config, detector, remaining_targets)
+        except Exception as exc:
+            if "No usable YOLO detections" not in safe_log_text(exc):
+                rospy.logwarn_throttle(
+                    2.0, "YOLO sequence selection failed: %s",
+                    ascii_log_text(exc))
+            rate.sleep()
+            continue
+        if detections:
+            detections.sort(
+                key=lambda item: detection_to_observation(item)["u"])
+            target = detections[0]["target"]
+            rospy.loginfo(
+                "Visible remaining targets left-to-right: %s; selecting %d=%s.",
+                [item["target"] for item in detections],
+                target_number(config, target), ascii_log_text(target))
+            return target
+        rospy.logwarn_throttle(
+            5.0, "Waiting for a remaining block target: %s",
+            [ascii_log_text(item) for item in remaining_targets])
+        rate.sleep()
+    raise TerminationRequested(
+        "ROS shut down while waiting for a remaining block target.")
+
+
+def align_sequence_target(args, config, detector, target, publisher, settings):
+    stable = 0
+    last_stamp_ns = None
+    last_result = None
+    best_error_px = None
+    confirmation_required = False
+    deadline = time.time() + float(settings["max_align_seconds"])
+    progress_reset_px = float(settings["progress_reset_px"])
+    rate = rospy.Rate(float(settings["control_hz"]))
+    target_right_forward = settings["target_right_motion"] == "forward"
+    while not rospy.is_shutdown() and time.time() < deadline:
+        try:
+            capture, detections = request_sequence_detections(
+                args, config, detector, [target])
+        except Exception as exc:
+            stable = 0
+            publisher.publish(make_chassis_twist(0.0))
+            if "No usable YOLO detections" not in safe_log_text(exc):
+                rospy.logwarn_throttle(
+                    2.0, "YOLO chassis alignment failed: %s",
+                    ascii_log_text(exc))
+            rate.sleep()
+            continue
+        if capture["stamp_ns"] == last_stamp_ns:
+            publisher.publish(make_chassis_twist(0.0))
+            rate.sleep()
+            continue
+        last_stamp_ns = capture["stamp_ns"]
+        if not detections:
+            stable = 0
+            publisher.publish(make_chassis_twist(0.0))
+            rospy.logwarn_throttle(
+                2.0, "Waiting for target %d=%s before chassis alignment.",
+                target_number(config, target), ascii_log_text(target))
+            rate.sleep()
+            continue
+        detection = max(
+            detections, key=lambda item: float(item.get("confidence", 0.0)))
+        height, width = capture["rgb"].shape[:2]
+        roi_pixels = roi_ratio_to_pixels(
+            config["grasp_roi_ratio"], width, height)
+        result = compute_drive_command(
+            detection,
+            roi_pixels,
+            float(settings["drive_speed"]),
+            float(settings["align_tolerance_px"]),
+            target_right_forward,
+        )
+        last_result = result
+        alignment_error_px = chassis_alignment_error_px(result)
+        if (best_error_px is None or
+                alignment_error_px <= best_error_px - progress_reset_px):
+            best_error_px = alignment_error_px
+            deadline = time.time() + float(settings["max_align_seconds"])
+        publisher.publish(make_chassis_twist(result.linear_x))
+        rospy.loginfo_throttle(
+            1.0,
+            "Chassis align %d=%s center=%.1f window=[%.1f, %.1f] "
+            "cmd_vel=%.3f.",
+            target_number(config, target), ascii_log_text(target),
+            result.center_x, result.left, result.right, result.linear_x)
+        if result.aligned:
+            if not confirmation_required:
+                stop_chassis(publisher)
+                rospy.loginfo(
+                    "Target %d=%s entered ROI; settling chassis for %.2fs.",
+                    target_number(config, target), ascii_log_text(target),
+                    float(settings["chassis_settle_seconds"]))
+                rospy.sleep(float(settings["chassis_settle_seconds"]))
+                stable = 0
+                confirmation_required = True
+                # Unlike the Tag relay, monocular ONNX inference is synchronous
+                # and may take several seconds per fresh frame. Keep the same
+                # stable-frame gate, but allow the normal alignment timeout.
+                deadline = time.time() + float(settings["max_align_seconds"])
+            else:
+                stable += 1
+                stop_chassis(publisher)
+                rospy.loginfo(
+                    "Target %d=%s stopped confirmation: %d/%d fresh frames.",
+                    target_number(config, target), ascii_log_text(target),
+                    stable, int(settings["stable_frames"]))
+                if stable >= int(settings["stable_frames"]):
+                    rospy.loginfo(
+                        "Target %d=%s alignment confirmed with %d fresh frames.",
+                        target_number(config, target), ascii_log_text(target), stable)
+                    return
+        else:
+            stable = 0
+            if confirmation_required:
+                rospy.logwarn(
+                    "Target %d=%s left ROI after settling; resuming slow alignment.",
+                    target_number(config, target), ascii_log_text(target))
+                deadline = time.time() + float(settings["max_align_seconds"])
+                best_error_px = None
+            confirmation_required = False
+        rate.sleep()
+    stop_chassis(publisher)
+    detail = ""
+    if last_result is not None:
+        detail = (
+            " No progress for %.1fs. Last center=%.1f, "
+            "window=[%.1f, %.1f], cmd_vel=%.3f."
+            % (float(settings["max_align_seconds"]), last_result.center_x,
+               last_result.left, last_result.right, last_result.linear_x))
+    raise RuntimeError(
+        "Target %d=%s chassis alignment timed out.%s" % (
+            target_number(config, target), target, detail))
+
+
+def run_sequence_startup_home(config, target, settings, skip):
+    if skip:
+        return
+    service_name = settings["startup_home_service"]
+    rospy.loginfo(
+        "Target %d=%s completed; calling startup home service %s.",
+        target_number(config, target), ascii_log_text(target), service_name)
+    rospy.wait_for_service(
+        service_name, timeout=float(settings["startup_home_wait_seconds"]))
+    response = rospy.ServiceProxy(service_name, Trigger)()
+    if not response.success:
+        raise RuntimeError(
+            "Startup home failed after target %s: %s" % (
+                target, safe_log_text(response.message)))
+    rospy.sleep(float(settings["startup_home_settle_seconds"]))
+
+
+def wait_between_sequence_targets(config, target, index, total):
+    print_utf8(
+        u"%d=%s 已完成（%d/%d）。准备好下一个物块后按 Enter；输入 q 回车退出。" % (
+            target_number(config, target), safe_log_text(target), index, total))
+    try:
+        line = raw_input("> ")
+    except NameError:
+        line = input("> ")
+    if line.strip().lower() in ("q", "quit", "exit"):
+        raise RuntimeError("User stopped the chassis sequence.")
+
+
+def run_block_chassis_sequence(args, config, detector):
+    settings = require_chassis_sequence_config(config)
+    targets = parse_target_sequence(args.sequence, config)
+    if not args.align_only:
+        validate_chassis_sequence_preset(args.preset_file, targets)
+    raw_publisher = rospy.Publisher(
+        settings["cmd_vel_topic"], Twist, queue_size=1)
+    publisher = ChassisVelocityKeeper(
+        raw_publisher, settings["control_hz"],
+        settings["command_max_age_seconds"])
+    remaining_targets = list(targets)
+    total = len(remaining_targets)
+    completed = 0
+    try:
+        while remaining_targets and not rospy.is_shutdown():
+            target = select_next_sequence_target(
+                args, config, detector, remaining_targets, settings)
+            rospy.loginfo(
+                "Starting slow chassis alignment for %d=%s.",
+                target_number(config, target), ascii_log_text(target))
+            align_sequence_target(
+                args, config, detector, target, publisher, settings)
+            stop_chassis(publisher)
+            if not args.align_only:
+                args.block_target = target
+                localization = compute_block_localization(
+                    args, config, detector)
+                do_run_taught_block_mono(
+                    args, config, localization, "run_taught_block")
+                run_sequence_startup_home(
+                    config, target, settings, args.skip_startup_home)
+            remaining_targets.remove(target)
+            completed += 1
+            if args.wait_key_between_targets and remaining_targets:
+                wait_between_sequence_targets(
+                    config, target, completed, total)
+    finally:
+        publisher.shutdown()
+
+
 def pose_from_camera_xyz_mm(frame_id, camera_xyz_mm):
     point = PoseStamped()
     point.header.frame_id = frame_id
@@ -868,23 +1342,23 @@ def build_localization_from_observations(target, observations, capture, args, co
     )
     fx, fy, cx, cy = camera_info_intrinsics(capture["camera_info"])
     z_mm = estimate_distance_from_box_mm(
-        config.get("distance_method", "theory"),
+        config["distance_method"],
         stable["w"],
         stable["h"],
         fx,
         fy,
         config["target_size_mm"],
-        config.get("target_height_mm", config["target_size_mm"]),
+        config["target_height_mm"],
         target,
-        config.get("distance_models", {}),
+        config["distance_models"],
         config.get("fixed_z_mm"),
-        config.get("max_axis_distance_disagreement_mm", 20.0),
+        config["max_axis_distance_disagreement_mm"],
     )
     camera_xyz = deproject_pixel_to_camera_mm(
         stable["u"], stable["v"], z_mm, fx, fy, cx, cy)
     camera_frame = getattr(capture["header"], "frame_id", "") or config["camera_frame"]
-    base_frame = config.get("base_frame", "base")
-    tf_timeout = finite_scalar(config.get("tf_timeout", 5.0), "tf_timeout")
+    base_frame = config["base_frame"]
+    tf_timeout = finite_scalar(config["tf_timeout"], "tf_timeout")
     surface_base = transform_camera_point(
         listener, base_frame, camera_frame, camera_xyz, tf_timeout)
     reference_camera = (camera_xyz[0], camera_xyz[1], camera_xyz[2] + 100.0)
@@ -906,7 +1380,7 @@ def build_localization_from_observations(target, observations, capture, args, co
         "h": stable["h"],
         "center_std_px": stable["center_std_px"],
         "width_cv": stable["width_cv"],
-        "distance_method": config.get("distance_method", "theory"),
+        "distance_method": config["distance_method"],
         "z_mm": z_mm,
         "camera_xyz_mm": camera_xyz,
         "base_xyz_mm": surface_base,
@@ -998,8 +1472,8 @@ def pose_from_base_mm(base_frame, xyz_mm, orientation):
 
 
 def validate_workspace(point_mm, config, label):
-    z_min = finite_scalar(config.get("base_min_z_mm", 40.0), "base_min_z_mm")
-    radius_max = finite_scalar(config.get("base_max_radius_mm", 500.0), "base_max_radius_mm")
+    z_min = finite_scalar(config["base_min_z_mm"], "base_min_z_mm")
+    radius_max = finite_scalar(config["base_max_radius_mm"], "base_max_radius_mm")
     x, y, z = finite_vector3(point_mm, label)
     if z < z_min:
         raise RuntimeError("%s z %.2f below %.2f mm." % (label, z, z_min))
@@ -1018,11 +1492,11 @@ def validate_pose_workspace(pose_stamped, config, label):
 
 def build_move_group(config, group_name):
     arm = moveit_commander.MoveGroupCommander(group_name)
-    arm.set_pose_reference_frame(config.get("base_frame", "base"))
+    arm.set_pose_reference_frame(config["base_frame"])
     arm.allow_replanning(True)
-    arm.set_max_velocity_scaling_factor(float(config.get("velocity_scale", 0.05)))
-    arm.set_max_acceleration_scaling_factor(float(config.get("acceleration_scale", 0.05)))
-    arm.set_planning_time(float(config.get("planning_time", 5.0)))
+    arm.set_max_velocity_scaling_factor(float(config["velocity_scale"]))
+    arm.set_max_acceleration_scaling_factor(float(config["acceleration_scale"]))
+    arm.set_planning_time(float(config["planning_time"]))
     return arm
 
 
@@ -1159,22 +1633,30 @@ def do_wrist_forward(config, group_name, joint5_target):
         raise RuntimeError("Failed to move wrist forward.")
 
 
-def _require_overwrite(entry, field, args, target):
-    if field in entry and not args.overwrite:
-        raise RuntimeError(
-            "Preset target %s already contains %s. Use --overwrite to update it."
-            % (target, field))
-
-
 def record_block_grasp(args, config, localization, arm, preset):
     target = require_taught_target(args, "teach_block_grasp")
     targets = preset.setdefault("targets", {})
     entry = targets.setdefault(target, {})
-    _require_overwrite(entry, "grasp_offset_xyz_base", args, target)
+    if "grasp_offset_xyz_base" in entry:
+        print_utf8(
+            u"%s 已有抓取示教；本次完整示教成功后自动替换，"
+            u"中途失败会保留旧值。" % safe_log_text(target))
 
     pickup_model = preset.get("pickup_model")
+    current_orientation = copy.deepcopy(
+        arm.get_current_pose().pose.orientation)
+    assist_pose = build_teach_assist_pose(
+        localization, current_orientation, config)
+    assist_distance_mm = finite_scalar(
+        config["teach_assist_distance_mm"],
+        "teach_assist_distance_mm")
+    rospy.loginfo(pose_to_text("block_teach_assist_front", assist_pose))
     prompt_enter(
-        u"示教模式不会自动移动机械臂，也不会自动改变 joint5。\n"
+        u"确认路径安全，按 Enter 自动移动到 %s 检测表面前约 %.0fmm。\n"
+        u"本步保持当前末端姿态，不套用旧抓取姿态。" % (
+            safe_log_text(target), assist_distance_mm))
+    execute_pose(arm, assist_pose, "block_teach_assist_front")
+    prompt_enter(
         u"请在 RViz 中 Plan/Execute 到能可靠吸住 %s 的接触姿态，"
         u"确认到位后按 Enter 记录；不要用手掰机械臂。" %
         safe_log_text(target))
@@ -1190,10 +1672,18 @@ def record_block_grasp(args, config, localization, arm, preset):
     return entry
 
 
-def record_block_place(args, config, arm, preset):
-    target = require_taught_target(args, "teach_block_place")
+def block_place_teach_targets(args, config):
+    if args.block_target is not None:
+        return [args.block_target]
+    return parse_target_sequence(args.sequence, config)
+
+
+def record_block_place(arm, preset, target):
     entry = preset.setdefault("targets", {}).setdefault(target, {})
-    _require_overwrite(entry, "place_ee_in_base", args, target)
+    if "place_ee_in_base" in entry:
+        print_utf8(
+            u"%s 已有放置点；本次确认记录后自动替换，"
+            u"中途退出会保留旧值。" % safe_log_text(target))
     prompt_enter(
         u"请在 RViz 中移动到 %s 对应载物仓的释放姿态。\n"
         u"Plan/Execute 到位后按 Enter 记录；不要用手掰机械臂。" %
@@ -1210,13 +1700,25 @@ def do_teach_block_mono(args, config, localization, action):
     target = args.block_target
     if action == "teach_block_grasp":
         record_block_grasp(args, config, localization, arm, preset)
-    else:
-        record_block_place(args, config, arm, preset)
-    preset["base_frame"] = config.get("base_frame", "base")
-    save_block_preset(args.preset_file, preset, overwrite=True)
-    rospy.loginfo(
-        "Saved taught block preset for %s: %s",
-        ascii_log_text(target), ascii_log_text(args.preset_file))
+        preset["base_frame"] = config["base_frame"]
+        save_block_preset(args.preset_file, preset, overwrite=True)
+        rospy.loginfo(
+            "Saved taught block preset for %s: %s",
+            ascii_log_text(target), ascii_log_text(args.preset_file))
+        return
+
+    targets = block_place_teach_targets(args, config)
+    for index, target in enumerate(targets, 1):
+        print_utf8(
+            u"开始示教放置点 %d/%d：%s" % (
+                index, len(targets), safe_log_text(target)))
+        record_block_place(arm, preset, target)
+        preset["base_frame"] = config["base_frame"]
+        save_block_preset(args.preset_file, preset, overwrite=True)
+        rospy.loginfo(
+            "Saved block place %d/%d for %s: %s",
+            index, len(targets), ascii_log_text(target),
+            ascii_log_text(args.preset_file))
 
 
 def do_teach_block_joints(args, config, action):
@@ -1247,13 +1749,12 @@ def do_run_taught_block_mono(args, config, localization, action):
             "Preset target %s must contain grasp_offset_xyz_base and place_ee_in_base."
             % target)
     pickup_model = require_block_pickup_model(preset)
-    arm = build_move_group(config, args.group)
     anchor_pose = block_anchor_pose_from_localization(localization, config)
     grasp_pose = compute_constrained_block_grasp_pose(
         anchor_pose, pickup_model, entry, localization["base_frame"])
     pre_grasp_pose = build_constrained_block_pregrasp(
         grasp_pose, pickup_model,
-        config.get("pregrasp_distance_mm", 80.0),
+        config["pregrasp_distance_mm"],
         localization["base_frame"],
     )
     place_pose = transform_to_pose(
@@ -1277,11 +1778,13 @@ def do_run_taught_block_mono(args, config, localization, action):
     if action == "preview_taught_block":
         rospy.logwarn("Preview only: no arm motion or pump command executed.")
         return
+    arm = build_move_group(config, args.group)
     if action == "stop_at_taught_pre_grasp":
         execute_pose(arm, pre_grasp_pose, "taught_block_pre_grasp")
         rospy.logwarn("Stopped at taught pre-grasp; pump was not enabled.")
         return
 
+    carry_joint_values = require_joint_values(preset, "carry_joint_values")
     pump_proxy = get_pump_proxy()
     holding_object = False
     try:
@@ -1291,8 +1794,7 @@ def do_run_taught_block_mono(args, config, localization, action):
         holding_object = True
         rospy.sleep(0.8)
         execute_cartesian_pose(arm, pre_grasp_pose, "taught_block_retreat")
-        if preset.get("carry_joint_values"):
-            execute_joint_values(arm, preset["carry_joint_values"], "block_carry")
+        execute_joint_values(arm, carry_joint_values, "block_carry")
         execute_pose(arm, pre_place_pose, "taught_block_pre_place")
         execute_cartesian_pose(
             arm, place_pose, "taught_block_place",
@@ -1321,7 +1823,7 @@ def do_block_mono(args, config):
     action = get_action(args)
     if action == "calib_record" and args.known_z_mm is None:
         raise RuntimeError("--calib-record requires --known-z-mm.")
-    if action in ("teach_block_grasp", "teach_block_place",
+    if action in ("teach_block_grasp",
                   "preview_taught_block", "stop_at_taught_pre_grasp",
                   "run_taught_block"):
         require_taught_target(args, action)
@@ -1331,6 +1833,10 @@ def do_block_mono(args, config):
         if action == "live_preview":
             detector = DetectorClient(request_stream, response_stream)
             run_live_preview(args, config, detector)
+            return
+        if action == "run_chassis_sequence":
+            detector = DetectorClient(request_stream, response_stream)
+            run_block_chassis_sequence(args, config, detector)
             return
         if action in ("teach_block_place", "teach_block_idle", "teach_block_carry"):
             localization = None
@@ -1368,7 +1874,9 @@ def do_block_mono(args, config):
 
 def main():
     global MOTION_SETTLE_SECONDS
+    signal.signal(signal.SIGTERM, raise_termination_requested)
     args = parse_args(sys.argv)
+    enable_parent_death_signal(args.supervisor_pid)
     config = load_config(args.config)
     if args.base_frame:
         config["base_frame"] = args.base_frame
@@ -1392,11 +1900,16 @@ def main():
             raise RuntimeError("--confidence must be in (0, 1].")
         config["confidence_min"] = confidence
     MOTION_SETTLE_SECONDS = finite_scalar(
-        config.get("motion_settle_seconds", 0.25), "motion_settle_seconds")
+        config["motion_settle_seconds"], "motion_settle_seconds")
 
-    rospy.init_node("mirobot_pick_test", anonymous=True)
-    moveit_commander.roscpp_initialize(sys.argv)
+    moveit_initialized = False
+    motion_lock = None
     try:
+        rospy.init_node("mirobot_pick_test", anonymous=True)
+        motion_lock = acquire_motion_lock(args)
+        if action_uses_moveit(args):
+            moveit_commander.roscpp_initialize(sys.argv)
+            moveit_initialized = True
         if args.mode == "home":
             do_home(config, args.group)
         elif args.mode == "pump":
@@ -1417,7 +1930,10 @@ def main():
         rospy.logerr("%s", ascii_log_text(exc))
         raise
     finally:
-        moveit_commander.roscpp_shutdown()
+        if moveit_initialized:
+            moveit_commander.roscpp_shutdown()
+        if motion_lock is not None:
+            motion_lock.close()
 
 
 if __name__ == "__main__":
