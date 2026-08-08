@@ -42,6 +42,23 @@ def rotated_rect(binary, center, size, angle):
 
 
 class LaneGeometryTests(unittest.TestCase):
+    def test_lane_center_weights_near_rows_more_than_far_rows(self):
+        detector = line_new.LaneDetector(
+            roi_top=0.2, roi_bottom=0.9, center_near_weight=3.0
+        )
+        points = [(100.0, 100), (300.0, 400)]
+
+        weighted = detector._weighted_center_x(points, 480)
+
+        self.assertGreater(weighted, 200.0)
+        self.assertLess(weighted, 300.0)
+
+    def test_lane_center_weight_does_not_move_straight_center(self):
+        detector = line_new.LaneDetector(center_near_weight=3.0)
+        points = [(320.0, 100), (320.0, 250), (320.0, 430)]
+
+        self.assertEqual(detector._weighted_center_x(points, 480), 320.0)
+
     def test_positive_follow_bias_moves_control_target_right(self):
         self.assertEqual(line_new.control_target_x(300.0, 35.0), 335.0)
 
@@ -1761,13 +1778,14 @@ class TaskEntryAlignmentLockTests(unittest.TestCase):
         if restore is not None:
             restore()
 
-    def test_locked_entry_alignment_keeps_using_first_bar_angle(self):
+    def test_lost_bar_alignment_keeps_using_last_bar_angle(self):
         follower = self._follower(now=20.0)
         self._restore_rospy = follower._restore_rospy
         follower.last_crosswalk.candidate = True
         follower.last_crosswalk.stop_angle = 10.0
 
         follower._set_state("ALIGN")
+        follower._lock_entry_alignment(20.0, 10.0)
         follower.last_crosswalk.stop_angle = -25.0
         handled, next_state = follower._run_locked_entry_alignment(20.01)
 
@@ -1775,12 +1793,13 @@ class TaskEntryAlignmentLockTests(unittest.TestCase):
         self.assertIsNone(next_state)
         self.assertLess(follower.published[-1][1], 0.0)
 
-    def test_locked_entry_alignment_enters_maneuver_after_rotation_and_settle(self):
+    def test_lost_bar_alignment_finishes_after_rotation_and_settle(self):
         follower = self._follower(now=20.0)
         self._restore_rospy = follower._restore_rospy
         follower.last_crosswalk.candidate = True
         follower.last_crosswalk.stop_angle = 10.0
         follower._set_state("ALIGN")
+        follower._lock_entry_alignment(20.0, 10.0)
 
         handled, next_state = follower._run_locked_entry_alignment(25.0)
 
@@ -1827,7 +1846,8 @@ class TaskYoloTests(unittest.TestCase):
         follower.yolo_stop_enabled = yolo_stop_enabled
         follower.yolo_debug_view = False
         follower.yolo_confidence = 0.5
-        follower.yolo_building_confidence = 0.4
+        follower.yolo_trash_confidence = 0.65
+        follower.yolo_building_confidence = 0.65
         follower.yolo_center_band_ratio = 0.8
         follower.yolo_class_names = line_task.YOLO_CLASS_NAMES
         follower.yolo_street_model_path = "/tmp/street.onnx"
@@ -1843,6 +1863,8 @@ class TaskYoloTests(unittest.TestCase):
         follower.yolo_stop_detection = None
         follower.yolo_stop_reported = False
         follower.yolo_stop_report_seq = 0
+        follower.yolo_event_ignore_time = 4.0
+        follower.yolo_accept_after = 0.0
         follower.yolo_lock = threading.Lock()
         follower.yolo_switch_lock = threading.Lock()
         follower.yolo_latest_seq = 0
@@ -1893,7 +1915,8 @@ class TaskYoloTests(unittest.TestCase):
                          line_task.YOLO_STREET_MODEL_PATH)
         self.assertEqual(line_task.YOLO_IMAGE_SIZE, 320)
         self.assertEqual(line_task.YOLO_CONFIDENCE, 0.60)
-        self.assertEqual(line_task.YOLO_BUILDING_CONFIDENCE, 0.40)
+        self.assertEqual(line_task.YOLO_TRASH_CONFIDENCE, 0.65)
+        self.assertEqual(line_task.YOLO_BUILDING_CONFIDENCE, 0.65)
 
     def test_line_operation_doc_uses_separate_task_models(self):
         doc_path = os.path.abspath(os.path.join(
@@ -2303,6 +2326,129 @@ class TaskYoloTests(unittest.TestCase):
         )
         self.assertIsNone(ledger.select_event(context, [general], 0.5))
 
+    def test_people_majority_requires_stable_frames_for_both_classes(self):
+        def detection(class_id, class_name, confidence, x1):
+            return line_task.YoloDetection(
+                class_id, class_name, confidence,
+                (x1, 20, x1 + 20, 80), (100, 200, 3), 0.8,
+            )
+
+        context = line_task.yolo_route_context(1, "FOLLOW")
+        medical_majority = [
+            detection(1, "Medical population", 0.90, 70),
+            detection(1, "Medical population", 0.85, 95),
+            detection(0, "General population", 0.93, 120),
+        ]
+        ledger = line_task.YoloTaskLedger()
+        self.assertIsNone(ledger.select_event(
+            context, medical_majority, 0.5, people_stable_frames=3
+        ))
+        self.assertIsNone(ledger.select_event(
+            context, medical_majority, 0.5, people_stable_frames=3
+        ))
+        event = ledger.select_event(
+            context, medical_majority, 0.5, people_stable_frames=3
+        )
+        self.assertEqual(event.class_name, "Medical population")
+        self.assertEqual(event.display_name, "医疗人群")
+
+        general_majority = [
+            detection(0, "General population", 0.86, 70),
+            detection(0, "General population", 0.82, 95),
+            detection(1, "Medical population", 0.95, 120),
+        ]
+        ledger = line_task.YoloTaskLedger()
+        self.assertIsNone(ledger.select_event(
+            context, general_majority, 0.5, people_stable_frames=2
+        ))
+        event = ledger.select_event(
+            context, general_majority, 0.5, people_stable_frames=2
+        )
+        self.assertEqual(event.class_name, "General population")
+        self.assertEqual(event.display_name, "普通人群")
+
+    def test_people_tie_resets_stable_majority(self):
+        context = line_task.yolo_route_context(1, "FOLLOW")
+        medical = line_task.YoloDetection(
+            1, "Medical population", 0.9,
+            (70, 20, 90, 80), (100, 200, 3), 0.8,
+        )
+        general = line_task.YoloDetection(
+            0, "General population", 0.9,
+            (100, 20, 120, 80), (100, 200, 3), 0.8,
+        )
+        ledger = line_task.YoloTaskLedger()
+        self.assertIsNone(ledger.select_event(
+            context, [medical, medical], 0.5, people_stable_frames=2
+        ))
+        self.assertIsNone(ledger.select_event(
+            context, [medical, general], 0.5, people_stable_frames=2
+        ))
+        self.assertIsNone(ledger.select_event(
+            context, [medical, medical], 0.5, people_stable_frames=2
+        ))
+        event = ledger.select_event(
+            context, [medical, medical], 0.5, people_stable_frames=2
+        )
+        self.assertEqual(event.class_name, "Medical population")
+
+    def test_trash_and_building_use_fixed_065_confidence(self):
+        street_context = line_task.yolo_route_context(1, "FOLLOW")
+        low_trash = line_task.YoloDetection(
+            2, "hazardous waste", 0.64,
+            (70, 20, 110, 80), (100, 200, 3), 0.8,
+        )
+        high_trash = line_task.YoloDetection(
+            2, "hazardous waste", 0.66,
+            (70, 20, 110, 80), (100, 200, 3), 0.8,
+        )
+        ledger = line_task.YoloTaskLedger()
+        self.assertIsNone(ledger.select_event(
+            street_context, [low_trash], 0.60,
+            trash_confidence=line_task.YOLO_TRASH_CONFIDENCE,
+        ))
+        self.assertEqual(ledger.select_event(
+            street_context, [high_trash], 0.60,
+            trash_confidence=line_task.YOLO_TRASH_CONFIDENCE,
+        ).class_name, "hazardous waste")
+
+        building_context = line_task.yolo_route_context(4, "FOLLOW")
+        low_building = line_task.YoloDetection(
+            0, "Collapsed Building", 0.64,
+            (70, 20, 110, 80), (100, 200, 3), 0.8,
+        )
+        high_building = line_task.YoloDetection(
+            0, "Collapsed Building", 0.66,
+            (70, 20, 110, 80), (100, 200, 3), 0.8,
+        )
+        ledger = line_task.YoloTaskLedger()
+        self.assertIsNone(ledger.select_event(
+            building_context, [low_building], 0.60,
+            building_confidence=line_task.YOLO_BUILDING_CONFIDENCE,
+        ))
+        self.assertEqual(ledger.select_event(
+            building_context, [high_building], 0.60,
+            building_confidence=line_task.YOLO_BUILDING_CONFIDENCE,
+        ).class_name, "Collapsed Building")
+
+    def test_yolo_stop_return_to_follow_starts_four_second_guard(self):
+        follower = self._follower(now=20.0)
+        self._restore_rospy = follower._restore_rospy
+        follower.state = "YOLO_STOP"
+
+        follower._set_state("FOLLOW")
+
+        self.assertEqual(follower.yolo_accept_after, 24.0)
+        polled = []
+        follower._poll_yolo_detections = lambda: polled.append(True) or (
+            True, []
+        )
+        stopped = follower._maybe_enter_yolo_stop(
+            types.SimpleNamespace(valid=True)
+        )
+        self.assertFalse(stopped)
+        self.assertEqual(polled, [])
+
     def test_task_ledger_accepts_building_area_and_class_once(self):
         ledger = line_task.YoloTaskLedger()
         context = line_task.yolo_route_context(4, "FOLLOW")
@@ -2384,9 +2530,9 @@ class TaskYoloTests(unittest.TestCase):
             finally:
                 line_task.rospy.loginfo = original_loginfo
 
-            self.assertIn("C区检测到人群：医疗人群1个", logs)
+            self.assertIn("C区识别到医疗人群", logs)
             files = os.listdir(root)
-            self.assertEqual(files, ["01_C区_医疗人群1个.jpg"])
+            self.assertEqual(files, ["01_C区_医疗人群.jpg"])
             saved = line_task.cv2.imread(os.path.join(root, files[0]))
             self.assertGreater(int(np.count_nonzero(saved)), 0)
         finally:
@@ -2413,7 +2559,7 @@ class TaskYoloTests(unittest.TestCase):
             follower._report_yolo_task_event([detection])
 
             saved = line_task.cv2.imread(os.path.join(
-                root, "01_C区_医疗人群1个.jpg"
+                root, "01_C区_医疗人群.jpg"
             ))
             cyan = (
                 (saved[:, :, 0] > 150)

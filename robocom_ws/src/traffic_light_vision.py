@@ -10,6 +10,7 @@ import numpy as np
 
 
 TRAFFIC_LIGHT_CLASS_NAMES = ("Green", "Red", "Yellow")
+TRAFFIC_CAMERA_EXPOSURE = 15
 
 
 def traffic_camera_command(camera_index):
@@ -17,7 +18,7 @@ def traffic_camera_command(camera_index):
     return [
         "v4l2-ctl", "-d", "/dev/video%d" % int(camera_index),
         "-c", "exposure_auto=1",
-        "-c", "exposure_absolute=30",
+        "-c", "exposure_absolute=%d" % TRAFFIC_CAMERA_EXPOSURE,
         "-c", "white_balance_temperature_auto=0",
         "-c", "white_balance_temperature=4600",
         "-c", "exposure_auto_priority=0",
@@ -183,7 +184,8 @@ def update_green_hits(detections, current_hits, required_hits):
 
 
 def draw_traffic_light(frame, detections, color=None, green_hits=0,
-                       required_hits=2):
+                       required_hits=2,
+                       exposure=TRAFFIC_CAMERA_EXPOSURE):
     output = frame.copy()
     colors = {
         "Green": (0, 255, 0),
@@ -204,4 +206,9 @@ def draw_traffic_light(frame, detections, color=None, green_hits=0,
     )
     cv2.putText(output, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
                 0.55, (255, 255, 255), 2)
+    cv2.putText(
+        output, "exposure_absolute=%d" % int(exposure),
+        (8, 44), cv2.FONT_HERSHEY_SIMPLEX,
+        0.5, (255, 255, 255), 2,
+    )
     return output

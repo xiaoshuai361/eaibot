@@ -73,8 +73,6 @@ def draw_status(frame, green_ready, fps):
 def run(args):
     confidence = max(0.01, min(1.0, float(args.confidence)))
     green_required = max(1, int(args.green_frames))
-    if not args.skip_camera_config:
-        configure_traffic_camera(args.camera)
 
     detector = TrafficLightDetector(
         args.model,
@@ -90,6 +88,8 @@ def run(args):
 
     try:
         capture = open_camera(args.camera)
+        if not args.skip_camera_config:
+            configure_traffic_camera(args.camera)
         print("红绿灯测试已启动：camera=%d model=%s" %
               (args.camera, detector.model_path))
         print("窗口中绿色框=Green，红色框=Red，黄色框=Yellow；按 q 或 Esc 退出")

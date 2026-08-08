@@ -55,6 +55,26 @@ TRAFFIC_LIGHT_CONFIDENCE = 0.55 # 红绿灯单帧最低置信度；漏检可降�
 # ===== 模型路径（部署前检查） =====
 TRAFFIC_LIGHT_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/traffic_lights_yolov5n_320_best.onnx"
 
+# ===== 路口时序快速调参 =====
+STOP_STABLE_FRAMES = 3    # 入口横条确认帧数；误触发就加。
+ENTRY_MIN_STRIPES = 1     # 入口最少斑马条数；边线误报就加。
+ALIGN_STABLE_FRAMES = 8   # 摆正稳定帧数；容易误通过就加。
+ALIGN_LOCK_SETTLE_TIME = 0.15 # 横条丢失补转后的稳定时间(s)。
+ALIGN_OPEN_LOOP_TIME_SCALE = 1.0 # 丢失后按最后角度补转；不额外超调。
+ALIGN_OPEN_LOOP_MIN_TIME = 0.05 # 横条丢失后最短补转时间(s)。
+ALIGN_OPEN_LOOP_MAX_TIME = 5.0 # 横条丢失后最长补转时间(s)。
+ALIGN_TIMEOUT = 5.0       # 入口摆正最长等待时间(s)。
+LOST_LIMIT = 7            # 入口横条允许丢失帧数；偶发丢线就加。
+EXIT_ALIGN_LOST_FRAMES = 5 # 出口横条丢失多少帧后恢复巡线。
+WAIT_RECOVER_FRAMES = 3   # 等待状态重新确认入口的帧数。
+TURN_ENTRY_TIME = 6.5     # 摆正后盲区直行时间(s)；起转太早加，太晚减。
+TURN_TIME = 3.5           # 固定转弯时间(s)；转不够加，转过头减。
+MANEUVER_MIN_TIME = 1.0   # 路口最短通过时间(s)；过早识别出口就加。
+MANEUVER_MAX_TIME = 14.0  # 路口最长通过时间(s)；出口漏检后恢复巡线。
+ENTRY_CLEAR_FRAMES = 6    # 入口横条消失确认帧数；入口被当出口就加。
+EXIT_BAR_FRAMES = 1       # 出口横条确认帧数；误触发就加。
+EXIT_ENTRY_IGNORE_TIME = 2.0 # 出口完成后忽略横条时间(s)；重复触发就加。
+
 # ===== 场地光照快速调参（固定曝光后再调整） =====
 BLACK_V_MAX = 160         # 黑线断裂就加；阴影和地面杂物变多就降。
 ADAPTIVE_BLOCK_SIZE = 31  # 局部阈值窗口，必须为大于 1 的奇数；光照变化范围大可加。
@@ -72,19 +92,19 @@ APPROACH_SPEED = 0.16     # 靠近横条 linear.x 前进速度(m/s)；冲过横�
 MANEUVER_SPEED = 0.16     # 路口内 linear.x 前进速度(m/s)；路口通过慢可小幅加。
 MANEUVER_CENTER_BIAS_PIXELS = 40.0 # 直行路口避障量；只填正数，数值越大避让越多。
 MAX_ANGULAR = 0.50       # angular.z 偏航角速度上限(rad/s)；只影响转头快慢，不提高前进速度。
+FOLLOW_LEFT_ANGULAR_SCALE = 0.60 # 所有巡线左弯力度；左弯太猛就减小。
+FOLLOW_RIGHT_ANGULAR_SCALE = 1.00 # 巡线右弯力度；右弯正常保持 1.0。
 
-# 左右转只需要调整下面四项；直行路口和普通巡线不使用这些参数。！！！
-TURN_ENTRY_TIME = 6.8     # 摆正后进入盲区的直行时间(s)；起转太早加，太晚减。
+# 左右转固定控制；直行路口和普通巡线不使用这两项。
 TURN_SPEED = 0.16         # 盲区直行和固定转弯线速度(m/s)。
 TURN_ANGULAR = 0.7        # 固定转弯角速度绝对值(rad/s)；越大转弯半径越小。
-TURN_TIME = 3.4          # 固定转弯持续时间(s)；转不够就加，转过头就减。
 
 KP = 0.0015              # 小误差比例；直线摆动就降，轻微修正不够就加。
 KD = 0.0008              # 小误差阻尼；直线摆动就加，反应迟钝或尖峰大时降。
 LARGE_ERROR_THRESHOLD_PIXELS = 136.0 # 误差达到此值切换急转 PD；太晚切换就减小。
-LARGE_ERROR_KP = 0.0024 # 大误差比例；急弯拐不过就加，转得过猛就减。
+LARGE_ERROR_KP = 0.0028 # 大误差比例；急弯拐不过就加，转得过猛就减。
 LARGE_ERROR_KD = 0.01  # 大误差阻尼；急弯摆动就加，响应尖峰过大就减。
-ANGULAR_SMOOTH = 0.88    # 转向保留比例；加大更平稳但迟钝，减小更灵敏。
+ANGULAR_SMOOTH = 0.80    # 转向保留比例；加大更平稳但迟钝，减小更灵敏。
 
 # ===== 车道边线 =====
 ROI_TOP = 0.2           # 识别区域上边界；减小看得更远，但更容易收到远处干扰。
@@ -92,9 +112,10 @@ ROI_BOTTOM = 0.92       # 识别区域下边界；增大看得更近，车头遮
 LANE_WIDTH_PIXELS = 620.0 # 车道内边缘间距；按当前 640 宽处理图估算，实测后可微调。
 FILL_WIDTH_PIXELS = 620.0 # 路口直行模型补线间距；路口内偏移时再调。
 LEFT_FILL_WIDTH_PIXELS = 620.0 # 只看到左边线时使用；增大会让目标向右移。
-RIGHT_FILL_WIDTH_PIXELS = 580.0 # 只看到右边线时使用；减小会让目标向右移。
+RIGHT_FILL_WIDTH_PIXELS = 620.0 # 只看到右边线时使用；减小会让目标向右移。
 FOLLOW_CENTER_BIAS_PIXELS = 0.0 # 巡线目标横向偏置；正数向右、负数向左，固定偏航先调这里。
 SCAN_ROWS = 9                 # 水平扫描行数；加大更稳但稍慢，过少容易漏线。
+LANE_CENTER_NEAR_WEIGHT = 3.0 # 最下方中心点权重；弯道切内线就加。
 MIN_SEGMENT_WIDTH = 4        # 最小黑段宽度；噪点多就加，细线漏检就减。
 MAX_SEGMENT_WIDTH_RATIO = 0.18 # 最大黑段占画面宽度；大黑块误识别就减。
 DEFAULT_LANE_WIDTH_RATIO = 0.60 # 尚未学习时的默认车道宽度比例。
@@ -149,8 +170,6 @@ BAR_ONLY_MIN_THICKNESS_RATIO = 0.010 # 纯横条最小厚度；细线误报就�
 BAR_ONLY_MAX_THICKNESS_RATIO = 0.075 # 纯横条最大厚度；大块误报就减。
 
 # ===== 横条时间防抖与纯横条通道 =====
-STOP_STABLE_FRAMES = 1       # 入口连续确认帧数；误触发就加，反应太慢就减。
-EXIT_ENTRY_IGNORE_TIME = 2 # 出口摆正后继续巡线且忽略新横条的时间(s)。
 STOP_NEAR_RATIO = 0.8       # 横条接近画面底部比例；停得太早加，太晚减。
 STOP_CENTER_WIDTH_RATIO = 0.15 # 底部停车区占画面中央宽度比例；减小可排除两侧干扰。
 BAR_ONLY_STABLE_FRAMES = 1   # 无竖纹时横条连续确认帧数；误识别就加，出现太慢就减。
@@ -163,24 +182,16 @@ BAR_TRACK_HOLD_FRAMES = 1    # 横条短暂丢失保持帧数；闪烁就加，�
 BAR_TRACK_SMOOTH = 0.25      # 横条位置历史保留比例；当前帧占 75%，框跟随迟钝就继续减。
 
 # ===== 停车摆正 =====
-ALIGN_TOLERANCE_DEG = 3.0    # 横条水平容差；难以完成摆正就加，要求更正就减。
-ALIGN_STABLE_FRAMES = 5      # 摆正稳定帧数；容易误通过就加，等待太久就减。
-ALIGN_KP = 0.025             # 摆正转向比例；摆正太慢就加，来回过冲就减。
+ALIGN_TOLERANCE_DEG = 2.0    # 横条水平容差；难以完成摆正就加，要求更正就减。
+ALIGN_KP = 0.018             # 摆正转向比例；摆正太慢就加，来回过冲就减。
 ALIGN_MIN_ANGULAR = 0.08     # 摆正最小角速度；小误差转不动就加。
-ALIGN_MAX_ANGULAR = 0.35     # 摆正最大角速度；转得太猛就减，太慢可加。
-LOST_LIMIT = 7               # 横条允许丢失帧数；偶发丢线就加，错误等待太久就减。
-EXIT_ALIGN_LOST_FRAMES = 5   # 出口摆正横条连续丢失帧数；防止单帧闪烁提前恢复巡线。
-ALIGN_TIMEOUT = 5.0          # 摆正最长时间；横条仍稳定时超时会按放宽角度进入。
+ALIGN_MAX_ANGULAR = 0.20     # 摆正最大角速度；转得太猛就减，太慢可加。
+ALIGN_LOST_FALLBACK_ENABLED = True # 横条丢失时用最后角度完成补转。
 ALIGN_ENTRY_MAX_ANGLE = 10.0 # 超时进入路口允许的最大横条角度；入场太斜就减。
 ALIGN_ENTRY_MIN_STRIPES = 3  # 超时进入至少需要的竖条数；误进入就加。
-WAIT_RECOVER_FRAMES = 3      # WAIT 中重新确认入口的连续帧数；误恢复就加。
 
 # ===== 路口通过与双边透视补线 =====
-MANEUVER_MIN_TIME = 1.0      # 路口最短通过时间；过早恢复巡线就加。
-MANEUVER_MAX_TIME = 14.0     # 未识别到出口横条时，超过此时间恢复普通巡线。
 MANEUVER_LOOKAHEAD_RATIO = 0.60 # 路口中心线前视控制行；减小看得更远，增大看得更近。
-ENTRY_CLEAR_FRAMES = 6       # 入口斑马线消失确认；入口被当出口就加。
-EXIT_BAR_FRAMES = 1          # 第二条横条连续确认帧数；误触发就加，退出太慢就减。
 RANSAC_RESIDUAL_PIXELS = 12.0 # 直线内点容差像素；线断/抖就加，圆角混入就减。
 RANSAC_MIN_INLIERS = 4       # 直线最少内点数；误拟合就加，难锁定就减。
 MODEL_HOLD_FRAMES = 8        # 边线丢失后保持帧数；短暂丢线就加，旧线残留就减。
@@ -379,7 +390,8 @@ class LaneObservation(object):
 class LaneDetector(object):
     def __init__(self, roi_top=ROI_TOP, roi_bottom=ROI_BOTTOM, scan_rows=SCAN_ROWS,
                  fill_width=0.0, left_fill_width=None,
-                 right_fill_width=None):
+                 right_fill_width=None,
+                 center_near_weight=LANE_CENTER_NEAR_WEIGHT):
         self.roi_top = float(roi_top)
         self.roi_bottom = float(roi_bottom)
         self.scan_rows = int(scan_rows)
@@ -388,6 +400,20 @@ class LaneDetector(object):
                                 else float(left_fill_width))
         self.right_fill_width = (self.fill_width if right_fill_width is None
                                  else float(right_fill_width))
+        self.center_near_weight = max(1.0, float(center_near_weight))
+
+    def _weighted_center_x(self, center_points, frame_height):
+        top_y = float(frame_height) * self.roi_top
+        bottom_y = float(frame_height) * self.roi_bottom
+        span = max(1.0, bottom_y - top_y)
+        weights = [
+            1.0 + (self.center_near_weight - 1.0)
+            * clamp((float(y) - top_y) / span, 0.0, 1.0)
+            for _, y in center_points
+        ]
+        return float(np.average(
+            [x for x, _ in center_points], weights=weights
+        ))
 
     def points(self, binary, center_x=None):
         height, width = binary.shape[:2]
@@ -491,7 +517,7 @@ class LaneDetector(object):
         else:
             active_side = max(set(used_sides), key=used_sides.count)
         return LaneObservation(
-            np.average([x for x, _ in center_points]), True, len(widths),
+            self._weighted_center_x(center_points, height), True, len(widths),
             left_points, right_points, measured, active_side, center_points,
             virtual_left_points=virtual_left,
             virtual_right_points=virtual_right,
@@ -1483,7 +1509,10 @@ class LaneFollower(object):
         self.maneuver_phase = "NONE"
         self.maneuver_phase_started = self.state_started
         self.entry_accept_after = 0.0
+        self.align_lock = None
+        self.align_last_angle = None
         self.last_angular = 0.0
+        self.last_command_angular = 0.0
         self.last_control_target = None
         self.last_observation = None
         self.last_crosswalk = CrosswalkResult()
@@ -1506,6 +1535,7 @@ class LaneFollower(object):
                 and getattr(self, "maneuver_phase", None) == "TURN"):
             angular_limit = max(MAX_ANGULAR, abs(self.turn_angular))
         angular = clamp(float(angular), -angular_limit, angular_limit)
+        self.last_command_angular = angular
         command = Twist()
         command.linear.x = float(linear)
         command.linear.y = command.linear.z = 0.0
@@ -1520,6 +1550,9 @@ class LaneFollower(object):
         deviation = target_x - width * 0.5
         kp, kd, _ = pd_gains(deviation)
         raw = self.pid.update(deviation, kp, kd)
+        direction_scale = FOLLOW_LEFT_ANGULAR_SCALE \
+            if raw > 0.0 else FOLLOW_RIGHT_ANGULAR_SCALE
+        raw *= direction_scale
         angular = ANGULAR_SMOOTH * self.last_angular + (1.0 - ANGULAR_SMOOTH) * raw
         self.last_angular = angular
         self.publish(speed, angular)
@@ -1572,7 +1605,6 @@ class LaneFollower(object):
             pass
 
     def _open_traffic_light(self):
-        configure_traffic_camera(self.traffic_light_camera_index)
         camera = CameraReader(
             self.traffic_light_camera_index,
             TRAFFIC_LIGHT_FRAME_WIDTH,
@@ -1582,6 +1614,11 @@ class LaneFollower(object):
             camera.release()
             raise RuntimeError("无法打开红绿灯摄像头 %d" %
                                self.traffic_light_camera_index)
+        try:
+            configure_traffic_camera(self.traffic_light_camera_index)
+        except Exception:
+            camera.release()
+            raise
         detector = TrafficLightDetector(
             self.traffic_light_model_path,
             confidence=self.traffic_light_confidence,
@@ -1642,6 +1679,58 @@ class LaneFollower(object):
             rospy.loginfo("line_cy_new 连续识别到绿灯，释放模型并进入路口")
             self._set_state("MANEUVER")
 
+    def _lock_entry_alignment(self, now=None, angle=None):
+        if angle is None:
+            cross = getattr(self, "last_crosswalk", None)
+            if cross is None:
+                self.align_lock = None
+                return False
+            if getattr(cross, "candidate", False) and cross.stop_angle is not None:
+                angle = cross.stop_angle
+            else:
+                angle = cross.tracking_angle
+        if angle is None:
+            self.align_lock = None
+            return False
+        now = rospy.get_time() if now is None else float(now)
+        angle = float(angle)
+        magnitude = clamp(abs(angle) * ALIGN_KP,
+                          ALIGN_MIN_ANGULAR, ALIGN_MAX_ANGULAR)
+        angular = 0.0 if abs(angle) <= ALIGN_TOLERANCE_DEG \
+            else (-magnitude if angle > 0.0 else magnitude)
+        rotate_time = 0.0 if angular == 0.0 else clamp(
+            np.radians(abs(angle)) / max(magnitude, 1e-6)
+            * ALIGN_OPEN_LOOP_TIME_SCALE,
+            ALIGN_OPEN_LOOP_MIN_TIME,
+            ALIGN_OPEN_LOOP_MAX_TIME,
+        )
+        self.align_lock = {
+            "angle": angle,
+            "angular": angular,
+            "rotate_until": now + rotate_time,
+            "settle_until": now + rotate_time + ALIGN_LOCK_SETTLE_TIME,
+        }
+        rospy.loginfo(
+            "line_cy_new lost-bar align angle=%.1f angular=%.2f "
+            "rotate=%.2fs settle=%.2fs",
+            self.align_lock["angle"], self.align_lock["angular"],
+            rotate_time, ALIGN_LOCK_SETTLE_TIME,
+        )
+        return True
+
+    def _run_locked_entry_alignment(self, now):
+        if self.align_lock is None:
+            return False, None
+        now = float(now)
+        if now < self.align_lock["rotate_until"]:
+            self.publish(0, self.align_lock["angular"])
+            return True, None
+        if now < self.align_lock["settle_until"]:
+            self.publish(0, 0)
+            return True, None
+        self.publish(0, 0)
+        return True, "MANEUVER"
+
     def _set_state(self, state):
         if state == self.state:
             return
@@ -1655,6 +1744,8 @@ class LaneFollower(object):
         self.last_angular = 0.0
         self.last_control_target = None
         self.lost_hits = self.align_hits = 0
+        self.align_lock = None
+        self.align_last_angle = None
         if (state == "FOLLOW"
                 and previous_state in ("EXIT_ALIGN", "MANEUVER")):
             self.stop_hits = 0
@@ -1677,7 +1768,6 @@ class LaneFollower(object):
             self.maneuver_phase_started = self.state_started
         else:
             self.maneuver_phase = "NONE"
-
     def _update_lane_width(self, observation, frame_width):
         measured = observation.measured_width
         if LANE_WIDTH_PIXELS > 0 or measured is None:
@@ -1730,10 +1820,11 @@ class LaneFollower(object):
             entry_allowed = entry_acceptance_enabled(
                 now, getattr(self, "entry_accept_after", 0.0)
             )
-            if entry_allowed:
-                entry_candidate = cross.candidate
-            else:
-                entry_candidate = False
+            entry_candidate = (
+                entry_allowed
+                and cross.candidate
+                and len(cross.stripe_polygons) >= ENTRY_MIN_STRIPES
+            )
             self.stop_hits = follow_entry_hits(
                 entry_candidate, self.stop_hits
             )
@@ -1779,26 +1870,38 @@ class LaneFollower(object):
         elif self.state == "ALIGN":
             bridge_binary = mask_crosswalk(binary, cross, include_loose=True)
             self._update_bridge(bridge_binary, frame.shape[1] * 0.5)
-            angle = cross.stop_angle if cross.candidate else cross.tracking_angle
-            visible = angle is not None
-            if angle is None:
-                self.lost_hits += 1
-                self.publish(0, 0)
-            elif abs(angle) <= ALIGN_TOLERANCE_DEG:
-                self.lost_hits = 0
-                self.align_hits += 1
-                self.publish(0, 0)
+            if self.align_lock is not None:
+                _, next_state = self._run_locked_entry_alignment(now)
+                if next_state is not None:
+                    self._set_state(self._entry_ready_state())
             else:
-                self.lost_hits = 0
-                self.align_hits = 0
-                magnitude = clamp(abs(angle) * ALIGN_KP, ALIGN_MIN_ANGULAR, ALIGN_MAX_ANGULAR)
-                self.publish(0, -magnitude if angle > 0 else magnitude)
-            next_state = alignment_next_state(
-                angle, visible, self.align_hits, self.lost_hits,
-                now - self.state_started, len(cross.stripe_polygons),
-            )
-            if next_state is not None:
-                self._set_state(self._entry_ready_state())
+                angle = cross.stop_angle if cross.candidate else cross.tracking_angle
+                if angle is None:
+                    self.lost_hits += 1
+                    if (ALIGN_LOST_FALLBACK_ENABLED
+                            and self.align_last_angle is not None
+                            and self._lock_entry_alignment(
+                                now, self.align_last_angle
+                            )):
+                        _, next_state = self._run_locked_entry_alignment(now)
+                        if next_state is not None:
+                            self._set_state(self._entry_ready_state())
+                    else:
+                        self.publish(0, 0)
+                elif abs(angle) <= ALIGN_TOLERANCE_DEG:
+                    self.align_last_angle = float(angle)
+                    self.lost_hits = 0
+                    self.align_hits += 1
+                    self.publish(0, 0)
+                else:
+                    self.align_last_angle = float(angle)
+                    self.lost_hits = 0
+                    self.align_hits = 0
+                    magnitude = clamp(abs(angle) * ALIGN_KP,
+                                      ALIGN_MIN_ANGULAR, ALIGN_MAX_ANGULAR)
+                    self.publish(0, -magnitude if angle > 0 else magnitude)
+                if self.align_hits >= ALIGN_STABLE_FRAMES:
+                    self._set_state(self._entry_ready_state())
 
         elif self.state == "EXIT_ALIGN":
             angle = cross.stop_angle if cross.candidate else cross.tracking_angle
@@ -1923,12 +2026,19 @@ class LaneFollower(object):
                      if self.last_crosswalk.stop_angle is not None
                      else self.last_crosswalk.tracking_angle)
         angle_text = "--" if bar_angle is None else "{:.1f}".format(bar_angle)
-        text = ("state={} cmd={} phase={} side={} lane={:.0f} dual={} stripes={} "
-                "bar={} angle={} hits={} cross={:.2f}").format(
+        align_lock = getattr(self, "align_lock", None)
+        align_angle = (getattr(self, "align_last_angle", None)
+                       if align_lock is None else align_lock["angle"])
+        lock_text = "--" if align_angle is None else "{:.1f}".format(align_angle)
+        text = ("state={} cmd={} phase={} side={} lane={:.0f} dual={} "
+                "ctrl={:+.2f} stripes={} bar={} angle={} lock={} hits={} "
+                "cross={:.2f}").format(
             self.state, self.turn_cmd, self.maneuver_phase,
             side, self.lane_width,
-            observation.dual_rows, len(self.last_crosswalk.stripe_polygons),
-            bar_state, angle_text, self.crosswalk.bar_only_hits,
+            observation.dual_rows,
+            getattr(self, "last_command_angular", 0.0),
+            len(self.last_crosswalk.stripe_polygons),
+            bar_state, angle_text, lock_text, self.crosswalk.bar_only_hits,
             self.last_crosswalk.confidence)
         try:
             cv2.imshow(WINDOW_NAME, frame)

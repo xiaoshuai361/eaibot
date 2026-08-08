@@ -79,7 +79,27 @@ TASK_TURN_COMMANDS = (
     "left", "straight", "left",
     "right", "straight", "right",
 )
-FINAL_EXIT_TIME = 6.0     # 第九次出口摆正后继续直行时间(s)，随后停车结束。
+
+# ===== 路口时序快速调参 =====
+STOP_STABLE_FRAMES = 3    # 入口横条确认帧数；误触发就加。
+ENTRY_MIN_STRIPES = 1     # 入口最少斑马条数；边线误报就加。
+ALIGN_STABLE_FRAMES = 8   # 摆正稳定帧数；容易误通过就加。
+ALIGN_LOCK_SETTLE_TIME = 0.15 # 横条丢失补转后的稳定时间(s)。
+ALIGN_OPEN_LOOP_TIME_SCALE = 1.0 # 丢失后按最后角度补转；不额外超调。
+ALIGN_OPEN_LOOP_MIN_TIME = 0.05 # 横条丢失后最短补转时间(s)。
+ALIGN_OPEN_LOOP_MAX_TIME = 5.0 # 横条丢失后最长补转时间(s)。
+ALIGN_TIMEOUT = 8.0       # 入口摆正最长等待时间(s)。
+LOST_LIMIT = 7            # 入口横条允许丢失帧数；偶发丢线就加。
+EXIT_ALIGN_LOST_FRAMES = 5 # 出口横条丢失多少帧后恢复巡线。
+WAIT_RECOVER_FRAMES = 3   # 等待状态重新确认入口的帧数。
+TURN_ENTRY_TIME = 6.5     # 摆正后盲区直行时间(s)；起转太早加，太晚减。
+TURN_TIME = 3.6           # 固定转弯时间(s)；转不够加，转过头减。
+MANEUVER_MIN_TIME = 1.0   # 路口最短通过时间(s)；过早识别出口就加。
+MANEUVER_MAX_TIME = 14.0  # 路口最长通过时间(s)；出口漏检后恢复巡线。
+ENTRY_CLEAR_FRAMES = 5    # 入口横条消失确认帧数；入口被当出口就加。
+EXIT_BAR_FRAMES = 1       # 出口横条确认帧数；误触发就加。
+EXIT_ENTRY_IGNORE_TIME = 2.0 # 出口完成后忽略横条时间(s)；重复触发就加。
+FINAL_EXIT_TIME = 6.0     # 第九次出口摆正后继续直行时间(s)。
 
 # ===== 速度与转向 =====
 FOLLOW_SPEED = 0.16       # 普通巡线 linear.x 前进速度(m/s)；整车过弯慢可小幅加。
@@ -87,16 +107,16 @@ APPROACH_SPEED = 0.16     # 靠近横条 linear.x 前进速度(m/s)；冲过横�
 MANEUVER_SPEED = 0.16     # 路口内 linear.x 前进速度(m/s)；路口通过慢可小幅加。
 MANEUVER_CENTER_BIAS_PIXELS = 40.0 # 直行路口避障量；只填正数，数值越大避让越多。
 MAX_ANGULAR = 0.50       # angular.z 偏航角速度上限(rad/s)；只影响转头快慢，不提高前进速度。
+FOLLOW_LEFT_ANGULAR_SCALE = 0.74 # 所有巡线左弯力度；左弯太猛就减小。
+FOLLOW_RIGHT_ANGULAR_SCALE = 1.00 # 巡线右弯力度；右弯正常保持 1.0。
 
-# 左右转只需要调整下面四项；直行路口和普通巡线不使用这些参数。！！！
-TURN_ENTRY_TIME = 6.8     # 摆正后进入盲区的直行时间(s)；起转太早加，太晚减。
+# 左右转固定控制；直行路口和普通巡线不使用这两项。
 TURN_SPEED = 0.16         # 盲区直行和固定转弯线速度(m/s)。
-TURN_ANGULAR = 0.7        # 固定转弯角速度绝对值(rad/s)；越大转弯半径越小。
-TURN_TIME = 3.4          # 固定转弯持续时间(s)；转不够就加，转过头就减。
+TURN_ANGULAR = 0.58        # 固定转弯角速度绝对值(rad/s)；越大转弯半径越小。
 
 KP = 0.0015              # 小误差比例；直线摆动就降，轻微修正不够就加。
 KD = 0.0008              # 小误差阻尼；直线摆动就加，反应迟钝或尖峰大时降。
-LARGE_ERROR_THRESHOLD_PIXELS = 136.0 # 误差达到此值切换急转 PD；太晚切换就减小。
+LARGE_ERROR_THRESHOLD_PIXELS = 120.0 # 误差达到此值切换急转 PD；太晚切换就减小。
 LARGE_ERROR_KP = 0.0028  # 大误差比例；急弯拐不过就加，转得过猛就减。
 LARGE_ERROR_KD = 0.01  # 大误差阻尼；急弯摆动就加，响应尖峰过大就减。
 ANGULAR_SMOOTH = 0.80    # 转向保留比例；加大更平稳但迟钝，减小更灵敏。
@@ -107,9 +127,10 @@ ROI_BOTTOM = 0.92       # 识别区域下边界；增大看得更近，车头遮
 LANE_WIDTH_PIXELS = 620.0 # 车道内边缘间距；按当前 640 宽处理图估算，实测后可微调。
 FILL_WIDTH_PIXELS = 620.0 # 路口直行模型补线间距；路口内偏移时再调。
 LEFT_FILL_WIDTH_PIXELS = 620.0 # 只看到左边线时使用；增大会让目标向右移。
-RIGHT_FILL_WIDTH_PIXELS = 580.0 # 只看到右边线时使用；减小会让目标向右移。
+RIGHT_FILL_WIDTH_PIXELS = 620.0 # 只看到右边线时使用；减小会让目标向右移。
 FOLLOW_CENTER_BIAS_PIXELS = 0.0 # 巡线目标横向偏置；正数向右、负数向左，固定偏航先调这里。
 SCAN_ROWS = 9                 # 水平扫描行数；加大更稳但稍慢，过少容易漏线。
+LANE_CENTER_NEAR_WEIGHT = 3.0 # 最下方中心点权重；弯道切内线就加。
 MIN_SEGMENT_WIDTH = 4        # 最小黑段宽度；噪点多就加，细线漏检就减。
 MAX_SEGMENT_WIDTH_RATIO = 0.18 # 最大黑段占画面宽度；大黑块误识别就减。
 DEFAULT_LANE_WIDTH_RATIO = 0.60 # 尚未学习时的默认车道宽度比例。
@@ -141,8 +162,8 @@ STRIPE_CENTER_X_MAX_RATIO = 0.98 # 竖条中心最大横坐标；画面边缘干
 BAR_HOUGH_MIN_LENGTH_RATIO = 0.16 # 单个横条片段最小图宽比例；短杂线多就加。
 
 BAR_MAX_ABS_ANGLE = 45.0      # 横条相对画面水平最大角度；急斜拍漏检就加。
-BAR_LANE_PARALLEL_ANGLE = 10.0 # 横条与边线方向接近到此值时判为边线。
-BAR_LANE_DISTANCE_RATIO = 0.05 # 横条中心距边线最大图宽比例；边线误报就加，误排横条就减。
+BAR_LANE_PARALLEL_ANGLE = 15.0 # 横条与边线方向接近到此值时判为边线。
+BAR_LANE_DISTANCE_RATIO = 0.07 # 横条中心距边线最大图宽比例；边线误报就加，误排横条就减。
 BAR_MERGE_ANGLE = 7.0         # 横条片段合并最大角差；半条不合并就加，乱并就减。
 BAR_MERGE_DISTANCE_RATIO = 0.035 # 共线片段法向距离；双框不合并就加。
 BAR_MERGE_GAP_RATIO = 0.14    # 共线片段最大断口；只识别半条就加，乱连就减。
@@ -164,10 +185,8 @@ BAR_ONLY_MIN_THICKNESS_RATIO = 0.010 # 纯横条最小厚度；细线误报就�
 BAR_ONLY_MAX_THICKNESS_RATIO = 0.075 # 纯横条最大厚度；大块误报就减。
 
 # ===== 横条时间防抖与纯横条通道 =====
-STOP_STABLE_FRAMES = 1       # 入口连续确认帧数；误触发就加，反应太慢就减。
-EXIT_ENTRY_IGNORE_TIME = 2 # 出口摆正后继续巡线且忽略新横条的时间(s)。
 STOP_NEAR_RATIO = 0.8       # 横条接近画面底部比例；停得太早加，太晚减。
-STOP_CENTER_WIDTH_RATIO = 0.15 # 底部停车区占画面中央宽度比例；减小可排除两侧干扰。
+STOP_CENTER_WIDTH_RATIO = 0.12 # 底部停车区占画面中央宽度比例；减小可排除两侧干扰。
 BAR_ONLY_STABLE_FRAMES = 1   # 无竖纹时横条连续确认帧数；误识别就加，出现太慢就减。
 BAR_ONLY_MIN_LENGTH_RATIO = 0.2 # 无竖纹横条最小宽度比例；误识别就加，近景短条漏检就减。
 BAR_ONLY_MAX_ABS_ANGLE = 20.0 # 无竖纹横条最大倾角；斜车道线误报就减，真实斜横条漏检就加。
@@ -178,29 +197,16 @@ BAR_TRACK_HOLD_FRAMES = 1    # 横条短暂丢失保持帧数；闪烁就加，�
 BAR_TRACK_SMOOTH = 0.25      # 横条位置历史保留比例；当前帧占 75%，框跟随迟钝就继续减。
 
 # ===== 停车摆正 =====
-ALIGN_TOLERANCE_DEG = 3.0    # 横条水平容差；难以完成摆正就加，要求更正就减。
-ALIGN_STABLE_FRAMES = 5      # 摆正稳定帧数；容易误通过就加，等待太久就减。
-ALIGN_KP = 0.025             # 摆正转向比例；摆正太慢就加，来回过冲就减。
+ALIGN_TOLERANCE_DEG = 2.0    # 横条水平容差；难以完成摆正就加，要求更正就减。
+ALIGN_KP = 0.018             # 摆正转向比例；摆正太慢就加，来回过冲就减。
 ALIGN_MIN_ANGULAR = 0.08     # 摆正最小角速度；小误差转不动就加。
-ALIGN_MAX_ANGULAR = 0.35     # 摆正最大角速度；转得太猛就减，太慢可加。
-ALIGN_LOCKED_ENTRY_ENABLED = True # 入口摆正锁定首次横条角度，不再二次追新横条。
-ALIGN_LOCK_SETTLE_TIME = 0.15 # 锁定摆正完成后原地等待时间(s)，让车身稳定。
-ALIGN_OPEN_LOOP_TIME_SCALE = 1.0 # 锁定角度换算旋转时间倍率；摆不够加，摆过头减。
-ALIGN_OPEN_LOOP_MIN_TIME = 0.05 # 锁定摆正最短旋转时间(s)。
-ALIGN_OPEN_LOOP_MAX_TIME = 1.40 # 锁定摆正最长旋转时间(s)。
-LOST_LIMIT = 7               # 横条允许丢失帧数；偶发丢线就加，错误等待太久就减。
-EXIT_ALIGN_LOST_FRAMES = 5   # 出口摆正横条连续丢失帧数；防止单帧闪烁提前恢复巡线。
-ALIGN_TIMEOUT = 5.0          # 摆正最长时间；横条仍稳定时超时会按放宽角度进入。
+ALIGN_MAX_ANGULAR = 0.20     # 摆正最大角速度；转得太猛就减，太慢可加。
+ALIGN_LOST_FALLBACK_ENABLED = True # 横条丢失时用最后角度完成补转。
 ALIGN_ENTRY_MAX_ANGLE = 10.0 # 超时进入路口允许的最大横条角度；入场太斜就减。
 ALIGN_ENTRY_MIN_STRIPES = 3  # 超时进入至少需要的竖条数；误进入就加。
-WAIT_RECOVER_FRAMES = 3      # WAIT 中重新确认入口的连续帧数；误恢复就加。
 
 # ===== 路口通过与双边透视补线 =====
-MANEUVER_MIN_TIME = 1.0      # 路口最短通过时间；过早恢复巡线就加。
-MANEUVER_MAX_TIME = 14.0     # 未识别到出口横条时，超过此时间恢复普通巡线。
 MANEUVER_LOOKAHEAD_RATIO = 0.60 # 路口中心线前视控制行；减小看得更远，增大看得更近。
-ENTRY_CLEAR_FRAMES = 6       # 入口斑马线消失确认；入口被当出口就加。
-EXIT_BAR_FRAMES = 1          # 第二条横条连续确认帧数；误触发就加，退出太慢就减。
 RANSAC_RESIDUAL_PIXELS = 12.0 # 直线内点容差像素；线断/抖就加，圆角混入就减。
 RANSAC_MIN_INLIERS = 4       # 直线最少内点数；误拟合就加，难锁定就减。
 MODEL_HOLD_FRAMES = 8        # 边线丢失后保持帧数；短暂丢线就加，旧线残留就减。
@@ -214,10 +220,13 @@ PROCESSED_WINDOW_NAME = "line_cy_task_processed" # 二值处理结果窗口名�
 
 # ===== YOLO 模型识别 =====
 YOLO_FRAME_INTERVAL = 1      # YOLO 线程每隔多少个任务摄像头新帧做一次模型推理。
-YOLO_CONFIDENCE = 0.60       # 人群和垃圾桶 YOLO 置信度阈值。
-YOLO_BUILDING_CONFIDENCE = 0.40 # 楼宇 YOLO 置信度阈值；楼宇偏低时先调这里。
+YOLO_PEOPLE_STABLE_FRAMES = 3 # 人群多数类别连续确认帧数；误识别多就加。
+YOLO_CONFIDENCE = 0.60       # 人群 YOLO 置信度阈值。
+YOLO_TRASH_CONFIDENCE = 0.65 # 垃圾桶 YOLO 置信度阈值。
+YOLO_BUILDING_CONFIDENCE = 0.65 # 楼宇 YOLO 置信度阈值。
 YOLO_CENTER_BAND_RATIO = 0.650 # 目标框中心位于画面中间此比例时才触发停车。
 YOLO_STOP_TIME = 1.0         # 模型触发后停车等待时间(s)。
+YOLO_EVENT_IGNORE_TIME = 4.0 # 每次任务识别后忽略新目标时间(s)。
 YOLO_IMAGE_SIZE = 320        # 模型训练和导出使用的输入尺寸。
 YOLO_NMS_THRESHOLD = 0.45    # ONNX 后处理 NMS 阈值；重叠框重复就减，漏框就加。
 YOLO_SAVE_DIR = "/home/eaibot/zcy/保存图片" # 任务识别图片保存目录，启动时清空。
@@ -259,6 +268,10 @@ YOLO_STREET_MESSAGES = {
     "recyclable material": ("trash", "可回收垃圾"),
     "hazardous waste": ("trash", "有害垃圾"),
 }
+YOLO_PEOPLE_CLASS_NAMES = (
+    "Medical population",
+    "General population",
+)
 YOLO_BUILDING_MESSAGES = (
     ("Fire Building", "火灾楼宇"),
     ("Collapsed Building", "坍塌楼宇"),
@@ -568,6 +581,8 @@ class YoloTaskLedger(object):
             (area, None) for area in ("楼宇A", "楼宇B", "楼宇C", "楼宇D")
         )
         self.building_seen_classes = set()
+        self.people_stable_key = None
+        self.people_stable_hits = 0
         self.pending_event = None
         self.save_index = 0
 
@@ -584,27 +599,79 @@ class YoloTaskLedger(object):
                 return area
         return None
 
+    def _reset_people_stability(self):
+        self.people_stable_key = None
+        self.people_stable_hits = 0
+
+    def _stable_people_candidate(self, area, candidates, stable_frames):
+        grouped = dict((name, []) for name in YOLO_PEOPLE_CLASS_NAMES)
+        for item in candidates:
+            if item.class_name in grouped:
+                grouped[item.class_name].append(item)
+        largest = max([len(items) for items in grouped.values()] or [0])
+        winners = [
+            name for name, items in grouped.items()
+            if largest > 0 and len(items) == largest
+        ]
+        if len(winners) != 1:
+            self._reset_people_stability()
+            return None
+        class_name = winners[0]
+        key = (str(area), class_name)
+        if key == self.people_stable_key:
+            self.people_stable_hits += 1
+        else:
+            self.people_stable_key = key
+            self.people_stable_hits = 1
+        if self.people_stable_hits < max(1, int(stable_frames)):
+            return None
+        return max(grouped[class_name], key=lambda item: item.confidence)
+
     def select_event(self, context, detections, confidence,
-                     building_confidence=None):
+                     building_confidence=None, people_stable_frames=1,
+                     trash_confidence=None):
         kind = context.get("kind")
         if kind == "street":
-            candidates = self._target_candidates(detections, confidence)
+            trash_threshold = confidence if trash_confidence is None \
+                else float(trash_confidence)
+            candidates = self._target_candidates(
+                detections, min(float(confidence), trash_threshold)
+            )
             area = self._next_street_area(context.get("areas", ()))
             if area is None:
                 return None
-            street = [
-                item for item in candidates
-                if item.class_name in YOLO_STREET_MESSAGES
-                and item.class_name not in self.street_seen_classes
-            ]
+            street = []
+            for item in candidates:
+                if (item.class_name not in YOLO_STREET_MESSAGES
+                        or item.class_name in self.street_seen_classes):
+                    continue
+                target_kind, _ = YOLO_STREET_MESSAGES[item.class_name]
+                threshold = trash_threshold if target_kind == "trash" \
+                    else float(confidence)
+                if item.confidence >= threshold:
+                    street.append(item)
             if not street:
+                self._reset_people_stability()
                 return None
-            selected = max(street, key=lambda item: item.confidence)
+            people = [
+                item for item in street
+                if item.class_name in YOLO_PEOPLE_CLASS_NAMES
+            ]
+            if people:
+                selected = self._stable_people_candidate(
+                    area, people, people_stable_frames
+                )
+                if selected is None:
+                    return None
+            else:
+                self._reset_people_stability()
+                selected = max(street, key=lambda item: item.confidence)
             _, display_name = YOLO_STREET_MESSAGES[selected.class_name]
             return YoloTaskEvent(
                 "street", area, selected.class_name, display_name, selected
             )
         if kind == "building":
+            self._reset_people_stability()
             threshold = confidence if building_confidence is None \
                 else building_confidence
             candidates = self._target_candidates(detections, threshold)
@@ -633,6 +700,7 @@ class YoloTaskLedger(object):
         if event.kind == "street":
             self.street_results[event.area] = event
             self.street_seen_classes.add(event.class_name)
+            self._reset_people_stability()
         elif event.kind == "building":
             self.building_results[event.area] = event
             self.building_seen_classes.add(event.class_name)
@@ -809,7 +877,8 @@ class LaneObservation(object):
 class LaneDetector(object):
     def __init__(self, roi_top=ROI_TOP, roi_bottom=ROI_BOTTOM, scan_rows=SCAN_ROWS,
                  fill_width=0.0, left_fill_width=None,
-                 right_fill_width=None):
+                 right_fill_width=None,
+                 center_near_weight=LANE_CENTER_NEAR_WEIGHT):
         self.roi_top = float(roi_top)
         self.roi_bottom = float(roi_bottom)
         self.scan_rows = int(scan_rows)
@@ -818,6 +887,20 @@ class LaneDetector(object):
                                 else float(left_fill_width))
         self.right_fill_width = (self.fill_width if right_fill_width is None
                                  else float(right_fill_width))
+        self.center_near_weight = max(1.0, float(center_near_weight))
+
+    def _weighted_center_x(self, center_points, frame_height):
+        top_y = float(frame_height) * self.roi_top
+        bottom_y = float(frame_height) * self.roi_bottom
+        span = max(1.0, bottom_y - top_y)
+        weights = [
+            1.0 + (self.center_near_weight - 1.0)
+            * clamp((float(y) - top_y) / span, 0.0, 1.0)
+            for _, y in center_points
+        ]
+        return float(np.average(
+            [x for x, _ in center_points], weights=weights
+        ))
 
     def points(self, binary, center_x=None):
         height, width = binary.shape[:2]
@@ -921,7 +1004,7 @@ class LaneDetector(object):
         else:
             active_side = max(set(used_sides), key=used_sides.count)
         return LaneObservation(
-            np.average([x for x, _ in center_points]), True, len(widths),
+            self._weighted_center_x(center_points, height), True, len(widths),
             left_points, right_points, measured, active_side, center_points,
             virtual_left_points=virtual_left,
             virtual_right_points=virtual_right,
@@ -1904,12 +1987,14 @@ class LaneFollower(object):
         self.yolo_frame_interval = max(1, int(rospy.get_param(
             "~yolo_frame_interval", YOLO_FRAME_INTERVAL
         )))
+        self.yolo_people_stable_frames = max(1, int(rospy.get_param(
+            "~yolo_people_stable_frames", YOLO_PEOPLE_STABLE_FRAMES
+        )))
         self.yolo_confidence = clamp(float(rospy.get_param(
             "~yolo_confidence", YOLO_CONFIDENCE
         )), 0.001, 1.0)
-        self.yolo_building_confidence = clamp(float(rospy.get_param(
-            "~yolo_building_confidence", YOLO_BUILDING_CONFIDENCE
-        )), 0.001, 1.0)
+        self.yolo_trash_confidence = YOLO_TRASH_CONFIDENCE
+        self.yolo_building_confidence = YOLO_BUILDING_CONFIDENCE
         self.yolo_center_band_ratio = clamp(float(rospy.get_param(
             "~yolo_center_band_ratio", YOLO_CENTER_BAND_RATIO
         )), 0.01, 1.0)
@@ -1938,6 +2023,9 @@ class LaneFollower(object):
         ))
         self.yolo_stop_time = max(0.0, float(rospy.get_param(
             "~yolo_stop_time", YOLO_STOP_TIME
+        )))
+        self.yolo_event_ignore_time = max(0.0, float(rospy.get_param(
+            "~yolo_event_ignore_time", YOLO_EVENT_IGNORE_TIME
         )))
         self.task_index = 0
         self.turn_cmd = TASK_TURN_COMMANDS[self.task_index]
@@ -1987,6 +2075,7 @@ class LaneFollower(object):
         self.yolo_stop_report_seq = 0
         self.yolo_segment_key = None
         self.yolo_segment_start_seq = 0
+        self.yolo_accept_after = 0.0
         self.task_ledger = YoloTaskLedger()
         self.pid = PID(KP, KD, MAX_ANGULAR)
         self.lane_width = LANE_WIDTH_PIXELS if LANE_WIDTH_PIXELS > 0 else PROCESS_WIDTH * DEFAULT_LANE_WIDTH_RATIO
@@ -2001,7 +2090,9 @@ class LaneFollower(object):
         self.maneuver_phase_started = self.state_started
         self.entry_accept_after = 0.0
         self.align_lock = None
+        self.align_last_angle = None
         self.last_angular = 0.0
+        self.last_command_angular = 0.0
         self.last_control_target = None
         self.last_observation = None
         self.last_crosswalk = CrosswalkResult()
@@ -2032,7 +2123,7 @@ class LaneFollower(object):
         return (
             self.yolo_street_model_path,
             self.yolo_street_class_names,
-            self.yolo_confidence,
+            min(self.yolo_confidence, self.yolo_trash_confidence),
         )
 
     def _create_yolo_detector(self, profile):
@@ -2124,12 +2215,16 @@ class LaneFollower(object):
         rospy.loginfo(
             "line_cy_task YOLO %s模型加载和预热完成，"
             "enabled camera=%d backend=%s model=%s interval=%d imgsz=%d "
-            "conf=%.2f building_conf=%.2f nms=%.2f stop=%s debug=%s",
+            "people_stable=%d people_conf=%.2f trash_conf=%.2f "
+            "building_conf=%.2f nms=%.2f "
+            "stop=%s debug=%s",
             self.yolo_active_profile,
             self.yolo_camera_index, self.yolo_detector.backend_name,
             self.yolo_detector.model_path, self.yolo_frame_interval,
-            self.yolo_image_size, self.yolo_confidence,
-            self.yolo_building_confidence, self.yolo_nms_threshold,
+            self.yolo_image_size, self.yolo_people_stable_frames,
+            self.yolo_confidence,
+            self.yolo_trash_confidence, self.yolo_building_confidence,
+            self.yolo_nms_threshold,
             self.yolo_stop_enabled,
             self.yolo_debug_view,
         )
@@ -2219,6 +2314,7 @@ class LaneFollower(object):
                 and getattr(self, "maneuver_phase", None) == "TURN"):
             angular_limit = max(MAX_ANGULAR, abs(self.turn_angular))
         angular = clamp(float(angular), -angular_limit, angular_limit)
+        self.last_command_angular = angular
         command = Twist()
         command.linear.x = float(linear)
         command.linear.y = command.linear.z = 0.0
@@ -2233,6 +2329,9 @@ class LaneFollower(object):
         deviation = target_x - width * 0.5
         kp, kd, _ = pd_gains(deviation)
         raw = self.pid.update(deviation, kp, kd)
+        direction_scale = FOLLOW_LEFT_ANGULAR_SCALE \
+            if raw > 0.0 else FOLLOW_RIGHT_ANGULAR_SCALE
+        raw *= direction_scale
         angular = ANGULAR_SMOOTH * self.last_angular + (1.0 - ANGULAR_SMOOTH) * raw
         self.last_angular = angular
         self.publish(speed, angular)
@@ -2302,8 +2401,6 @@ class LaneFollower(object):
             camera = shared_camera
             camera_owned = False
         else:
-            configure_traffic_camera(self.traffic_light_camera_index)
-            self.traffic_camera_configured = True
             camera = CameraReader(
                 self.traffic_light_camera_index,
                 TRAFFIC_LIGHT_FRAME_WIDTH,
@@ -2314,6 +2411,12 @@ class LaneFollower(object):
                 camera.release()
                 raise RuntimeError("无法打开红绿灯摄像头 %d" %
                                    self.traffic_light_camera_index)
+            try:
+                configure_traffic_camera(self.traffic_light_camera_index)
+                self.traffic_camera_configured = True
+            except Exception:
+                camera.release()
+                raise
         detector = TrafficLightDetector(
             self.traffic_light_model_path,
             confidence=self.traffic_light_confidence,
@@ -2379,15 +2482,16 @@ class LaneFollower(object):
             rospy.loginfo("line_cy_task 连续识别到绿灯，释放模型并进入路口")
             self._set_state("MANEUVER")
 
-    def _lock_entry_alignment(self, now=None):
-        cross = getattr(self, "last_crosswalk", None)
-        if cross is None:
-            self.align_lock = None
-            return False
-        if getattr(cross, "candidate", False) and cross.stop_angle is not None:
-            angle = cross.stop_angle
-        else:
-            angle = cross.tracking_angle
+    def _lock_entry_alignment(self, now=None, angle=None):
+        if angle is None:
+            cross = getattr(self, "last_crosswalk", None)
+            if cross is None:
+                self.align_lock = None
+                return False
+            if getattr(cross, "candidate", False) and cross.stop_angle is not None:
+                angle = cross.stop_angle
+            else:
+                angle = cross.tracking_angle
         if angle is None:
             self.align_lock = None
             return False
@@ -2410,7 +2514,7 @@ class LaneFollower(object):
             "settle_until": now + rotate_time + ALIGN_LOCK_SETTLE_TIME,
         }
         rospy.loginfo(
-            "line_cy_task locked entry align angle=%.1f angular=%.2f "
+            "line_cy_task lost-bar align angle=%.1f angular=%.2f "
             "rotate=%.2fs settle=%.2fs",
             self.align_lock["angle"], self.align_lock["angular"],
             rotate_time, ALIGN_LOCK_SETTLE_TIME,
@@ -2443,13 +2547,22 @@ class LaneFollower(object):
         self.last_angular = 0.0
         self.last_control_target = None
         self.lost_hits = self.align_hits = 0
-        if state != "ALIGN":
-            self.align_lock = None
+        self.align_lock = None
+        self.align_last_angle = None
         if (state == "FOLLOW"
                 and previous_state in ("EXIT_ALIGN", "MANEUVER")):
             self.stop_hits = 0
             self.entry_accept_after = (
                 self.state_started + EXIT_ENTRY_IGNORE_TIME
+            )
+        if state == "FOLLOW" and previous_state == "YOLO_STOP":
+            ignore_time = max(0.0, float(getattr(
+                self, "yolo_event_ignore_time", YOLO_EVENT_IGNORE_TIME
+            )))
+            self.yolo_accept_after = self.state_started + ignore_time
+            rospy.loginfo(
+                "line_cy_task 任务识别保护 %.1f 秒",
+                ignore_time,
             )
         if state in ("FOLLOW", "MANEUVER", "FINAL_EXIT", "YOLO_STOP",
                      "TRAFFIC_WAIT"):
@@ -2468,9 +2581,6 @@ class LaneFollower(object):
             self.maneuver_phase_started = self.state_started
         else:
             self.maneuver_phase = "NONE"
-        if state == "ALIGN" and ALIGN_LOCKED_ENTRY_ENABLED:
-            self._lock_entry_alignment(self.state_started)
-
     def _complete_intersection(self):
         completed = self.task_index + 1
         rospy.loginfo(
@@ -2518,27 +2628,22 @@ class LaneFollower(object):
     def _prepare_yolo_save_dir(self):
         ensure_clean_directory(self.yolo_save_dir)
 
-    def _people_count_for_event(self, event, detections):
-        count = sum(
-            1 for item in detections
-            if item.class_name == event.class_name
-            and item.confidence >= self.yolo_confidence
-        )
-        if count == 0 and event.detection is not None \
-                and event.detection.class_name == event.class_name:
-            return 1
-        return count
-
     def _save_yolo_event_image(self, event, detections):
         with self.yolo_lock:
             frame = None if self.yolo_latest_frame is None \
                 else self.yolo_latest_frame.copy()
         if frame is None:
             frame = np.zeros((1, 1, 3), dtype=np.uint8)
+        event_confidence = self.yolo_confidence
+        if event.kind == "building":
+            event_confidence = self.yolo_building_confidence
+        elif (event.kind == "street"
+              and YOLO_STREET_MESSAGES[event.class_name][0] == "trash"):
+            event_confidence = self.yolo_trash_confidence
         event_detections = [
             item for item in detections
             if item.class_name == event.class_name
-            and item.confidence >= self.yolo_confidence
+            and item.confidence >= event_confidence
         ]
         if not event_detections and event.detection is not None:
             event_detections = [event.detection]
@@ -2547,15 +2652,7 @@ class LaneFollower(object):
             draw_center_band=False,
         )
         self.task_ledger.save_index += 1
-        if event.kind == "street" and event.class_name in YOLO_STREET_MESSAGES:
-            target_kind, _ = YOLO_STREET_MESSAGES[event.class_name]
-            if target_kind == "people":
-                count = self._people_count_for_event(event, detections)
-                result = "%s%d个" % (event.display_name, count)
-            else:
-                result = event.display_name
-        else:
-            result = event.display_name
+        result = event.display_name
         filename = "%02d_%s_%s.jpg" % (
             self.task_ledger.save_index,
             safe_filename_text(event.area),
@@ -2572,11 +2669,7 @@ class LaneFollower(object):
         if event.kind == "street":
             target_kind, _ = YOLO_STREET_MESSAGES[event.class_name]
             if target_kind == "people":
-                count = self._people_count_for_event(event, detections)
-                rospy.loginfo(
-                    "%s检测到人群：%s%d个",
-                    event.area, event.display_name, count,
-                )
+                rospy.loginfo("%s识别到%s", event.area, event.display_name)
             else:
                 rospy.loginfo(
                     "%s检测到垃圾桶：%s",
@@ -2686,10 +2779,15 @@ class LaneFollower(object):
         return self.task_ledger.select_event(
             self._current_yolo_context(), detections, self.yolo_confidence,
             getattr(self, "yolo_building_confidence", self.yolo_confidence),
+            getattr(self, "yolo_people_stable_frames",
+                    YOLO_PEOPLE_STABLE_FRAMES),
+            getattr(self, "yolo_trash_confidence", YOLO_TRASH_CONFIDENCE),
         )
 
     def _maybe_enter_yolo_stop(self, observation):
         if self.state != "FOLLOW" or not self.yolo_enabled:
+            return False
+        if rospy.get_time() < getattr(self, "yolo_accept_after", 0.0):
             return False
         if self._current_yolo_context().get("kind") == "off":
             return False
@@ -2750,10 +2848,11 @@ class LaneFollower(object):
             entry_allowed = entry_acceptance_enabled(
                 now, getattr(self, "entry_accept_after", 0.0)
             )
-            if entry_allowed:
-                entry_candidate = cross.candidate
-            else:
-                entry_candidate = False
+            entry_candidate = (
+                entry_allowed
+                and cross.candidate
+                and len(cross.stripe_polygons) >= ENTRY_MIN_STRIPES
+            )
             self.stop_hits = follow_entry_hits(
                 entry_candidate, self.stop_hits
             )
@@ -2809,32 +2908,37 @@ class LaneFollower(object):
         elif self.state == "ALIGN":
             bridge_binary = mask_crosswalk(binary, cross, include_loose=True)
             self._update_bridge(bridge_binary, frame.shape[1] * 0.5)
-            locked_handled = False
-            if ALIGN_LOCKED_ENTRY_ENABLED:
-                locked_handled, next_state = self._run_locked_entry_alignment(now)
+            if self.align_lock is not None:
+                _, next_state = self._run_locked_entry_alignment(now)
                 if next_state is not None:
                     self._set_state(self._entry_ready_state())
-            if not locked_handled:
+            else:
                 angle = cross.stop_angle if cross.candidate else cross.tracking_angle
-                visible = angle is not None
                 if angle is None:
                     self.lost_hits += 1
-                    self.publish(0, 0)
+                    if (ALIGN_LOST_FALLBACK_ENABLED
+                            and self.align_last_angle is not None
+                            and self._lock_entry_alignment(
+                                now, self.align_last_angle
+                            )):
+                        _, next_state = self._run_locked_entry_alignment(now)
+                        if next_state is not None:
+                            self._set_state(self._entry_ready_state())
+                    else:
+                        self.publish(0, 0)
                 elif abs(angle) <= ALIGN_TOLERANCE_DEG:
+                    self.align_last_angle = float(angle)
                     self.lost_hits = 0
                     self.align_hits += 1
                     self.publish(0, 0)
                 else:
+                    self.align_last_angle = float(angle)
                     self.lost_hits = 0
                     self.align_hits = 0
                     magnitude = clamp(abs(angle) * ALIGN_KP,
                                       ALIGN_MIN_ANGULAR, ALIGN_MAX_ANGULAR)
                     self.publish(0, -magnitude if angle > 0 else magnitude)
-                next_state = alignment_next_state(
-                    angle, visible, self.align_hits, self.lost_hits,
-                    now - self.state_started, len(cross.stripe_polygons),
-                )
-                if next_state is not None:
+                if self.align_hits >= ALIGN_STABLE_FRAMES:
                     self._set_state(self._entry_ready_state())
 
         elif self.state == "TRAFFIC_WAIT":
@@ -3005,15 +3109,18 @@ class LaneFollower(object):
                      else self.last_crosswalk.tracking_angle)
         angle_text = "--" if bar_angle is None else "{:.1f}".format(bar_angle)
         align_lock = getattr(self, "align_lock", None)
-        lock_text = "--" if align_lock is None else "{:.1f}".format(
-            align_lock["angle"]
-        )
-        text = ("task={}/{} state={} cmd={} phase={} side={} lane={:.0f} dual={} stripes={} "
-                "bar={} angle={} lock={} hits={} cross={:.2f}").format(
+        align_angle = (getattr(self, "align_last_angle", None)
+                       if align_lock is None else align_lock["angle"])
+        lock_text = "--" if align_angle is None else "{:.1f}".format(align_angle)
+        text = ("task={}/{} state={} cmd={} phase={} side={} lane={:.0f} dual={} "
+                "ctrl={:+.2f} stripes={} bar={} angle={} lock={} hits={} "
+                "cross={:.2f}").format(
             self.task_index + 1, len(TASK_TURN_COMMANDS),
             self.state, self.turn_cmd, self.maneuver_phase,
             side, self.lane_width,
-            observation.dual_rows, len(self.last_crosswalk.stripe_polygons),
+            observation.dual_rows,
+            getattr(self, "last_command_angular", 0.0),
+            len(self.last_crosswalk.stripe_polygons),
             bar_state, angle_text, lock_text, self.crosswalk.bar_only_hits,
             self.last_crosswalk.confidence)
         try:

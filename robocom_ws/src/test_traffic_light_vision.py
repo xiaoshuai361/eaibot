@@ -59,13 +59,28 @@ class TrafficLightVisionTests(unittest.TestCase):
         expected = [
             "v4l2-ctl", "-d", "/dev/video0",
             "-c", "exposure_auto=1",
-            "-c", "exposure_absolute=30",
+            "-c", "exposure_absolute=15",
             "-c", "white_balance_temperature_auto=0",
             "-c", "white_balance_temperature=4600",
             "-c", "exposure_auto_priority=0",
         ]
         self.assertEqual(command, expected)
         self.assertEqual(calls, [expected])
+
+    def test_debug_view_displays_configured_exposure(self):
+        texts = []
+        original_put_text = cv2.putText
+        cv2.putText = lambda image, text, *args, **kwargs: (
+            texts.append(text) or image
+        )
+        try:
+            traffic.draw_traffic_light(
+                np.zeros((240, 320, 3), dtype=np.uint8), []
+            )
+        finally:
+            cv2.putText = original_put_text
+
+        self.assertIn("exposure_absolute=15", texts)
 
     def test_green_requires_consecutive_frames_and_red_resets_hits(self):
         green = [FakeDetection("Green")]
