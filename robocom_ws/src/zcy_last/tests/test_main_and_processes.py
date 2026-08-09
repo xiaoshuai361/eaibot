@@ -23,6 +23,7 @@ _install_ros_stubs()
 
 from zcy_last import main as task_main  # noqa: E402
 from zcy_last.control import processes  # noqa: E402
+from zcy_last.control import runtime  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -133,3 +134,49 @@ def test_shared_camera_occupancy_is_rejected(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="正被其他进程占用"):
         supervisor._assert_shared_camera_available()
+
+
+def test_camera_reader_applies_requested_resolution(monkeypatch):
+    settings = []
+
+    class Capture(object):
+        def isOpened(self):
+            return True
+
+        def set(self, name, value):
+            settings.append((name, value))
+
+        def release(self):
+            pass
+
+    class Thread(object):
+        def __init__(self, target):
+            self.target = target
+            self.daemon = False
+
+        def start(self):
+            pass
+
+        def join(self, _timeout):
+            pass
+
+    monkeypatch.setattr(runtime.cv2, "VideoCapture", lambda *_args: Capture())
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    reader = runtime.CameraReader(2, 320, 240)
+    reader.release()
+
+    assert settings == [
+        (runtime.cv2.CAP_PROP_FRAME_WIDTH, 320),
+        (runtime.cv2.CAP_PROP_FRAME_HEIGHT, 240),
+        (runtime.cv2.CAP_PROP_BUFFERSIZE, 1),
+    ]
+
+
+def test_pid_output_is_limited_without_algorithm_module_dependency(monkeypatch):
+    clock = iter([1.0, 1.1])
+    monkeypatch.setattr(runtime.rospy, "get_time", lambda: next(clock))
+    pid = runtime.PID(kp=10.0, kd=0.0, limit=0.5)
+
+    assert pid.update(-100.0) == pytest.approx(0.5)
+    assert pid.update(100.0) == pytest.approx(-0.5)

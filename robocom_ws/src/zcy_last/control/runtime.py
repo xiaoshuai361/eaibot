@@ -7,6 +7,17 @@ import time
 import cv2
 import rospy
 
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _set_capture_resolution(capture, width, height):
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+
 class CameraReader(object):
     def __init__(self, index, frame_width=None, frame_height=None):
         backend = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else 0
@@ -21,7 +32,7 @@ class CameraReader(object):
         self.thread = None
         if self.running:
             if frame_width is not None and frame_height is not None:
-                set_capture_resolution(self.cap, frame_width, frame_height)
+                _set_capture_resolution(self.cap, frame_width, frame_height)
             else:
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.thread = threading.Thread(target=self._loop)
@@ -76,4 +87,4 @@ class PID(object):
         output = active_kp * error + active_kd * (error - self.last_error) / dt
         self.last_error = error
         self.last_time = now
-        return clamp(output, -self.limit, self.limit)
+        return _clamp(output, -self.limit, self.limit)
