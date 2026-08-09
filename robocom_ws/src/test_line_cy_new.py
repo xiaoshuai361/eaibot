@@ -2177,7 +2177,7 @@ class TaskYoloTests(unittest.TestCase):
                                     (10, 10, 80, 80), (100, 100, 3), 0.6),
             line_task.YoloDetection(3, "General population", 0.8,
                                     (10, 10, 80, 80), (100, 100, 3), 0.6),
-            line_task.YoloDetection(7, "recyclable material", 0.85,
+            line_task.YoloDetection(7, "Recyclable waste", 0.85,
                                     (10, 10, 80, 80), (100, 100, 3), 0.6),
             line_task.YoloDetection(8, "unknown object", 0.99,
                                     (10, 10, 80, 80), (100, 100, 3), 0.6),
@@ -2185,7 +2185,7 @@ class TaskYoloTests(unittest.TestCase):
 
         self.assertEqual(
             [item.class_name for item in detections if item.target],
-            ["Fire Building", "General population", "recyclable material"],
+            ["Fire Building", "General population", "Recyclable waste"],
         )
 
     def test_yolo_center_band_uses_middle_eighty_percent(self):
@@ -2253,8 +2253,8 @@ class TaskYoloTests(unittest.TestCase):
             (
                 "General population",
                 "Medical population",
-                "hazardous waste",
-                "recyclable material",
+                "Recyclable waste",
+                "other waste",
             ),
         )
         self.assertEqual(
@@ -2275,8 +2275,8 @@ class TaskYoloTests(unittest.TestCase):
                 "General population",
                 "Medical population",
                 "Toxic Gas-contaminated Building",
-                "hazardous waste",
-                "recyclable material",
+                "Recyclable waste",
+                "other waste",
             ),
         )
         for class_name in (
@@ -2286,8 +2286,8 @@ class TaskYoloTests(unittest.TestCase):
                 "Toxic Gas-contaminated Building",
                 "General population",
                 "Medical population",
-                "recyclable material",
-                "hazardous waste"):
+                "Recyclable waste",
+                "other waste"):
             self.assertIn(class_name, line_task.YOLO_TARGET_CLASS_NAMES)
         self.assertNotIn("ID1", line_task.YOLO_CLASS_NAMES)
 
@@ -2303,7 +2303,7 @@ class TaskYoloTests(unittest.TestCase):
             (82, 31, 122, 81), (100, 200, 3), 0.8
         )
         trash = line_task.YoloDetection(
-            7, "recyclable material", 0.91,
+            7, "Recyclable waste", 0.91,
             (70, 20, 130, 90), (100, 200, 3), 0.8
         )
 
@@ -2395,11 +2395,11 @@ class TaskYoloTests(unittest.TestCase):
     def test_trash_and_building_use_fixed_065_confidence(self):
         street_context = line_task.yolo_route_context(1, "FOLLOW")
         low_trash = line_task.YoloDetection(
-            2, "hazardous waste", 0.64,
+            2, "other waste", 0.64,
             (70, 20, 110, 80), (100, 200, 3), 0.8,
         )
         high_trash = line_task.YoloDetection(
-            2, "hazardous waste", 0.66,
+            2, "other waste", 0.66,
             (70, 20, 110, 80), (100, 200, 3), 0.8,
         )
         ledger = line_task.YoloTaskLedger()
@@ -2410,7 +2410,7 @@ class TaskYoloTests(unittest.TestCase):
         self.assertEqual(ledger.select_event(
             street_context, [high_trash], 0.60,
             trash_confidence=line_task.YOLO_TRASH_CONFIDENCE,
-        ).class_name, "hazardous waste")
+        ).class_name, "other waste")
 
         building_context = line_task.yolo_route_context(4, "FOLLOW")
         low_building = line_task.YoloDetection(
@@ -2603,11 +2603,11 @@ class TaskYoloTests(unittest.TestCase):
             follower.yolo_save_dir = root
             follower.task_ledger = line_task.YoloTaskLedger()
             trash = line_task.YoloDetection(
-                6, "hazardous waste", 0.9,
+                6, "other waste", 0.9,
                 (20, 20, 80, 80), (100, 120, 3), 0.8
             )
             event = line_task.YoloTaskEvent(
-                "street", "P区", "hazardous waste", "有害垃圾", trash
+                "street", "P区", "other waste", "其他垃圾", trash
             )
             building = line_task.YoloDetection(
                 0, "Collapsed Building", 0.9,
@@ -2633,9 +2633,9 @@ class TaskYoloTests(unittest.TestCase):
             finally:
                 line_task.rospy.loginfo = original_loginfo
 
-            self.assertIn("P区检测到垃圾桶：有害垃圾", logs)
+            self.assertIn("P区检测到垃圾桶：其他垃圾", logs)
             self.assertIn("楼宇B检测到坍塌楼宇", logs)
-            self.assertIn("01_P区_有害垃圾.jpg", os.listdir(root))
+            self.assertIn("01_P区_其他垃圾.jpg", os.listdir(root))
             self.assertIn("02_楼宇B_坍塌楼宇.jpg", os.listdir(root))
         finally:
             shutil.rmtree(root, ignore_errors=True)

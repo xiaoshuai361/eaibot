@@ -203,8 +203,8 @@ YOLO_SAVE_DIR = "/home/eaibot/zcy/保存图片" # 任务识别图片保存目录
 YOLO_STREET_CLASS_NAMES = (
     "General population",
     "Medical population",
-    "hazardous waste",
-    "recyclable material",
+    "Recyclable waste",
+    "other waste",
 )
 YOLO_BUILDING_CLASS_NAMES = (
     "Collapsed Building",
@@ -219,8 +219,8 @@ YOLO_CLASS_NAMES = (
     "General population",
     "Medical population",
     "Toxic Gas-contaminated Building",
-    "hazardous waste",
-    "recyclable material",
+    "Recyclable waste",
+    "other waste",
 )
 YOLO_TARGET_CLASS_NAMES = (
     "Collapsed Building",
@@ -229,14 +229,14 @@ YOLO_TARGET_CLASS_NAMES = (
     "Toxic Gas-contaminated Building",
     "General population",
     "Medical population",
-    "hazardous waste",
-    "recyclable material",
+    "Recyclable waste",
+    "other waste",
 )
 YOLO_STREET_MESSAGES = {
     "Medical population": ("people", "医疗人群"),
     "General population": ("people", "普通人群"),
-    "recyclable material": ("trash", "可回收垃圾"),
-    "hazardous waste": ("trash", "有害垃圾"),
+    "Recyclable waste": ("trash", "可回收垃圾"),
+    "other waste": ("trash", "其他垃圾"),
 }
 YOLO_PEOPLE_CLASS_NAMES = (
     "Medical population",
