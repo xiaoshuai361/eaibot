@@ -1305,15 +1305,15 @@ class LaneFollower(object):
                     self.crosswalk.lock_current_bar()
                     self._set_state("EXIT_ALIGN")
                 elif maneuver_timeout_exits_to_follow(now - self.state_started):
-                    rospy.logwarn(
-                        "line_cy_task maneuver timeout, complete current intersection"
+                    rospy.logwarn_throttle(
+                        5.0,
+                        "line_cy_task maneuver timeout, still searching current exit"
                     )
-                    self._complete_intersection()
-                    if self.state == "FOLLOW" and observation.valid:
-                        self._control(observation.center_x, frame.shape[1], FOLLOW_SPEED,
-                                      FOLLOW_CENTER_BIAS_PIXELS)
-                    elif self.state == "FINAL_EXIT":
-                        self.publish(self.turn_speed, 0.0)
+                    if observation.valid:
+                        self._control(
+                            observation.center_x, frame.shape[1], FOLLOW_SPEED,
+                            FOLLOW_CENTER_BIAS_PIXELS,
+                        )
                     else:
                         self.publish(0, 0)
 
