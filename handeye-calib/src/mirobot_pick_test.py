@@ -186,6 +186,8 @@ def parse_args(argv):
     parser.add_argument("--run-taught-block", action="store_true")
     parser.add_argument("--run-chassis-sequence", action="store_true")
     parser.add_argument("--sequence", default="1,2,3,4")
+    parser.add_argument("--max-targets", type=int)
+    parser.add_argument("--fail-on-skip", action="store_true")
     parser.add_argument("--wait-key-between-targets", action="store_true")
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
@@ -744,15 +746,27 @@ def run_live_preview(args, config, detector):
     reported_targets = set()
     while not rospy.is_shutdown():
         started = time.time()
+        capture = None
+        detections = []
+        observations = []
         try:
             capture = capture_rgb_once(config)
-            response = request_detection(
-                detector, args.block_target, capture["rgb"])
-            detections = response_detections(response)
-            observations = [detection_to_observation(item) for item in detections]
-            new_labels = new_live_preview_labels(detections, reported_targets)
-            if new_labels:
-                print_utf8(u"检测到：" + u"，".join(new_labels))
+            try:
+                response = request_detection(
+                    detector, args.block_target, capture["rgb"])
+                detections = response_detections(response)
+                observations = [
+                    detection_to_observation(item) for item in detections]
+                new_labels = new_live_preview_labels(
+                    detections, reported_targets)
+                if new_labels:
+                    print_utf8(u"检测到：" + u"，".join(new_labels))
+            except Exception as exc:
+                error_text = safe_log_text(exc)
+                if "No usable YOLO detections" not in error_text:
+                    rospy.logwarn(
+                        "Live preview frame failed: %s",
+                        ascii_log_text(error_text))
             if not show_rgb_debug(
                     capture["rgb"], detections, observations, milliseconds=1,
                     roi_ratio=config.get(
@@ -760,9 +774,9 @@ def run_live_preview(args, config, detector):
                 return
         except Exception as exc:
             error_text = safe_log_text(exc)
-            if "No usable YOLO detections" not in error_text:
-                rospy.logwarn(
-                    "Live preview frame failed: %s", ascii_log_text(error_text))
+            rospy.logwarn(
+                "Live preview capture/display failed: %s",
+                ascii_log_text(error_text))
         remaining = period - (time.time() - started)
         if remaining > 0.0:
             rospy.sleep(remaining)
@@ -1074,8 +1088,15 @@ def select_next_sequence_target(args, config, detector, remaining_targets,
                                 settings):
     if settings["order"] == "sequence":
         return remaining_targets[0]
+    strict_deadline = None
+    if getattr(args, "fail_on_skip", False):
+        strict_deadline = time.time() + float(settings["max_align_seconds"])
     rate = rospy.Rate(float(settings["control_hz"]))
     while not rospy.is_shutdown():
+        if strict_deadline is not None and time.time() >= strict_deadline:
+            raise RuntimeError(
+                "No remaining block target became visible within %.1fs: %s"
+                % (float(settings["max_align_seconds"]), remaining_targets))
         try:
             _capture, detections = request_sequence_detections(
                 args, config, detector, remaining_targets)
@@ -1253,10 +1274,15 @@ def run_block_chassis_sequence(args, config, detector):
         raw_publisher, settings["control_hz"],
         settings["command_max_age_seconds"])
     remaining_targets = list(targets)
-    total = len(remaining_targets)
+    requested = getattr(args, "max_targets", None)
+    total = len(remaining_targets) if requested is None else int(requested)
+    if not 1 <= total <= len(remaining_targets):
+        raise RuntimeError(
+            "--max-targets must be between 1 and the sequence length.")
     completed = 0
     try:
-        while remaining_targets and not rospy.is_shutdown():
+        while (remaining_targets and completed < total
+               and not rospy.is_shutdown()):
             target = select_next_sequence_target(
                 args, config, detector, remaining_targets, settings)
             rospy.loginfo(
@@ -1275,9 +1301,13 @@ def run_block_chassis_sequence(args, config, detector):
                     config, target, settings, args.skip_startup_home)
             remaining_targets.remove(target)
             completed += 1
-            if args.wait_key_between_targets and remaining_targets:
+            if (args.wait_key_between_targets and remaining_targets
+                    and completed < total):
                 wait_between_sequence_targets(
                     config, target, completed, total)
+        if completed < total:
+            raise RuntimeError(
+                "Only %d/%d tagless targets completed." % (completed, total))
     finally:
         publisher.shutdown()
 

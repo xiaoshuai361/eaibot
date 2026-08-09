@@ -251,7 +251,7 @@ def test_pick_failure_is_missing_tf_detects_child_tf_error():
         "RuntimeError: MoveIt failed during taught_grasp.", 2) is False
 
 
-def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
+def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
     parse_args, = load_symbols("parse_args")
 
     args = parse_args([
@@ -259,25 +259,21 @@ def test_parse_args_accepts_wait_key_and_tag_tf_gate_options():
         "--sequence", "1,2",
         "--wait-key-between-tags",
         "--tag-tf-wait-seconds", "10",
-        "--tag-tf-stable-frames", "4",
         "--base-frame", "base",
         "--startup-home-service", "/mirobot_startup_home",
         "--skip-startup-home",
         "--max-detection-age-seconds", "1.5",
         "--chassis-settle-seconds", "0.8",
-        "--tag-tf-max-range-m", "0.005",
     ])
 
     assert args.sequence == [1, 2]
     assert args.wait_key_between_tags is True
     assert args.tag_tf_wait_seconds == 10.0
-    assert args.tag_tf_stable_frames == 4
     assert args.base_frame == "base"
     assert args.startup_home_service == "/mirobot_startup_home"
     assert args.skip_startup_home is True
     assert args.max_detection_age_seconds == pytest.approx(1.5)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
-    assert args.tag_tf_max_range_m == pytest.approx(0.005)
 
 
 def test_parse_args_defaults_match_competition_short_command():
@@ -295,14 +291,64 @@ def test_parse_args_defaults_match_competition_short_command():
     assert args.max_detection_age_seconds == pytest.approx(4.0)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.tag_tf_wait_seconds == pytest.approx(10.0)
-    assert args.tag_tf_stable_frames == 3
-    assert args.tag_tf_max_range_m == pytest.approx(0.005)
     assert args.startup_home_settle_seconds == pytest.approx(3.0)
-    assert args.pick_velocity_scale == pytest.approx(0.4)
-    assert args.pick_acceleration_scale == pytest.approx(0.4)
+    assert args.pick_velocity_scale == pytest.approx(0.2)
+    assert args.pick_acceleration_scale == pytest.approx(0.2)
 
 
-def test_align_tag_extends_timeout_for_settle_confirmation():
+def test_tf_gate_ignores_cached_stamp_and_accepts_next_new_tf():
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    events = []
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                align_only=False,
+                dry_run=False,
+                tag_tf_wait_seconds=1.0,
+                control_hz=5.0,
+            )
+            self.samples = [
+                100,
+                100,
+                101,
+            ]
+
+        def read_tag_tf_stamp(self, tag_id):
+            events.append(("read", tag_id))
+            return self.samples.pop(0)
+
+        def stop_chassis(self):
+            events.append(("stop",))
+
+    assert FakeSequence().wait_for_tag_tf_before_pick(3) is True
+    assert events == [("read", 3), ("read", 3), ("read", 3)]
+
+
+def test_tf_gate_times_out_when_only_cached_tf_is_available():
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    events = []
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                align_only=False,
+                dry_run=False,
+                tag_tf_wait_seconds=0.3,
+                control_hz=5.0,
+            )
+
+        def read_tag_tf_stamp(self, tag_id):
+            return 100
+
+        def stop_chassis(self):
+            events.append(("stop",))
+
+    assert FakeSequence().wait_for_tag_tf_before_pick(3) is False
+    assert events == [("stop",)]
+
+
+def test_align_tag_gives_confirmation_a_full_alignment_timeout():
     ChassisAlignPickSequence, AlignmentResult = load_symbols(
         "ChassisAlignPickSequence", "AlignmentResult")
     events = []
@@ -396,6 +442,49 @@ def test_align_tag_extends_timeout_for_settle_confirmation():
 
     assert events.count("stop") >= 2
     assert "info" in events
+
+
+def test_run_skips_alignment_timeout_and_continues_with_next_tag():
+    ChassisAlignPickSequence, AlignmentTimeout = load_symbols(
+        "ChassisAlignPickSequence", "AlignmentTimeout")
+    calls = []
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2],
+                align_only=True,
+                dry_run=False,
+                wait_key_between_tags=False,
+            )
+
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
+
+        def align_tag(self, tag_id):
+            calls.append(("align", tag_id))
+            if tag_id == 1:
+                raise AlignmentTimeout("ID1 timed out")
+
+        def run_pick(self, tag_id):
+            calls.append(("pick", tag_id))
+
+        def run_startup_home(self, tag_id):
+            calls.append(("home", tag_id))
+
+        def stop_chassis(self):
+            calls.append(("stop",))
+
+    FakeSequence().run()
+
+    assert calls == [
+        ("align", 1),
+        ("stop",),
+        ("align", 2),
+        ("pick", 2),
+        ("home", 2),
+        ("stop",),
+    ]
 
 
 def test_run_calls_controller_startup_home_after_each_successful_pick():
@@ -661,3 +750,63 @@ def test_run_does_not_require_tag_tf_for_align_only():
         ("pick", 1),
         ("stop",),
     ]
+
+
+def test_run_stops_after_requested_success_count():
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    calls = []
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2, 3, 4], max_targets=2,
+                fail_on_skip=True, align_only=True, dry_run=False,
+                wait_key_between_tags=False,
+            )
+
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
+
+        def align_tag(self, tag_id):
+            calls.append(("align", tag_id))
+
+        def run_pick(self, tag_id):
+            calls.append(("pick", tag_id))
+
+        def run_startup_home(self, tag_id):
+            calls.append(("home", tag_id))
+
+        def stop_chassis(self):
+            calls.append(("stop",))
+
+    FakeSequence().run()
+
+    assert calls == [
+        ("align", 1), ("pick", 1), ("home", 1),
+        ("align", 2), ("pick", 2), ("home", 2),
+        ("stop",),
+    ]
+
+
+def test_strict_run_fails_on_alignment_skip():
+    ChassisAlignPickSequence, AlignmentTimeout = load_symbols(
+        "ChassisAlignPickSequence", "AlignmentTimeout")
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2], max_targets=1, fail_on_skip=True,
+                align_only=True, dry_run=False, wait_key_between_tags=False,
+            )
+
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
+
+        def align_tag(self, _tag_id):
+            raise AlignmentTimeout("alignment failed")
+
+        def stop_chassis(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="alignment failed"):
+        FakeSequence().run()

@@ -45,8 +45,21 @@ except ImportError as traffic_light_import_error:
 
 
 class LaneFollower(object):
-    def __init__(self):
+    def __init__(self, grasp_coordinator=None, process_supervisor=None,
+                 enable_tag_pick=False, tag_pick_count=1,
+                 enable_untagged_pick=False, untagged_pick_count=1):
         rospy.init_node("line_cy_task", anonymous=True)
+        self.grasp_coordinator = grasp_coordinator
+        self.process_supervisor = process_supervisor
+        self.enable_tag_pick = bool(enable_tag_pick)
+        self.tag_pick_count = int(tag_pick_count)
+        self.enable_untagged_pick = bool(enable_untagged_pick)
+        self.untagged_pick_count = int(untagged_pick_count)
+        self.tag_pick_completed = not self.enable_tag_pick
+        self.untagged_pick_completed = not self.enable_untagged_pick
+        self.active_pick_kind = None
+        self.pick_recover_hits = 0
+        self.velocity_owner = "line"
         self.camera_index = int(rospy.get_param("~camera_index", CAMERA_INDEX))
         self.process_width = int(rospy.get_param("~process_width", PROCESS_WIDTH))
         self.dry_run = bool(rospy.get_param("~dry_run", DRY_RUN))
@@ -88,6 +101,7 @@ class LaneFollower(object):
             "~final_exit_time", FINAL_EXIT_TIME
         )))
         self.yolo_enabled = bool(rospy.get_param("~yolo_enabled", YOLO_ENABLED))
+        self.yolo_requested = self.yolo_enabled
         self.yolo_stop_enabled = bool(rospy.get_param(
             "~yolo_stop_enabled", YOLO_STOP_ENABLED
         ))
@@ -203,7 +217,7 @@ class LaneFollower(object):
         self.pid = PID(KP, KD, MAX_ANGULAR)
         self.lane_width = LANE_WIDTH_PIXELS if LANE_WIDTH_PIXELS > 0 else PROCESS_WIDTH * DEFAULT_LANE_WIDTH_RATIO
         self.bridge = DualLineBridge(self.lane_width, fill_width=FILL_WIDTH_PIXELS)
-        self.state = "FOLLOW"
+        self.state = "B_PICK_PREPARE" if self.enable_tag_pick else "FOLLOW"
         self.state_started = rospy.get_time()
         self.stop_hits = self.lost_hits = self.align_hits = 0
         self.wait_recover_hits = 0
@@ -224,7 +238,7 @@ class LaneFollower(object):
         if not self.camera.cap.isOpened():
             rospy.signal_shutdown("cannot open lane camera")
         self._prepare_yolo_save_dir()
-        if self.yolo_enabled:
+        if self.yolo_enabled and not self.enable_tag_pick:
             self._init_yolo()
         rospy.on_shutdown(self.cleanup)
 
@@ -261,8 +275,8 @@ class LaneFollower(object):
             class_names=class_names,
         )
 
-    def _init_yolo(self):
-        initial_profile = yolo_model_profile(self.task_index)
+    def _init_yolo(self, profile=None):
+        initial_profile = profile or yolo_model_profile(self.task_index)
         _, initial_class_names, _ = self._yolo_profile_settings(initial_profile)
         try:
             self.yolo_detector = self._create_yolo_detector(initial_profile)
@@ -356,6 +370,34 @@ class LaneFollower(object):
         self.yolo_thread.daemon = True
         self.yolo_thread.start()
 
+    def _shutdown_yolo(self):
+        """释放任务 YOLO 和共享 video2，不改变用户的启用配置。"""
+        self.yolo_running = False
+        if self.yolo_thread is not None:
+            self.yolo_thread.join(2.0)
+            self.yolo_thread = None
+        with self.yolo_switch_lock:
+            if self.yolo_detector is not None:
+                self.yolo_detector.close()
+                self.yolo_detector = None
+        if self.yolo_camera is not None:
+            self.yolo_camera.release()
+            self.yolo_camera = None
+        self.yolo_ready = False
+        self.yolo_active_profile = None
+        self._clear_yolo_cache()
+        try:
+            cv2.destroyWindow(YOLO_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+    def _resume_yolo(self, profile=None):
+        if not self.yolo_requested:
+            return True
+        self.yolo_enabled = True
+        self._init_yolo(profile)
+        return bool(self.yolo_ready)
+
     def _clear_yolo_cache(self):
         with self.yolo_lock:
             self.yolo_latest_detections = []
@@ -431,7 +473,9 @@ class LaneFollower(object):
         scale = float(self.process_width) / width
         return cv2.resize(frame, (self.process_width, int(height * scale)), interpolation=cv2.INTER_AREA)
 
-    def publish(self, linear, angular):
+    def publish(self, linear, angular, force=False):
+        if self.velocity_owner == "grasp" and not force:
+            return False
         angular_limit = MAX_ANGULAR
         if (getattr(self, "state", None) == "MANEUVER"
                 and getattr(self, "maneuver_phase", None) == "TURN"):
@@ -445,6 +489,7 @@ class LaneFollower(object):
         command.angular.z = angular
         if motion_enabled(self.dry_run):
             self.pub.publish(command)
+        return True
 
     def _control(self, center_x, width, speed, bias_pixels=0.0):
         target_x = control_target_x(center_x, bias_pixels)
@@ -657,6 +702,72 @@ class LaneFollower(object):
         self.publish(0, 0)
         return True, "MANEUVER"
 
+    def _pick_failed(self, message):
+        self.velocity_owner = "line"
+        self.publish(0, 0, force=True)
+        rospy.logerr("line_cy_task 抓取流程失败，永久停车：%s", message)
+        self._set_state("PICK_FAILED")
+
+    def _start_pick(self, kind, count, picking_state):
+        if self.grasp_coordinator is None:
+            self._pick_failed("未配置抓取协调器")
+            return
+        try:
+            self.active_pick_kind = kind
+            self.velocity_owner = "grasp"
+            self.grasp_coordinator.start(kind, count)
+            self._set_state(picking_state)
+        except Exception as exc:
+            self._pick_failed(exc)
+
+    def _finish_pick(self, kind):
+        self.velocity_owner = "line"
+        self.publish(0, 0, force=True)
+        if kind == "tag":
+            self.tag_pick_completed = True
+            profile = "street"
+        else:
+            self.untagged_pick_completed = True
+            profile = "building"
+        if not self._resume_yolo(profile):
+            self._pick_failed("共享摄像头释放后任务 YOLO 未能恢复")
+            return
+        self.active_pick_kind = None
+        self.pick_recover_hits = 0
+        self.bridge.reset(self.lane_width)
+        self.stop_hits = 0
+        self._set_state("PICK_RECOVER")
+
+    def _handle_pick_without_frame(self, now):
+        if self.state == "B_PICK_PREPARE":
+            self.publish(0, 0, force=True)
+            if now - self.state_started >= GRASP_SETTLE_TIME:
+                self._start_pick("tag", self.tag_pick_count, "B_PICKING")
+            return
+        if self.state == "A_PICK_PREPARE":
+            self.publish(0, 0, force=True)
+            if now - self.state_started >= GRASP_SETTLE_TIME:
+                self._start_pick(
+                    "untagged", self.untagged_pick_count, "A_PICKING")
+            return
+        if self.state in ("B_PICKING", "A_PICKING"):
+            success, error = self.grasp_coordinator.poll()
+            if success is None:
+                return
+            if not success:
+                self._pick_failed(error or "抓取子进程返回失败")
+                return
+            self._finish_pick(self.active_pick_kind)
+            return
+        if self.state == "PICK_FAILED":
+            self.publish(0, 0, force=True)
+
+    def _runtime_failure(self):
+        if self.process_supervisor is None:
+            return None
+        failed = self.process_supervisor.check_owned_processes()
+        return failed[0] if failed else None
+
     def _set_state(self, state):
         if state == self.state:
             return
@@ -673,7 +784,8 @@ class LaneFollower(object):
         self.align_lock = None
         self.align_last_angle = None
         if (state == "FOLLOW"
-                and previous_state in ("EXIT_ALIGN", "MANEUVER")):
+                and previous_state in ("EXIT_ALIGN", "MANEUVER",
+                                       "PICK_RECOVER")):
             self.stop_hits = 0
             self.entry_accept_after = (
                 self.state_started + EXIT_ENTRY_IGNORE_TIME
@@ -688,7 +800,7 @@ class LaneFollower(object):
                 ignore_time,
             )
         if state in ("FOLLOW", "MANEUVER", "FINAL_EXIT", "YOLO_STOP",
-                     "TRAFFIC_WAIT"):
+                     "TRAFFIC_WAIT", "PICK_RECOVER"):
             self.crosswalk.unlock_bar()
         if state == "TRAFFIC_WAIT":
             self.traffic_retry_after = self.state_started
@@ -704,6 +816,7 @@ class LaneFollower(object):
             self.maneuver_phase_started = self.state_started
         else:
             self.maneuver_phase = "NONE"
+
     def _complete_intersection(self):
         completed = self.task_index + 1
         rospy.loginfo(
@@ -716,6 +829,17 @@ class LaneFollower(object):
 
         self.task_index += 1
         self.turn_cmd = TASK_TURN_COMMANDS[self.task_index]
+        if (completed == UNTAGGED_TRIGGER_INTERSECTION
+                and self.enable_untagged_pick
+                and not self.untagged_pick_completed):
+            self.publish(0, 0, force=True)
+            self._shutdown_yolo()
+            self._set_state("A_PICK_PREPARE")
+            rospy.loginfo(
+                "line_cy_task 已完成第 %d 个路口，开始 A 点无 Tag 抓取",
+                completed,
+            )
+            return
         self._switch_yolo_profile_if_needed()
         self._set_state("FOLLOW")
         rospy.loginfo(
@@ -967,7 +1091,20 @@ class LaneFollower(object):
         self.last_binary = lane_binary
         now = rospy.get_time()
 
-        if self.state == "FOLLOW":
+        if self.state == "PICK_RECOVER":
+            self.publish(0, 0, force=True)
+            self.pick_recover_hits = self.pick_recover_hits + 1 \
+                if observation.valid else 0
+            if self.pick_recover_hits >= PICK_RECOVER_STABLE_FRAMES:
+                rospy.loginfo(
+                    "line_cy_task 抓取后车道已稳定 %d 帧，恢复循迹",
+                    self.pick_recover_hits,
+                )
+                self._set_state("FOLLOW")
+            elif now - self.state_started >= PICK_RECOVER_TIMEOUT:
+                self._pick_failed("抓取后未能重新识别车道")
+
+        elif self.state == "FOLLOW":
             entry_allowed = entry_acceptance_enabled(
                 now, getattr(self, "entry_accept_after", 0.0)
             )
@@ -1309,6 +1446,19 @@ class LaneFollower(object):
         rate = rospy.Rate(20)
         try:
             while not rospy.is_shutdown():
+                if self.state not in (
+                        "B_PICK_PREPARE", "B_PICKING",
+                        "A_PICK_PREPARE", "A_PICKING", "PICK_FAILED"):
+                    failed = self._runtime_failure()
+                    if failed is not None:
+                        self._pick_failed(
+                            "托管进程 %s 异常退出，状态码 %s" % failed)
+                if self.state in (
+                        "B_PICK_PREPARE", "B_PICKING",
+                        "A_PICK_PREPARE", "A_PICKING", "PICK_FAILED"):
+                    self._handle_pick_without_frame(rospy.get_time())
+                    rate.sleep()
+                    continue
                 ok, frame = self.camera.read(1.0)
                 if ok:
                     self.process(frame)
@@ -1323,16 +1473,12 @@ class LaneFollower(object):
             return
         self.cleaned = True
         try:
-            self.publish(0, 0)
-            self.yolo_running = False
-            if self.yolo_thread is not None:
-                self.yolo_thread.join(1.0)
-            if self.yolo_detector is not None:
-                self.yolo_detector.close()
-                self.yolo_detector = None
+            self.velocity_owner = "line"
+            self.publish(0, 0, force=True)
+            self._shutdown_yolo()
             self._close_traffic_light()
             self.camera.release()
-            if self.yolo_camera is not None:
-                self.yolo_camera.release()
+            if self.grasp_coordinator is not None:
+                self.grasp_coordinator.join(1.0)
         except Exception:
             pass

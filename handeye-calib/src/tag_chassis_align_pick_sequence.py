@@ -31,6 +31,10 @@ except NameError:
     STRING_TYPES = (str,)
 
 
+class AlignmentTimeout(RuntimeError):
+    pass
+
+
 class AlignmentResult(object):
     def __init__(self, linear_x, aligned, center_x, left, right):
         self.linear_x = float(linear_x)
@@ -260,6 +264,10 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description='Slow chassis alignment helper before taught AprilTag picking.')
     parser.add_argument('--sequence', default=DEFAULT_SEQUENCE)
+    parser.add_argument('--max-targets', type=int,
+                        help='最多成功抓取数量；默认处理完整 sequence。')
+    parser.add_argument('--fail-on-skip', action='store_true',
+                        help='任何对准、TF 或抓取跳过都按失败退出。')
     parser.add_argument('--order', choices=['left_to_right', 'sequence'],
                         default='left_to_right')
     parser.add_argument('--detections-topic', default='/tag_yolo_quiet/detections_json')
@@ -278,11 +286,7 @@ def parse_args(argv):
     parser.add_argument('--min-confidence', type=float, default=0.1)
     parser.add_argument('--base-frame', default='base')
     parser.add_argument('--tag-tf-wait-seconds', type=float, default=10.0,
-                        help='Wait this long for base->tag_N TF to stabilize before picking.')
-    parser.add_argument('--tag-tf-stable-frames', type=int, default=3,
-                        help='Required consecutive successful TF reads before picking.')
-    parser.add_argument('--tag-tf-max-range-m', type=float, default=0.005,
-                        help='Maximum xyz range across fresh TF gate samples.')
+                        help='Wait this long for a new base->tag_N TF before starting the pickup filter.')
     parser.add_argument('--target-right-motion', choices=['forward', 'backward'],
                         default='forward')
     parser.add_argument('--dry-run', action='store_true')
@@ -292,8 +296,8 @@ def parse_args(argv):
     parser.add_argument('--python2', default=sys.executable)
     parser.add_argument('--pick-script', default=DEFAULT_PICK_SCRIPT)
     parser.add_argument('--preset-file', default=DEFAULT_PRESET_FILE)
-    parser.add_argument('--pick-velocity-scale', type=float, default=0.4)
-    parser.add_argument('--pick-acceleration-scale', type=float, default=0.4)
+    parser.add_argument('--pick-velocity-scale', type=float, default=0.2)
+    parser.add_argument('--pick-acceleration-scale', type=float, default=0.2)
     parser.add_argument('--pick-motion-settle-seconds', type=float, default=0.25)
     parser.add_argument('--disable-replanning', action='store_true')
     parser.add_argument('--startup-home-service', default=DEFAULT_STARTUP_HOME_SERVICE,
@@ -305,6 +309,10 @@ def parse_args(argv):
                         help='Skip controller startup homing after each successful pick.')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
+    if args.max_targets is not None and not (
+            1 <= args.max_targets <= len(args.sequence)):
+        raise RuntimeError(
+            '--max-targets must be between 1 and the sequence length.')
     args.target_roi_ratio = parse_roi_ratio(args.target_roi_ratio)
     if args.drive_speed <= 0.0:
         raise RuntimeError('--drive-speed must be positive.')
@@ -322,10 +330,6 @@ def parse_args(argv):
         raise RuntimeError('--chassis-settle-seconds must be non-negative.')
     if args.tag_tf_wait_seconds < 0.0:
         raise RuntimeError('--tag-tf-wait-seconds must be non-negative.')
-    if args.tag_tf_stable_frames <= 0:
-        raise RuntimeError('--tag-tf-stable-frames must be positive.')
-    if args.tag_tf_max_range_m <= 0.0:
-        raise RuntimeError('--tag-tf-max-range-m must be positive.')
     if args.startup_home_wait_seconds <= 0.0:
         raise RuntimeError('--startup-home-wait-seconds must be positive.')
     if args.startup_home_settle_seconds < 0.0:
@@ -489,6 +493,9 @@ class ChassisAlignPickSequence(object):
             if result.aligned:
                 if confirmation_required:
                     self.stop_chassis()
+                    rospy.loginfo(
+                        'ID%d 停车确认帧 %d/%d（仅计新的 YOLO 推理帧）。',
+                        tag_id, stable, self.args.stable_frames)
                     if stable >= self.args.stable_frames:
                         rospy.loginfo(
                             'ID%d 对准确认完成：底盘已停稳，连续 %d 帧在红框内，center_x=%.1f。',
@@ -505,13 +512,9 @@ class ChassisAlignPickSequence(object):
                     rospy.sleep(self.args.chassis_settle_seconds)
                     stable = 0
                     confirmation_required = True
-                    confirmation_seconds = max(
-                        5.0,
-                        self.args.chassis_settle_seconds +
-                        self.args.max_detection_age_seconds + 2.0)
                     deadline = (
                         rospy.Time.now() +
-                        rospy.Duration(confirmation_seconds))
+                        rospy.Duration(self.args.max_align_seconds))
             else:
                 stable = 0
                 if confirmation_required:
@@ -524,7 +527,7 @@ class ChassisAlignPickSequence(object):
                 confirmation_required = False
             rate.sleep()
         self.stop_chassis()
-        raise RuntimeError('ID%d 对准红框超时。' % tag_id)
+        raise AlignmentTimeout('ID%d 对准红框超时。' % tag_id)
 
     def run_pick(self, tag_id):
         if self.args.align_only:
@@ -554,63 +557,43 @@ class ChassisAlignPickSequence(object):
                 % (tag_id, response.message))
         rospy.sleep(self.args.startup_home_settle_seconds)
 
-    def read_tag_tf_sample(self, tag_id):
+    def read_tag_tf_stamp(self, tag_id):
         if self.tf_listener is None:
             self.tf_listener = tf.TransformListener()
         tag_frame = 'tag_%d' % int(tag_id)
         try:
             common_time = self.tf_listener.getLatestCommonTime(
                 self.args.base_frame, tag_frame)
-            translation, _ = self.tf_listener.lookupTransform(
+            self.tf_listener.lookupTransform(
                 self.args.base_frame, tag_frame, common_time)
-            return int(common_time.to_nsec()), [
-                float(value) for value in translation
-            ]
+            return int(common_time.to_nsec())
         except (tf.Exception, tf.LookupException, tf.ConnectivityException,
                 tf.ExtrapolationException):
             return None
-
-    def tag_tf_is_available(self, tag_id):
-        return self.read_tag_tf_sample(tag_id) is not None
 
     def wait_for_tag_tf_before_pick(self, tag_id):
         if self.args.align_only or self.args.dry_run:
             return True
         if self.args.tag_tf_wait_seconds <= 0.0:
             return True
-        samples = []
-        seen_stamps = set()
+        initial_stamp = self.read_tag_tf_stamp(tag_id)
         deadline = rospy.Time.now() + rospy.Duration(self.args.tag_tf_wait_seconds)
         rate = rospy.Rate(self.args.control_hz)
         rospy.loginfo(
-            '抓取前最多等待 %.1fs，让 tag_%d TF 稳定。',
+            '抓取前最多等待 %.1fs，确认 tag_%d 发布一个新的 TF；多帧过滤由抓取脚本执行。',
             self.args.tag_tf_wait_seconds, tag_id)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            sample = self.read_tag_tf_sample(tag_id)
-            if sample is not None and sample[0] not in seen_stamps:
-                stamp_ns, position = sample
-                seen_stamps.add(stamp_ns)
-                samples.append(position)
-                samples = samples[-self.args.tag_tf_stable_frames:]
-                if len(samples) >= self.args.tag_tf_stable_frames:
-                    axes = list(zip(*samples))
-                    ranges = [max(axis) - min(axis) for axis in axes]
-                    if max(ranges) > self.args.tag_tf_max_range_m:
-                        rospy.logwarn_throttle(
-                            2.0,
-                            'tag_%d TF 还不稳定，xyz 波动：%s m',
-                            tag_id, [round(value, 5) for value in ranges])
-                        rate.sleep()
-                        continue
-                    rospy.loginfo(
-                        'tag_%d TF 稳定检查通过：%d 帧，range_mm=%s。',
-                        tag_id, len(samples),
-                        [round(value * 1000.0, 2) for value in ranges])
-                    return True
+            stamp = self.read_tag_tf_stamp(tag_id)
+            if stamp is not None and (
+                    initial_stamp is None or stamp != initial_stamp):
+                rospy.loginfo(
+                    'tag_%d 已发布新的 TF，开始由抓取脚本采集并过滤多帧位姿。',
+                    tag_id)
+                return True
             rate.sleep()
         self.stop_chassis()
         rospy.logwarn(
-            '跳过 ID%d：tag_%d TF 在 %.1fs 内没有稳定。',
+            '跳过 ID%d：tag_%d 在 %.1fs 内没有发布新的 TF。',
             tag_id, tag_id, self.args.tag_tf_wait_seconds)
         return False
 
@@ -628,29 +611,52 @@ class ChassisAlignPickSequence(object):
     def run(self):
         try:
             remaining_tags = list(self.args.sequence)
-            total = len(remaining_tags)
+            requested = getattr(self.args, 'max_targets', None)
+            total = len(remaining_tags) if requested is None else int(requested)
             processed = 0
-            while remaining_tags:
+            completed = 0
+            while remaining_tags and completed < total:
                 tag_id = self.select_next_tag(remaining_tags)
                 processed += 1
                 rospy.loginfo('开始把 ID%d 对准到红框。', tag_id)
-                self.align_tag(tag_id)
+                try:
+                    self.align_tag(tag_id)
+                except AlignmentTimeout as exc:
+                    self.stop_chassis()
+                    if getattr(self.args, 'fail_on_skip', False):
+                        raise RuntimeError(str(exc))
+                    rospy.logwarn('%s 跳过当前 ID，继续处理后续目标。', exc)
+                    remaining_tags.remove(tag_id)
+                    if self.args.wait_key_between_tags and processed < total:
+                        self.wait_between_tags(tag_id, processed, total)
+                    continue
                 needs_pick_tf = not self.args.align_only and not self.args.dry_run
                 if needs_pick_tf and not self.wait_for_tag_tf_before_pick(tag_id):
+                    if getattr(self.args, 'fail_on_skip', False):
+                        raise RuntimeError(
+                            'ID%d tag TF 未在限时内准备完成。' % tag_id)
                     remaining_tags.remove(tag_id)
                     if self.args.wait_key_between_tags and processed < total:
                         self.wait_between_tags(tag_id, processed, total)
                     continue
                 pick_completed = self.run_pick(tag_id)
                 if pick_completed is False:
+                    if getattr(self.args, 'fail_on_skip', False):
+                        raise RuntimeError('ID%d 抓取未完成。' % tag_id)
                     remaining_tags.remove(tag_id)
                     if self.args.wait_key_between_tags and processed < total:
                         self.wait_between_tags(tag_id, processed, total)
                     continue
                 self.run_startup_home(tag_id)
                 remaining_tags.remove(tag_id)
-                if self.args.wait_key_between_tags and processed < total:
+                completed += 1
+                if self.args.wait_key_between_tags and completed < total:
                     self.wait_between_tags(tag_id, processed, total)
+            if completed < total and (
+                    requested is not None
+                    or getattr(self.args, 'fail_on_skip', False)):
+                raise RuntimeError(
+                    '仅完成 %d/%d 个 Tag 抓取。' % (completed, total))
         finally:
             self.stop_chassis()
 

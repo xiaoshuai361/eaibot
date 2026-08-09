@@ -178,6 +178,21 @@ def test_chassis_sequence_is_targetless_and_forwards_short_options():
     assert "--show-rgb" in command
 
 
+def test_chassis_sequence_forwards_target_limit_and_strict_mode():
+    parsed = main.parse_args([
+        "--run-chassis-sequence",
+        "--sequence", "1,2,3,4",
+        "--max-targets", "2",
+        "--fail-on-skip",
+    ])
+
+    main.validate_runtime_args(parsed, {"distance_method": "calibrated"})
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+
+    assert command[command.index("--max-targets") + 1] == "2"
+    assert "--fail-on-skip" in command
+
+
 def test_taught_block_actions_require_target_and_non_theory_distance():
     parsed = main.parse_args(["--teach-block-grasp"])
 

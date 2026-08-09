@@ -282,6 +282,8 @@ PICK_RECOVER_TIMEOUT = 8.0
 PROCESS_START_TIMEOUT = 35.0
 PROCESS_STOP_TIMEOUT = 5.0
 MANAGE_ROS_PROCESSES = True
+PICK_BASE_FRAME = "base"
+PICK_CAMERA_FRAME = "camera_link"
 
 TAG_ALIGN_SCRIPT = DEPLOY_HOME + "/handeye-calib/src/tag_chassis_align_pick_sequence.py"
 UNTAGGED_PICK_SCRIPT = DEPLOY_HOME + "/handeye-calib/src/block_pick_main.py"

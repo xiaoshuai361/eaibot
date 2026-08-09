@@ -477,6 +477,35 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     assert "selection timeout" not in selection_source
 
 
+def test_strict_sequence_fails_when_no_remaining_target_becomes_visible():
+    select_next, = load_symbols("select_next_sequence_target")
+    clock = iter([0.0, 26.0])
+
+    class FakeRate(object):
+        def __init__(self, _hz):
+            pass
+
+        def sleep(self):
+            pass
+
+    select_next.__globals__.update({
+        "time": SimpleNamespace(time=lambda: next(clock)),
+        "rospy": SimpleNamespace(
+            Rate=FakeRate,
+            is_shutdown=lambda: False,
+            logwarn_throttle=lambda *args: None,
+        ),
+    })
+
+    with pytest.raises(RuntimeError, match="became visible"):
+        select_next(
+            SimpleNamespace(fail_on_skip=True), {}, object(),
+            ["power", "fire"],
+            {"order": "left_to_right", "control_hz": 5.0,
+             "max_align_seconds": 25.0},
+        )
+
+
 def test_chassis_sequence_settings_are_validated_from_yaml_mapping():
     finite_scalar, require_settings = load_symbols(
         "finite_scalar", "require_chassis_sequence_config")
@@ -811,6 +840,55 @@ def test_live_preview_reports_each_target_only_once():
     assert new_live_preview_labels(
         [{"target": "gas", "confidence": 0.76}], reported
     ) == ["gas GAS76"]
+
+
+def test_live_preview_refreshes_window_when_no_target_is_detected():
+    finite_scalar, run_live_preview = load_symbols(
+        "finite_scalar", "run_live_preview")
+    capture = {"rgb": object()}
+    shown = {}
+
+    def no_detection(*_args):
+        raise RuntimeError("No usable YOLO detections")
+
+    def show_frame(image, detections, observations, **_kwargs):
+        shown.update({
+            "image": image,
+            "detections": detections,
+            "observations": observations,
+        })
+        return False
+
+    run_live_preview.__globals__.update({
+        "capture_rgb_once": lambda _config: capture,
+        "request_detection": no_detection,
+        "show_rgb_debug": show_frame,
+        "safe_log_text": str,
+        "ascii_log_text": str,
+        "DEFAULT_CONFIG": {"grasp_roi_ratio": [0.0, 0.0, 1.0, 1.0]},
+        "rospy": type(
+            "Rospy",
+            (),
+            {
+                "is_shutdown": staticmethod(lambda: False),
+                "loginfo": staticmethod(lambda *_args: None),
+                "logwarn": staticmethod(lambda *_args: None),
+                "sleep": staticmethod(lambda _seconds: None),
+            },
+        ),
+    })
+
+    run_live_preview(
+        SimpleNamespace(preview_hz=1.0, block_target=None),
+        {"grasp_roi_ratio": [0.0, 0.0, 1.0, 1.0]},
+        detector=object(),
+    )
+
+    assert shown == {
+        "image": capture["rgb"],
+        "detections": [],
+        "observations": [],
+    }
 
 
 def test_collect_all_observations_groups_visible_targets_and_shows_all():

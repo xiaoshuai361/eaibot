@@ -101,6 +101,8 @@ def parse_args(argv=None):
         default="1,2,3,4",
         help="Comma-separated target IDs or names for chassis/place teaching sequence.",
     )
+    parser.add_argument("--max-targets", type=int)
+    parser.add_argument("--fail-on-skip", action="store_true")
     parser.add_argument("--wait-key-between-targets", action="store_true")
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
@@ -195,6 +197,15 @@ def validate_runtime_args(args, config):
     if args.wait_key_between_targets and action != "run_chassis_sequence":
         raise ValueError(
             "--wait-key-between-targets requires --run-chassis-sequence")
+    if args.max_targets is not None:
+        if action != "run_chassis_sequence":
+            raise ValueError("--max-targets requires --run-chassis-sequence")
+        target_count = len(parse_target_sequence(args.sequence, config))
+        if not 1 <= args.max_targets <= target_count:
+            raise ValueError(
+                "--max-targets must be between 1 and the sequence length")
+    if args.fail_on_skip and action != "run_chassis_sequence":
+        raise ValueError("--fail-on-skip requires --run-chassis-sequence")
     if args.skip_startup_home and action != "run_chassis_sequence":
         raise ValueError("--skip-startup-home requires --run-chassis-sequence")
     targetless_actions = (
@@ -389,6 +400,10 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--run-chassis-sequence")
     if args.run_chassis_sequence or (args.teach_block_place and args.target is None):
         command += ["--sequence", args.sequence]
+    if args.max_targets is not None:
+        command += ["--max-targets", str(args.max_targets)]
+    if args.fail_on_skip:
+        command.append("--fail-on-skip")
     if args.wait_key_between_targets:
         command.append("--wait-key-between-targets")
     if args.align_only:
