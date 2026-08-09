@@ -6,7 +6,7 @@
 
 ```text
 zcy_last/
-├── main.py                 # 唯一启动入口和依赖进程托管
+├── main.py                 # 比赛任务入口和抓取依赖进程托管
 ├── config.py               # 比赛开关、设备号、路径和调节参数
 ├── algorithms/             # 巡线、横条、补线、YOLO 和红绿灯算法
 ├── control/                # 摄像头、底盘、抓取协调和子进程所有权
@@ -14,7 +14,19 @@ zcy_last/
 └── tests/                  # 新旧算法对比和抓取流程测试
 ```
 
-## 启动
+## 启动底盘
+
+底盘驱动必须在独立终端人工启动，`zcy_last` 不启动也不关闭它：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/robocom_ws/devel/setup.bash
+roslaunch xpkg_bringup bringup_basic_ctrl.launch
+```
+
+任务启动时只检查 `/xnode_comm` 和 `/xnode_vehicle` 是否存在。
+
+## 启动任务
 
 在机器人上先进入 ROS 和 `ww` 环境：
 
@@ -72,14 +84,14 @@ STARTUP
 
 B 点流程先由 Astra、Tag 补白和 AprilTag 使用 `/dev/video2`。B 点结束后释放相机，再加载人偶和垃圾桶模型。第 3 个路口后先关闭任务 YOLO，再启动 Astra 执行 A 点无 Tag 抓取。A 点结束后释放 Astra并加载楼宇模型。
 
-进程管理器会检查共享相机占用、Astra 内参、MoveIt 状态、机械臂服务和手眼 TF。日志保存在 `/home/eaibot/logs/zcy_last/<启动时间>/`。程序退出时先停车，再逆序关闭本次启动的进程，不关闭用户手动启动的进程。
+进程管理器会检查外部底盘节点、共享相机占用、Astra 内参、MoveIt 状态、机械臂服务和手眼 TF。日志保存在 `/home/eaibot/logs/zcy_last/<启动时间>/`。程序退出时先停车，再逆序关闭本次启动的抓取相关进程，不关闭人工启动的底盘或其他外部进程。
 
 ## 故障处理
 
 - `PICK_FAILED` 不自动重试，也不恢复循迹，需要人工排查后重启任务。
 - 正式运行前确认 `/home/eaibot/handeye-calib/config/astra_rgb_640x480.yaml` 已安装且内参非零。
 - 不要在一键启动期间手动运行抓取脚本或另一个 `/cmd_vel` 发布程序。
-- 启动失败时先看终端错误，再查看对应的 `base.log`、`astra.log`、`moveit.log` 或 `pick_*.log`。
+- 启动失败时先看终端错误，再查看对应的 `astra.log`、`moveit.log` 或 `pick_*.log`。
 
 ## 测试
 

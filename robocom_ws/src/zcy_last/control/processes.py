@@ -118,30 +118,16 @@ class ProcessSupervisor(object):
             time.sleep(0.5)
         raise RuntimeError("等待%s超时" % description)
 
-    def assert_clean_ros_start(self):
-        if not self.enabled or not self._probe("rosnode list", timeout=1.0):
-            return
-        output = subprocess.check_output(
-            self._shell_command("rosnode list"), text=True).splitlines()
-        active = [name for name in output if name.strip() not in ("", "/rosout")]
-        if active:
-            raise RuntimeError(
-                "检测到已有 ROS 节点，禁止重复启动：%s" % ",".join(active))
-
-    def start_base(self):
+    def require_external_base(self):
+        """确认人工启动的底盘节点可用，但不取得其进程所有权。"""
         if not self.enabled:
             return
-        self.assert_clean_ros_start()
-        self.start(
-            "base",
-            "source /opt/ros/melodic/setup.bash && "
-            "source {0}/robocom_ws/devel/setup.bash && "
-            "exec roslaunch xpkg_bringup bringup_basic_ctrl.launch".format(
-                DEPLOY_HOME),
-        )
         self.wait_until(
-            "底盘 ROS 节点",
-            lambda: self._probe("rosnode list | grep -v '^/rosout$' | grep -q ."),
+            "外部底盘节点 /xnode_comm 和 /xnode_vehicle",
+            lambda: self._probe(
+                "rosnode list | grep -qx '/xnode_comm' && "
+                "rosnode list | grep -qx '/xnode_vehicle'"),
+            timeout=5.0,
         )
 
     def start_arm_common(self):

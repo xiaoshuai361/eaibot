@@ -52,7 +52,7 @@ def main(argv=None):
         python3=sys.executable,
     )
     try:
-        supervisor.start_base()
+        supervisor.require_external_base()
         if options.tag_pick or options.untagged_pick:
             supervisor.start_arm_common()
         if options.tag_pick:

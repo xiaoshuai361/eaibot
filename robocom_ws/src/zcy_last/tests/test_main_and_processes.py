@@ -55,19 +55,19 @@ def test_pick_count_must_be_between_one_and_four(option, count):
     [
         (
             ["--no-tag-pick", "--no-untagged-pick"],
-            ["base", "run", "shutdown"],
+            ["base_check", "run", "shutdown"],
         ),
         (
             ["--tag-pick", "--no-untagged-pick"],
-            ["base", "arm", "astra", "tag", "run", "shutdown"],
+            ["base_check", "arm", "astra", "tag", "run", "shutdown"],
         ),
         (
             ["--no-tag-pick", "--untagged-pick"],
-            ["base", "arm", "run", "shutdown"],
+            ["base_check", "arm", "run", "shutdown"],
         ),
         (
             ["--tag-pick", "--untagged-pick"],
-            ["base", "arm", "astra", "tag", "run", "shutdown"],
+            ["base_check", "arm", "astra", "tag", "run", "shutdown"],
         ),
     ],
 )
@@ -79,8 +79,8 @@ def test_main_starts_only_required_initial_dependencies(
         def __init__(self, **_kwargs):
             pass
 
-        def start_base(self):
-            calls.append("base")
+        def require_external_base(self):
+            calls.append("base_check")
 
         def start_arm_common(self):
             calls.append("arm")
