@@ -1904,7 +1904,7 @@ class TaskYoloTests(unittest.TestCase):
         self.assertEqual(
             line_task.YOLO_STREET_MODEL_PATH,
             "/home/eaibot/handeye-calib/src/model/yolov5/"
-            "rubbish_doll_yolov5n_320_best.onnx",
+            "rub_roll_new_yolov5n_320_best.onnx",
         )
         self.assertEqual(
             line_task.YOLO_BUILDING_MODEL_PATH,

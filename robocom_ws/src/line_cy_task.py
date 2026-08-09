@@ -56,7 +56,7 @@ TRAFFIC_LIGHT_ENABLED = True # True 时每个入口横条摆正后必须确认�
 TRAFFIC_LIGHT_CONFIDENCE = 0.55 # 红绿灯单帧最低置信度；漏检可降，误检可加。
 
 # ===== 模型路径与路线切换（部署前检查） =====
-YOLO_STREET_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/rubbish_doll_yolov5n_320_best.onnx"
+YOLO_STREET_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/rub_roll_new_yolov5n_320_best.onnx"
 YOLO_BUILDING_MODEL_PATH = "/home/eaibot/handeye-calib/src/model/yolov5/building_new_yolov5n_320_best.onnx"
 YOLO_MODEL_PATH = YOLO_STREET_MODEL_PATH # 兼容旧 ROS 参数；启动时加载人偶和垃圾桶模型。
 YOLO_BUILDING_SWITCH_INDEX = 3 # 第三个右转完成后、第四个左转前切换楼宇模型。
@@ -290,6 +290,7 @@ YOLO_BUILDING_ROUTE_AREAS = {
     8: "楼宇D",
 }
 YOLO_MODEL_PREFERRED_FILES = (
+    "rub_roll_new_yolov5n_320_best.onnx",
     "rubbish_doll_yolov5n_320_best.onnx",
     "building_new_yolov5n_320_best.onnx",
     "merge_new_yolov5n_320_best.onnx",
