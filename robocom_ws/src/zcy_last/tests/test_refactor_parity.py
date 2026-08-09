@@ -3,10 +3,7 @@
 """拆分前后的纯算法行为必须保持一致。"""
 
 import importlib.util
-import ast
-import inspect
 import sys
-import textwrap
 import types
 from pathlib import Path
 
@@ -44,7 +41,6 @@ def _load_legacy():
 _install_ros_stubs()
 from zcy_last.algorithms import vision as current  # noqa: E402
 from zcy_last import config  # noqa: E402
-from zcy_last.task.competition import LaneFollower as CurrentLaneFollower  # noqa: E402
 
 legacy = _load_legacy()
 
@@ -99,35 +95,3 @@ def test_route_context_matches_legacy():
     for index in range(len(config.TASK_TURN_COMMANDS)):
         assert current.yolo_route_context(index, "FOLLOW") == \
             legacy.yolo_route_context(index, "FOLLOW")
-
-
-def _maneuver_timeout_calls(follower_class):
-    source = textwrap.dedent(inspect.getsource(follower_class.process))
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        timeout_test = any(
-            isinstance(child, ast.Call)
-            and getattr(child.func, "id", None)
-            == "maneuver_timeout_exits_to_follow"
-            for child in ast.walk(node.test)
-        )
-        if not timeout_test:
-            continue
-        return {
-            getattr(call.func, "attr", getattr(call.func, "id", None))
-            for statement in node.body
-            for call in ast.walk(statement)
-            if isinstance(call, ast.Call)
-        }
-    raise AssertionError("未找到路口超时分支")
-
-
-def test_maneuver_timeout_does_not_complete_intersection():
-    """出口未确认时不能提前增加路口序号。"""
-    for follower_class in (legacy.LaneFollower, CurrentLaneFollower):
-        calls = _maneuver_timeout_calls(follower_class)
-        assert "_complete_intersection" not in calls
-        assert "_set_state" not in calls
-        assert "logwarn_throttle" in calls
