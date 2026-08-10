@@ -460,6 +460,9 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
 
     assert 'parser.add_argument("--run-chassis-sequence"' in source
     assert "run_block_chassis_sequence(args, config, detector)" in source
+    assert 'parser.add_argument("--result-file")' in source
+    assert "write_chassis_sequence_result(result_file, completed_ids)" in source
+    assert "completed_ids.append(target_number(config, target))" in source
     assert 'do_run_taught_block_mono(\n                    args, config, localization, "run_taught_block")' in source
     assert "compute_drive_command(" in source
     assert 'require_joint_values(preset, "carry_joint_values")' in source
@@ -475,6 +478,17 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     selection_source = ast.get_source_segment(source, selection_function)
     assert "while not rospy.is_shutdown():" in selection_source
     assert "selection timeout" not in selection_source
+
+
+def test_no_tag_chassis_sequence_result_file_records_completed_ids(tmp_path):
+    write_result, = load_symbols("write_chassis_sequence_result")
+    result_file = tmp_path / "untagged-result.json"
+
+    write_result(str(result_file), [4, 2])
+
+    assert json.loads(result_file.read_text(encoding="utf-8")) == {
+        "completed_ids": [4, 2],
+    }
 
 
 def test_strict_sequence_fails_when_no_remaining_target_becomes_visible():

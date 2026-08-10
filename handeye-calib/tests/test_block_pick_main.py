@@ -193,6 +193,28 @@ def test_chassis_sequence_forwards_target_limit_and_strict_mode():
     assert "--fail-on-skip" in command
 
 
+def test_chassis_sequence_forwards_result_file():
+    parsed = main.parse_args([
+        "--run-chassis-sequence",
+        "--sequence", "1,2,3,4",
+        "--max-targets", "2",
+        "--result-file", "/tmp/untagged-result.json",
+    ])
+
+    main.validate_runtime_args(parsed, {"distance_method": "calibrated"})
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+
+    assert command[command.index("--result-file") + 1] == \
+        "/tmp/untagged-result.json"
+
+
+def test_result_file_is_only_valid_for_chassis_sequence():
+    parsed = args("--dry-run", "--result-file", "/tmp/result.json")
+
+    with pytest.raises(ValueError, match="result-file"):
+        main.validate_runtime_args(parsed, {"distance_method": "theory"})
+
+
 def test_taught_block_actions_require_target_and_non_theory_distance():
     parsed = main.parse_args(["--teach-block-grasp"])
 

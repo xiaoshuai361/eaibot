@@ -103,6 +103,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-targets", type=int)
     parser.add_argument("--fail-on-skip", action="store_true")
+    parser.add_argument(
+        "--result-file",
+        help="底盘连续抓取实际成功物资 ID 的 JSON 输出路径。",
+    )
     parser.add_argument("--wait-key-between-targets", action="store_true")
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
@@ -206,6 +210,8 @@ def validate_runtime_args(args, config):
                 "--max-targets must be between 1 and the sequence length")
     if args.fail_on_skip and action != "run_chassis_sequence":
         raise ValueError("--fail-on-skip requires --run-chassis-sequence")
+    if args.result_file and action != "run_chassis_sequence":
+        raise ValueError("--result-file requires --run-chassis-sequence")
     if args.skip_startup_home and action != "run_chassis_sequence":
         raise ValueError("--skip-startup-home requires --run-chassis-sequence")
     targetless_actions = (
@@ -404,6 +410,8 @@ def build_child_command(args, request_fd, response_fd):
         command += ["--max-targets", str(args.max_targets)]
     if args.fail_on_skip:
         command.append("--fail-on-skip")
+    if args.result_file:
+        command += ["--result-file", args.result_file]
     if args.wait_key_between_targets:
         command.append("--wait-key-between-targets")
     if args.align_only:

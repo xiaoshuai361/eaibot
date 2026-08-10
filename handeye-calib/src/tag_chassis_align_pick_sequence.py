@@ -6,6 +6,7 @@ from __future__ import print_function
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 
@@ -62,6 +63,28 @@ def parse_sequence(text):
     if not result:
         raise RuntimeError('--sequence must contain at least one tag ID.')
     return result
+
+
+def write_result_file(path, completed_ids):
+    """原子记录实际完成入仓的 Tag ID，供比赛任务读取库存。"""
+    if not path:
+        return
+    path = os.path.abspath(os.path.expanduser(path))
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    temporary = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(temporary, 'w') as handle:
+            json.dump({'completed_ids': list(completed_ids)}, handle,
+                      sort_keys=True)
+            handle.write('\n')
+        os.rename(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
 
 def finite(value, option):
@@ -266,6 +289,8 @@ def parse_args(argv):
     parser.add_argument('--sequence', default=DEFAULT_SEQUENCE)
     parser.add_argument('--max-targets', type=int,
                         help='最多成功抓取数量；默认处理完整 sequence。')
+    parser.add_argument('--result-file',
+                        help='把实际成功入仓的 Tag ID 写入 JSON 文件。')
     parser.add_argument('--fail-on-skip', action='store_true',
                         help='任何对准、TF 或抓取跳过都按失败退出。')
     parser.add_argument('--order', choices=['left_to_right', 'sequence'],
@@ -280,7 +305,7 @@ def parse_args(argv):
     parser.add_argument('--chassis-settle-seconds', type=float, default=0.8)
     parser.add_argument('--drive-speed', type=float, default=0.012)
     parser.add_argument('--align-tolerance-px', type=float, default=12.0)
-    parser.add_argument('--stable-frames', type=int, default=4)
+    parser.add_argument('--stable-frames', type=int, default=1)
     parser.add_argument('--max-align-seconds', type=float, default=25.0)
     parser.add_argument('--control-hz', type=float, default=5.0)
     parser.add_argument('--min-confidence', type=float, default=0.1)
@@ -349,6 +374,7 @@ class ChassisAlignPickSequence(object):
     def __init__(self, args):
         self.args = args
         self.latest_detections = None
+        self.pick_in_progress = False
         self.bridge = CvBridge()
         self.cmd_pub = rospy.Publisher(args.cmd_vel_topic, Twist, queue_size=1)
         self.debug_image_pub = rospy.Publisher(args.debug_image_topic, Image, queue_size=1)
@@ -367,7 +393,7 @@ class ChassisAlignPickSequence(object):
             rospy.logwarn_throttle(2.0, '无法解析 YOLO 检测 JSON：%s', exc)
 
     def image_callback(self, message):
-        if self.latest_detections is None:
+        if self.pick_in_progress or self.latest_detections is None:
             return
         try:
             import cv2
@@ -538,7 +564,12 @@ class ChassisAlignPickSequence(object):
             return
         command = build_pick_command(self.args, tag_id)
         rospy.loginfo('开始执行 ID%d 示教抓取。', tag_id)
-        return run_pick_command(command, tag_id)
+        rospy.loginfo('实际抓取子命令：%s', ' '.join(command))
+        self.pick_in_progress = True
+        try:
+            return run_pick_command(command, tag_id)
+        finally:
+            self.pick_in_progress = False
 
     def run_startup_home(self, tag_id):
         if (self.args.align_only or self.args.dry_run or
@@ -615,6 +646,9 @@ class ChassisAlignPickSequence(object):
             total = len(remaining_tags) if requested is None else int(requested)
             processed = 0
             completed = 0
+            completed_ids = []
+            result_file = getattr(self.args, 'result_file', None)
+            write_result_file(result_file, completed_ids)
             while remaining_tags and completed < total:
                 tag_id = self.select_next_tag(remaining_tags)
                 processed += 1
@@ -650,6 +684,8 @@ class ChassisAlignPickSequence(object):
                 self.run_startup_home(tag_id)
                 remaining_tags.remove(tag_id)
                 completed += 1
+                completed_ids.append(tag_id)
+                write_result_file(result_file, completed_ids)
                 if self.args.wait_key_between_tags and completed < total:
                     self.wait_between_tags(tag_id, processed, total)
             if completed < total and (

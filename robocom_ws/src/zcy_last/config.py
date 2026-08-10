@@ -2,11 +2,13 @@
 # coding=utf-8
 """比赛现场参数；优先修改本文件顶部开关。"""
 
-# ===== 机械臂抓取开关（调试时优先修改） =====
-ENABLE_TAG_PICK = False
+# ===== 机械臂抓取与投递开关（调试时优先修改） =====
+ENABLE_TAG_PICK = False        # B 点有 Tag 抓取。
 TAG_PICK_COUNT = 1
-ENABLE_UNTAGGED_PICK = False
+ENABLE_TAG_DELIVERY = True     # B 点抓取开启时，第一圈按街区识别结果投递。
+ENABLE_UNTAGGED_PICK = False   # A 点无 Tag 抓取。
 UNTAGGED_PICK_COUNT = 1
+ENABLE_UNTAGGED_DELIVERY = True # A 点抓取开启时，后两圈按楼宇识别结果投递。
 UNTAGGED_TRIGGER_INTERSECTION = 3
 PICK_CANDIDATE_IDS = (1, 2, 3, 4)
 
@@ -63,7 +65,7 @@ LOST_LIMIT = 7            # 入口横条允许丢失帧数；偶发丢线就加�
 EXIT_ALIGN_LOST_FRAMES = 5 # 出口横条丢失多少帧后恢复巡线。
 WAIT_RECOVER_FRAMES = 3   # 等待状态重新确认入口的帧数。
 TURN_ENTRY_TIME = 6.5     # 摆正后盲区直行时间(s)；起转太早加，太晚减。
-TURN_TIME = 3.6           # 固定转弯时间(s)；转不够加，转过头减。
+TURN_TIME = 4          # 固定转弯时间(s)；转不够加，转过头减。
 MANEUVER_MIN_TIME = 1.0   # 路口最短通过时间(s)；过早识别出口就加。
 MANEUVER_MAX_TIME = 14.0  # 路口最长通过时间(s)；出口漏检后恢复巡线。
 ENTRY_CLEAR_FRAMES = 5    # 入口横条消失确认帧数；入口被当出口就加。
@@ -77,7 +79,7 @@ APPROACH_SPEED = 0.16     # 靠近横条 linear.x 前进速度(m/s)；冲过横�
 MANEUVER_SPEED = 0.16     # 路口内 linear.x 前进速度(m/s)；路口通过慢可小幅加。
 MANEUVER_CENTER_BIAS_PIXELS = 40.0 # 直行路口避障量；只填正数，数值越大避让越多。
 MAX_ANGULAR = 0.50       # angular.z 偏航角速度上限(rad/s)；只影响转头快慢，不提高前进速度。
-FOLLOW_LEFT_ANGULAR_SCALE = 0.74 # 所有巡线左弯力度；左弯太猛就减小。
+FOLLOW_LEFT_ANGULAR_SCALE = 0.76 # 所有巡线左弯力度；左弯太猛就减小。
 FOLLOW_RIGHT_ANGULAR_SCALE = 1.00 # 巡线右弯力度；右弯正常保持 1.0。
 
 # 左右转固定控制；直行路口和普通巡线不使用这两项。
@@ -155,8 +157,8 @@ BAR_ONLY_MIN_THICKNESS_RATIO = 0.010 # 纯横条最小厚度；细线误报就�
 BAR_ONLY_MAX_THICKNESS_RATIO = 0.075 # 纯横条最大厚度；大块误报就减。
 
 # ===== 横条时间防抖与纯横条通道 =====
-STOP_NEAR_RATIO = 0.8       # 横条接近画面底部比例；停得太早加，太晚减。
-STOP_CENTER_WIDTH_RATIO = 0.12 # 底部停车区占画面中央宽度比例；减小可排除两侧干扰。
+STOP_NEAR_RATIO = 0.75       # 横条接近画面底部比例；停得太早加，太晚减。
+STOP_CENTER_WIDTH_RATIO = 0.08 # 底部停车区占画面中央宽度比例；减小可排除两侧干扰。
 BAR_ONLY_STABLE_FRAMES = 1   # 无竖纹时横条连续确认帧数；误识别就加，出现太慢就减。
 BAR_ONLY_MIN_LENGTH_RATIO = 0.2 # 无竖纹横条最小宽度比例；误识别就加，近景短条漏检就减。
 BAR_ONLY_MAX_ABS_ANGLE = 20.0 # 无竖纹横条最大倾角；斜车道线误报就减，真实斜横条漏检就加。
@@ -238,6 +240,18 @@ YOLO_STREET_MESSAGES = {
     "Recyclable waste": ("trash", "可回收垃圾"),
     "other waste": ("trash", "其他垃圾"),
 }
+TAG_DELIVERY_ID_BY_STREET_CLASS = {
+    "General population": 1,   # 普通人群：基本生活物资。
+    "Medical population": 2,   # 医疗人群：医疗包。
+    "Recyclable waste": 3,     # 可回收垃圾：常规消杀剂。
+    "other waste": 4,          # 其他垃圾：生物危害专用消杀剂。
+}
+UNTAGGED_DELIVERY_ID_BY_BUILDING_CLASS = {
+    "Electrical Fault Building": 1,       # 电力故障：应急电源。
+    "Fire Building": 2,                   # 火灾：灭火装置。
+    "Toxic Gas-contaminated Building": 3, # 有毒气体：气体净化装置。
+    "Collapsed Building": 4,              # 坍塌：结构支撑装置。
+}
 YOLO_PEOPLE_CLASS_NAMES = (
     "Medical population",
     "General population",
@@ -287,9 +301,12 @@ PICK_BASE_FRAME = "base"
 PICK_CAMERA_FRAME = "camera_link"
 
 TAG_ALIGN_SCRIPT = DEPLOY_HOME + "/handeye-calib/src/tag_chassis_align_pick_sequence.py"
+TAG_DELIVERY_SCRIPT = DEPLOY_HOME + "/handeye-calib/src/mirobot_delivery.py"
 UNTAGGED_PICK_SCRIPT = DEPLOY_HOME + "/handeye-calib/src/block_pick_main.py"
 TAG_PRESET_FILE = DEPLOY_HOME + "/handeye-calib/config/tag_pick_place_presets.json"
+TAG_DELIVERY_PRESET_FILE = DEPLOY_HOME + "/handeye-calib/config/delivery_presets.json"
 UNTAGGED_CONFIG_FILE = DEPLOY_HOME + "/handeye-calib/src/config/block_mono_grasp.yaml"
 UNTAGGED_PRESET_FILE = DEPLOY_HOME + "/handeye-calib/config/block_mono_pick_place_presets.json"
+UNTAGGED_DELIVERY_PRESET_FILE = DEPLOY_HOME + "/handeye-calib/config/untagged_delivery_presets.json"
 ASTRA_CAMERA_INFO_FILE = DEPLOY_HOME + "/handeye-calib/config/astra_rgb_640x480.yaml"
 PROCESS_LOG_ROOT = DEPLOY_HOME + "/logs/zcy_last"

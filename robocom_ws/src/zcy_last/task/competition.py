@@ -47,17 +47,29 @@ except ImportError as traffic_light_import_error:
 class LaneFollower(object):
     def __init__(self, grasp_coordinator=None, process_supervisor=None,
                  enable_tag_pick=False, tag_pick_count=1,
-                 enable_untagged_pick=False, untagged_pick_count=1):
+                 enable_tag_delivery=False,
+                 enable_untagged_pick=False, untagged_pick_count=1,
+                 enable_untagged_delivery=False):
         rospy.init_node("line_cy_task", anonymous=True)
         self.grasp_coordinator = grasp_coordinator
         self.process_supervisor = process_supervisor
         self.enable_tag_pick = bool(enable_tag_pick)
         self.tag_pick_count = int(tag_pick_count)
+        self.enable_tag_delivery = bool(
+            enable_tag_delivery and enable_tag_pick)
         self.enable_untagged_pick = bool(enable_untagged_pick)
         self.untagged_pick_count = int(untagged_pick_count)
+        self.enable_untagged_delivery = bool(
+            enable_untagged_delivery and enable_untagged_pick)
         self.tag_pick_completed = not self.enable_tag_pick
         self.untagged_pick_completed = not self.enable_untagged_pick
         self.active_pick_kind = None
+        self.tag_inventory = []
+        self.untagged_inventory = []
+        self.tag_delivery_failed_ids = set()
+        self.untagged_delivery_failed_ids = set()
+        self.active_delivery_source = None
+        self.active_delivery_id = None
         self.pick_recover_hits = 0
         self.velocity_owner = "line"
         self.camera_index = int(rospy.get_param("~camera_index", CAMERA_INDEX))
@@ -208,6 +220,7 @@ class LaneFollower(object):
         self.yolo_ready = False
         self.yolo_active_profile = None
         self.yolo_stop_detection = None
+        self.yolo_stop_event = None
         self.yolo_stop_reported = False
         self.yolo_stop_report_seq = 0
         self.yolo_segment_key = None
@@ -723,12 +736,35 @@ class LaneFollower(object):
     def _finish_pick(self, kind):
         self.velocity_owner = "line"
         self.publish(0, 0, force=True)
+        label = "有 Tag" if kind == "tag" else "无 Tag"
+        expected_count = self.tag_pick_count if kind == "tag" \
+            else self.untagged_pick_count
+        try:
+            completed_ids = self.grasp_coordinator.completed_items()
+        except Exception as exc:
+            self._pick_failed("无法读取%s抓取库存：%s" % (label, exc))
+            return
+        if len(completed_ids) != expected_count:
+            self._pick_failed(
+                "%s抓取库存数量异常：期望 %d，实际 %s"
+                % (label, expected_count, completed_ids))
+            return
         if kind == "tag":
+            self.tag_inventory = list(completed_ids)
             self.tag_pick_completed = True
             profile = "street"
+            rospy.loginfo(
+                "line_cy_task 有 Tag 物资已入仓，库存 ID=%s",
+                self.tag_inventory,
+            )
         else:
+            self.untagged_inventory = list(completed_ids)
             self.untagged_pick_completed = True
             profile = "building"
+            rospy.loginfo(
+                "line_cy_task 无 Tag 物资已入仓，库存 ID=%s",
+                self.untagged_inventory,
+            )
         if not self._resume_yolo(profile):
             self._pick_failed("共享摄像头释放后任务 YOLO 未能恢复")
             return
@@ -737,6 +773,109 @@ class LaneFollower(object):
         self.bridge.reset(self.lane_width)
         self.stop_hits = 0
         self._set_state("PICK_RECOVER")
+
+    def _delivery_id_for_event(self, event):
+        if event is None:
+            return None
+        if event.kind == "street":
+            return TAG_DELIVERY_ID_BY_STREET_CLASS.get(event.class_name)
+        if event.kind == "building":
+            return UNTAGGED_DELIVERY_ID_BY_BUILDING_CLASS.get(
+                event.class_name)
+        return None
+
+    def _delivery_context_for_event(self, event):
+        if event is None:
+            return None
+        if event.kind == "street" and self.enable_tag_delivery:
+            return (
+                "tag", "有 Tag", self.tag_inventory,
+                self.tag_delivery_failed_ids,
+            )
+        if event.kind == "building" and self.enable_untagged_delivery:
+            return (
+                "untagged", "无 Tag", self.untagged_inventory,
+                self.untagged_delivery_failed_ids,
+            )
+        return None
+
+    def _start_delivery_for_event(self, event):
+        context = self._delivery_context_for_event(event)
+        if context is None:
+            return False
+        source, label, inventory, failed_ids = context
+        item_id = self._delivery_id_for_event(event)
+        if (item_id is None or item_id not in inventory
+                or item_id in failed_ids):
+            return False
+        if self.grasp_coordinator is None:
+            failed_ids.add(item_id)
+            rospy.logwarn(
+                "line_cy_task %s ID%d 需要投递，但未配置机械臂协调器，继续循迹",
+                label, item_id,
+            )
+            return False
+        try:
+            self.publish(0, 0, force=True)
+            self.velocity_owner = "grasp"
+            self.active_delivery_source = source
+            self.active_delivery_id = item_id
+            self.grasp_coordinator.start_delivery(source, [item_id])
+            self._set_state("DELIVERING")
+            rospy.loginfo(
+                "line_cy_task %s识别到%s，开始投递%s ID%d",
+                event.area, event.display_name, label, item_id,
+            )
+            return True
+        except Exception as exc:
+            self.velocity_owner = "line"
+            self.active_delivery_source = None
+            self.active_delivery_id = None
+            failed_ids.add(item_id)
+            self.publish(0, 0, force=True)
+            rospy.logwarn(
+                "line_cy_task %s ID%d 投递未启动：%s；继续循迹",
+                label, item_id, exc,
+            )
+            return False
+
+    def _finish_delivery(self, success, error=None):
+        source = self.active_delivery_source
+        item_id = self.active_delivery_id
+        if source == "untagged":
+            label = "无 Tag"
+            inventory = self.untagged_inventory
+            failed_ids = self.untagged_delivery_failed_ids
+        else:
+            label = "有 Tag"
+            inventory = self.tag_inventory
+            failed_ids = self.tag_delivery_failed_ids
+        self.velocity_owner = "line"
+        self.publish(0, 0, force=True)
+        if success:
+            if item_id in inventory:
+                inventory.remove(item_id)
+            rospy.loginfo(
+                "line_cy_task %s ID%d 投递完成，剩余库存=%s",
+                label, item_id, inventory,
+            )
+            arm_no_longer_needed = (
+                source == "untagged" and not inventory
+            ) or (
+                source == "tag" and not inventory
+                and not self.enable_untagged_pick
+            )
+            if arm_no_longer_needed and self.process_supervisor is not None:
+                self.process_supervisor.stop_arm_common()
+        else:
+            failed_ids.add(item_id)
+            rospy.logwarn(
+                "line_cy_task %s ID%d 投递失败：%s；不重试并继续循迹",
+                label, item_id, error or "投递子进程返回失败",
+            )
+        self.active_delivery_source = None
+        self.active_delivery_id = None
+        self._set_state("FOLLOW")
 
     def _handle_pick_without_frame(self, now):
         if self.state == "B_PICK_PREPARE":
@@ -758,6 +897,11 @@ class LaneFollower(object):
                 self._pick_failed(error or "抓取子进程返回失败")
                 return
             self._finish_pick(self.active_pick_kind)
+            return
+        if self.state == "DELIVERING":
+            success, error = self.grasp_coordinator.poll()
+            if success is not None:
+                self._finish_delivery(success, error)
             return
         if self.state == "PICK_FAILED":
             self.publish(0, 0, force=True)
@@ -790,7 +934,7 @@ class LaneFollower(object):
             self.entry_accept_after = (
                 self.state_started + EXIT_ENTRY_IGNORE_TIME
             )
-        if state == "FOLLOW" and previous_state == "YOLO_STOP":
+        if state == "FOLLOW" and previous_state in ("YOLO_STOP", "DELIVERING"):
             ignore_time = max(0.0, float(getattr(
                 self, "yolo_event_ignore_time", YOLO_EVENT_IGNORE_TIME
             )))
@@ -800,7 +944,7 @@ class LaneFollower(object):
                 ignore_time,
             )
         if state in ("FOLLOW", "MANEUVER", "FINAL_EXIT", "YOLO_STOP",
-                     "TRAFFIC_WAIT", "PICK_RECOVER"):
+                     "TRAFFIC_WAIT", "PICK_RECOVER", "DELIVERING"):
             self.crosswalk.unlock_bar()
         if state == "TRAFFIC_WAIT":
             self.traffic_retry_after = self.state_started
@@ -1048,6 +1192,7 @@ class LaneFollower(object):
             return False
         self.task_ledger.accept(event)
         self.yolo_stop_detection = event.detection
+        self.yolo_stop_event = event
         self.yolo_stop_reported = False
         self.yolo_stop_report_seq = self._latest_yolo_seq()
         self._set_state("YOLO_STOP")
@@ -1065,7 +1210,10 @@ class LaneFollower(object):
                 self.yolo_stop_reported = True
         if (self.yolo_stop_reported
                 and float(now) - self.state_started >= self.yolo_stop_time):
-            self._set_state("FOLLOW")
+            event = self.yolo_stop_event
+            self.yolo_stop_event = None
+            if not self._start_delivery_for_event(event):
+                self._set_state("FOLLOW")
         return True
 
     def process(self, raw_frame):
@@ -1448,14 +1596,16 @@ class LaneFollower(object):
             while not rospy.is_shutdown():
                 if self.state not in (
                         "B_PICK_PREPARE", "B_PICKING",
-                        "A_PICK_PREPARE", "A_PICKING", "PICK_FAILED"):
+                        "A_PICK_PREPARE", "A_PICKING", "DELIVERING",
+                        "PICK_FAILED"):
                     failed = self._runtime_failure()
                     if failed is not None:
                         self._pick_failed(
                             "托管进程 %s 异常退出，状态码 %s" % failed)
                 if self.state in (
                         "B_PICK_PREPARE", "B_PICKING",
-                        "A_PICK_PREPARE", "A_PICKING", "PICK_FAILED"):
+                        "A_PICK_PREPARE", "A_PICKING", "DELIVERING",
+                        "PICK_FAILED"):
                     self._handle_pick_without_frame(rospy.get_time())
                     rate.sleep()
                     continue

@@ -134,7 +134,7 @@ def parse_args(argv):
     parser.add_argument('--camera-frame', default='camera_rgb_optical_frame')
     parser.add_argument('--base-frame', default='base')
     parser.add_argument('--group', default='manipulator')
-    parser.add_argument('--tf-timeout', type=float, default=5.0)
+    parser.add_argument('--tf-timeout', type=float, default=12.0)
     parser.add_argument('--tag-min-samples', type=int,
                         default=DEFAULT_TAG_MIN_SAMPLES)
     parser.add_argument('--tag-max-mad-m', type=float,
@@ -845,11 +845,6 @@ def pose_from_tf_sample(frame_id, trans, rot):
     return pose
 
 
-def tag_sample_fallback_allowed(args):
-    return getattr(args, 'mode', '') in (
-        'teach_tag_sequence', 'teach_tag_grasp')
-
-
 def wait_for_tag_pose_in_base(listener, args, tag_id):
     tag_frame = 'tag_%d' % tag_id
     deadline = rospy.Time.now() + rospy.Duration(args.tf_timeout)
@@ -867,8 +862,9 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
     last_reported_sample_count = 0
     last_filter_report_count = 0
     rospy.loginfo(
-        '等待 tag_%d 稳定位姿：需要 %d 个新 TF，过滤后至少保留 %d 个内点。',
-        tag_id, min_samples, min_samples)
+        '等待 tag_%d 稳定位姿：需要 %d 个新 TF，过滤后至少保留 %d 个内点。'
+        '连续 %.1fs 收不到新的有效 TF 才超时。',
+        tag_id, min_samples, min_samples, args.tf_timeout)
     while not rospy.is_shutdown() and rospy.Time.now() < deadline:
         try:
             common_time = listener.getLatestCommonTime(
@@ -883,12 +879,16 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
                 continue
             stamp_ns = int(common_time.to_nsec())
             if append_unique_tag_sample(samples, seen_stamps, stamp_ns, trans, rot):
+                # Treat tf_timeout as an inactivity timeout. A slow detector may
+                # need longer than tf_timeout in total to produce enough unique
+                # frames, but every fresh frame proves that the pipeline is alive.
+                deadline = rospy.Time.now() + rospy.Duration(args.tf_timeout)
                 if len(samples) != last_reported_sample_count:
                     last_reported_sample_count = len(samples)
                     rospy.loginfo(
-                        'tag_%d 已采集新 TF：%d/%d，当前帧 age=%.2fs。',
+                        'tag_%d 已采集新 TF：%d/%d，源帧 stamp=%.3f，age=%.2fs。',
                         tag_id, min(len(samples), min_samples),
-                        min_samples, age_seconds)
+                        min_samples, stamp_ns / 1000000000.0, age_seconds)
             if len(samples) >= min_samples:
                 try:
                     filtered = filter_tag_translation_samples(
@@ -926,13 +926,6 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
                 tf.ExtrapolationException):
             pass
         rospy.sleep(0.02)
-    if latest_pose is not None and tag_sample_fallback_allowed(args):
-        rospy.logwarn(
-            'tag_%d 有 TF，但多帧稳定采样没有完成'
-            '（样本=%d/%d，最新帧age=%s）。示教模式下改用最新一帧 TF。',
-            tag_id, len(samples), min_samples,
-            'unknown' if latest_age_seconds is None else '%.2fs' % latest_age_seconds)
-        return latest_pose
     if samples:
         if latest_filter_error is not None:
             raise RuntimeError(
@@ -941,7 +934,7 @@ def wait_for_tag_pose_in_base(listener, args, tag_id):
                 % (tag_id, min_samples, len(samples), latest_filter_error))
         raise RuntimeError(
             'tag_%d did not provide enough stable, fresh, unique TF samples: '
-            'collected %d, need %d within %.1fs.'
+            'collected %d, need %d; no new valid TF arrived for %.1fs.'
             % (tag_id, len(samples), min_samples, args.tf_timeout))
     if latest_pose is not None:
         raise RuntimeError(

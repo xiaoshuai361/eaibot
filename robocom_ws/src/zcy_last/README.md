@@ -1,6 +1,6 @@
 # 九路口比赛任务
 
-`zcy_last` 是九路口循迹、任务识别、红绿灯等待和机械臂抓取的一键启动版本。旧版 `line_cy_task.py` 保留为比赛回退入口，新版不会在运行时导入旧文件。
+`zcy_last` 是九路口循迹、任务识别、红绿灯等待、机械臂抓取和物资投递的一键启动版本。旧版 `line_cy_task.py` 保留为比赛回退入口，新版不会在运行时导入旧文件。
 
 ## 目录
 
@@ -45,10 +45,10 @@ cd /home/eaibot/robocom_ws/src
 # 纯循迹，不抓取
 python3 -m zcy_last.main
 
-# 仅开始前执行 B 点有 Tag 抓取
+# 仅开始前执行 B 点有 Tag 抓取，并在第一圈自动投递
 python3 -m zcy_last.main --tag-pick --tag-pick-count 2
 
-# 仅第 3 个路口完成后执行 A 点无 Tag 抓取
+# 仅第 3 个路口完成后执行 A 点无 Tag 抓取，并在楼宇处自动投递
 python3 -m zcy_last.main --untagged-pick --untagged-pick-count 3
 
 # B 点和 A 点都抓取
@@ -59,6 +59,10 @@ python3 -m zcy_last.main \
 
 命令行开关优先于 `config.py` 顶部默认值。抓取数量范围为 `1..4`，表示必须成功完成的数量；目标按当前画面从左到右选择，目标不足或任一目标失败都会进入 `PICK_FAILED` 永久停车。
 
+B 点有 Tag 和 A 点无 Tag 各有独立抓取、投递开关。临时只抓取不投递分别加 `--no-tag-delivery` 或 `--no-untagged-delivery`；投递只有在对应抓取开启且库存中存在目标 ID 时才执行。
+
+B 点投递映射：普通人群 `1`、医疗人群 `2`、可回收垃圾 `3`、其他垃圾 `4`。A 点投递映射：电力故障楼宇 `1`、火灾楼宇 `2`、有毒气体楼宇 `3`、坍塌楼宇 `4`。程序只使用抓取脚本返回的实际成功 ID，不使用计划抓取数量代替库存。
+
 已经手动启动全部 ROS 依赖时，可在调试中增加 `--external-ros`。此模式不托管、不检查也不关闭外部进程，不用于正式比赛的一键启动。
 
 ## 状态机
@@ -66,13 +70,16 @@ python3 -m zcy_last.main \
 ```text
 STARTUP
   -> B_PICK_PREPARE -> B_PICKING -> PICK_RECOVER
-  -> FOLLOW -> APPROACH -> ALIGN -> TRAFFIC_WAIT
+  -> FOLLOW -> YOLO_STOP -> DELIVERING -> FOLLOW
+  -> APPROACH -> ALIGN -> TRAFFIC_WAIT
   -> MANEUVER -> EXIT_ALIGN
   -> A_PICK_PREPARE -> A_PICKING -> PICK_RECOVER
   -> FINAL_EXIT -> DONE
 ```
 
-抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。抓取完成后必须连续稳定识别车道才能恢复 `FOLLOW`。抓取、依赖进程或车道恢复失败都会进入 `PICK_FAILED`。
+抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。抓取完成后必须连续稳定识别车道才能恢复 `FOLLOW`。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存；投递时底盘停车，完成后恢复 `FOLLOW`。
+
+抓取、依赖进程或车道恢复失败会进入 `PICK_FAILED`。投递失败例外：终端输出警告、该 ID 不再自动重试，并继续循迹。
 
 ## 摄像头切换
 

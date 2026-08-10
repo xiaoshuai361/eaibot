@@ -51,6 +51,31 @@ def test_pick_count_must_be_between_one_and_four(option, count):
         task_main.parse_args([option, str(count)])
 
 
+def test_tag_delivery_requires_tag_pick_and_can_be_disabled():
+    enabled, _ = task_main.parse_args(["--tag-pick", "--tag-delivery"])
+    disabled, _ = task_main.parse_args([
+        "--tag-pick", "--no-tag-delivery"])
+    no_inventory, _ = task_main.parse_args([
+        "--no-tag-pick", "--tag-delivery"])
+
+    assert enabled.tag_delivery is True
+    assert disabled.tag_delivery is False
+    assert no_inventory.tag_delivery is False
+
+
+def test_untagged_delivery_requires_untagged_pick_and_can_be_disabled():
+    enabled, _ = task_main.parse_args([
+        "--untagged-pick", "--untagged-delivery"])
+    disabled, _ = task_main.parse_args([
+        "--untagged-pick", "--no-untagged-delivery"])
+    no_inventory, _ = task_main.parse_args([
+        "--no-untagged-pick", "--untagged-delivery"])
+
+    assert enabled.untagged_delivery is True
+    assert disabled.untagged_delivery is False
+    assert no_inventory.untagged_delivery is False
+
+
 @pytest.mark.parametrize(
     "argv,expected_calls",
     [

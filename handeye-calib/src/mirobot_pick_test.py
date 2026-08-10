@@ -188,6 +188,7 @@ def parse_args(argv):
     parser.add_argument("--sequence", default="1,2,3,4")
     parser.add_argument("--max-targets", type=int)
     parser.add_argument("--fail-on-skip", action="store_true")
+    parser.add_argument("--result-file")
     parser.add_argument("--wait-key-between-targets", action="store_true")
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
@@ -947,6 +948,28 @@ def target_number(config, target):
         raise RuntimeError("Target %s has no valid target_id." % target)
 
 
+def write_chassis_sequence_result(path, completed_ids):
+    """原子记录无 Tag 连续抓取实际完成的物资 ID。"""
+    if not path:
+        return
+    path = os.path.abspath(os.path.expanduser(path))
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    temporary = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(temporary, "w") as handle:
+            json.dump({"completed_ids": list(completed_ids)}, handle,
+                      sort_keys=True)
+            handle.write("\n")
+        os.rename(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
 def make_chassis_twist(linear_x):
     message = Twist()
     message.linear.x = float(linear_x)
@@ -1280,6 +1303,9 @@ def run_block_chassis_sequence(args, config, detector):
         raise RuntimeError(
             "--max-targets must be between 1 and the sequence length.")
     completed = 0
+    completed_ids = []
+    result_file = getattr(args, "result_file", None)
+    write_chassis_sequence_result(result_file, completed_ids)
     try:
         while (remaining_targets and completed < total
                and not rospy.is_shutdown()):
@@ -1301,6 +1327,8 @@ def run_block_chassis_sequence(args, config, detector):
                     config, target, settings, args.skip_startup_home)
             remaining_targets.remove(target)
             completed += 1
+            completed_ids.append(target_number(config, target))
+            write_chassis_sequence_result(result_file, completed_ids)
             if (args.wait_key_between_targets and remaining_targets
                     and completed < total):
                 wait_between_sequence_targets(

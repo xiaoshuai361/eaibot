@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 
+import json
 import sys
 import time
 import types
@@ -47,6 +48,9 @@ class FakeSupervisor(object):
     def start_astra(self):
         self.calls.append("start_astra")
 
+    def start_arm_common(self):
+        self.calls.append("start_arm_common")
+
     def stop_astra(self):
         self.calls.append("stop_astra")
 
@@ -59,6 +63,11 @@ class FakeSupervisor(object):
     def run_job(self, name, command):
         self.calls.append(name)
         self.command = list(command)
+        if "--result-file" in command and self.result == 0:
+            path = command[command.index("--result-file") + 1]
+            count = int(command[command.index("--max-targets") + 1])
+            with open(path, "w") as handle:
+                json.dump({"completed_ids": list(range(1, count + 1))}, handle)
         return self.result
 
 
@@ -68,6 +77,12 @@ class FakeCoordinator(object):
 
     def start(self, kind, count):
         self.calls.append((kind, count))
+
+    def start_delivery(self, source, item_ids):
+        self.calls.append(("delivery", source, list(item_ids)))
+
+    def completed_items(self):
+        return [1, 2]
 
     def poll(self):
         return None, None
@@ -111,6 +126,53 @@ def test_untagged_pick_failure_stops_camera_and_arm_stack():
     assert error is not None
     assert supervisor.calls[0] == "start_astra"
     assert supervisor.calls[-2:] == ["stop_astra", "stop_arm_common"]
+
+
+def test_untagged_pick_reports_actual_inventory_and_can_keep_arm():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(
+        supervisor, keep_arm_after_untagged=True, python3="/env/python3")
+
+    coordinator.start("untagged", 2)
+    result, error = _wait_result(coordinator)
+
+    assert result is True
+    assert error is None
+    assert coordinator.completed_items() == [1, 2]
+    assert "--result-file" in supervisor.command
+    assert supervisor.calls[-1] == "stop_astra"
+    assert "stop_arm_common" not in supervisor.calls
+
+
+def test_delivery_command_uses_only_requested_inventory_id():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+
+    coordinator.start_delivery("tag", [3])
+    result, error = _wait_result(coordinator)
+
+    assert result is True
+    assert error is None
+    assert supervisor.calls[:2] == ["start_arm_common", "delivery"]
+    assert supervisor.command[
+        supervisor.command.index("--sequence") + 1] == "3"
+
+
+def test_untagged_delivery_uses_its_own_motion_presets():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+
+    coordinator.start_delivery("untagged", [2])
+    result, error = _wait_result(coordinator)
+
+    assert result is True
+    assert error is None
+    assert supervisor.command[
+        supervisor.command.index("--delivery-file") + 1].endswith(
+            "/untagged_delivery_presets.json")
+    assert supervisor.command[
+        supervisor.command.index("--tag-preset-file") + 1].endswith(
+            "/block_mono_pick_place_presets.json")
 
 
 def test_line_publisher_is_suppressed_while_grasp_owns_chassis():
@@ -188,3 +250,103 @@ def test_completed_untagged_pick_is_not_triggered_twice():
 
     assert follower.task_index == 3
     assert follower.states == ["profile_switched", "FOLLOW"]
+
+
+def test_completed_untagged_pick_records_actual_inventory():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.grasp_coordinator.completed_items = lambda: [1, 2]
+    follower.untagged_pick_count = 2
+    follower.untagged_inventory = []
+    follower.untagged_pick_completed = False
+    follower.velocity_owner = "grasp"
+    follower.bridge = types.SimpleNamespace(reset=lambda _width: None)
+    follower.lane_width = 620.0
+    follower.stop_hits = 3
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._resume_yolo = lambda profile: profile == "building"
+    follower._set_state = follower.states.append
+
+    follower._finish_pick("untagged")
+
+    assert follower.untagged_inventory == [1, 2]
+    assert follower.untagged_pick_completed is True
+    assert follower.velocity_owner == "line"
+    assert follower.states == ["PICK_RECOVER"]
+
+
+def test_street_event_delivers_only_matching_tag_inventory():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.enable_tag_delivery = True
+    follower.enable_untagged_delivery = False
+    follower.tag_inventory = [1, 3]
+    follower.untagged_inventory = []
+    follower.tag_delivery_failed_ids = set()
+    follower.untagged_delivery_failed_ids = set()
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.velocity_owner = "line"
+    follower.active_delivery_source = None
+    follower.active_delivery_id = None
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._set_state = follower.states.append
+    event = types.SimpleNamespace(
+        kind="street", area="C区", class_name="Recyclable waste",
+        display_name="可回收垃圾")
+
+    assert follower._start_delivery_for_event(event) is True
+    assert follower.active_delivery_id == 3
+    assert follower.velocity_owner == "grasp"
+    assert follower.grasp_coordinator.calls == [("delivery", "tag", [3])]
+    assert follower.states == ["DELIVERING"]
+
+
+def test_building_event_delivers_only_matching_untagged_inventory():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.enable_tag_delivery = False
+    follower.enable_untagged_delivery = True
+    follower.tag_inventory = []
+    follower.untagged_inventory = [1, 4]
+    follower.tag_delivery_failed_ids = set()
+    follower.untagged_delivery_failed_ids = set()
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.velocity_owner = "line"
+    follower.active_delivery_source = None
+    follower.active_delivery_id = None
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._set_state = follower.states.append
+    event = types.SimpleNamespace(
+        kind="building", area="楼宇A", class_name="Collapsed Building",
+        display_name="坍塌楼宇")
+
+    assert follower._start_delivery_for_event(event) is True
+    assert follower.active_delivery_source == "untagged"
+    assert follower.active_delivery_id == 4
+    assert follower.grasp_coordinator.calls == [
+        ("delivery", "untagged", [4])]
+    assert follower.states == ["DELIVERING"]
+
+
+def test_delivery_failure_warns_and_resumes_follow_without_retry():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.active_delivery_source = "tag"
+    follower.active_delivery_id = 2
+    follower.tag_inventory = [2]
+    follower.untagged_inventory = []
+    follower.tag_delivery_failed_ids = set()
+    follower.untagged_delivery_failed_ids = set()
+    follower.enable_untagged_pick = False
+    follower.process_supervisor = FakeSupervisor()
+    follower.velocity_owner = "grasp"
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._set_state = follower.states.append
+
+    follower._finish_delivery(False, RuntimeError("motion failed"))
+
+    assert follower.tag_inventory == [2]
+    assert follower.tag_delivery_failed_ids == {2}
+    assert follower.velocity_owner == "line"
+    assert follower.states == ["FOLLOW"]

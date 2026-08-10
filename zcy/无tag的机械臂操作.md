@@ -46,7 +46,7 @@ roslaunch astra_camera astrapro.launch
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
-roslaunch mirobot_moveit_config mirobot.launch start_rviz:=true
+roslaunch mirobot_moveit_config mirobot.launch start_rviz:=false
 ```
 
 比赛运行时可关闭 RViz：
@@ -267,7 +267,7 @@ conda activate ww
 cd /home/eaibot/handeye-calib/src
 
 python3 block_pick_main.py \
-  --target 1 \
+  --target 4 \
   --teach-block-grasp \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
@@ -292,7 +292,7 @@ conda activate ww
 cd /home/eaibot/handeye-calib/src
 
 python3 block_pick_main.py \
-  --target 1 \
+  --target 3 \
   --run-taught-block \
   --pregrasp-distance-mm 70 \
   --confidence 0.5 \

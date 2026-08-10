@@ -264,6 +264,7 @@ def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
         "--skip-startup-home",
         "--max-detection-age-seconds", "1.5",
         "--chassis-settle-seconds", "0.8",
+        "--result-file", "/tmp/tag-result.json",
     ])
 
     assert args.sequence == [1, 2]
@@ -274,6 +275,19 @@ def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
     assert args.skip_startup_home is True
     assert args.max_detection_age_seconds == pytest.approx(1.5)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
+    assert args.result_file == "/tmp/tag-result.json"
+
+
+def test_result_file_records_completed_ids_atomically(tmp_path):
+    write_result_file, = load_symbols("write_result_file")
+    path = tmp_path / "tag-result.json"
+
+    write_result_file(str(path), [3, 1])
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "completed_ids": [3, 1]
+    }
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_parse_args_defaults_match_competition_short_command():
@@ -287,7 +301,7 @@ def test_parse_args_defaults_match_competition_short_command():
     assert args.target_roi_ratio == pytest.approx([0.06, 0.0, 0.24, 1.0])
     assert args.drive_speed == pytest.approx(0.012)
     assert args.align_tolerance_px == pytest.approx(12.0)
-    assert args.stable_frames == 4
+    assert args.stable_frames == 1
     assert args.max_detection_age_seconds == pytest.approx(4.0)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.tag_tf_wait_seconds == pytest.approx(10.0)

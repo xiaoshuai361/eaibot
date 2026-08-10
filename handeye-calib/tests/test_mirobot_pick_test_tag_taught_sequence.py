@@ -114,14 +114,14 @@ def test_parse_args_has_no_post_pick_place_joint_alignment():
     assert not hasattr(args, "tag_sample_seconds")
     assert args.tag_min_samples == 5
     assert args.tag_max_age_seconds == pytest.approx(2.0)
+    assert args.tf_timeout == pytest.approx(12.0)
     assert args.velocity_scale == pytest.approx(0.4)
     assert args.acceleration_scale == pytest.approx(0.4)
     assert parse_args(["prog", "--mode", "teach_carry"]).mode == "teach_carry"
 
 
-def test_teach_tag_pose_falls_back_to_latest_tf_when_strict_sampling_has_no_fresh_frames():
+def test_teach_tag_pose_rejects_stale_tf_instead_of_falling_back():
     wait_for_tag_pose_in_base, = load_module_symbols("wait_for_tag_pose_in_base")
-    warnings = []
 
     class FakeDuration:
         def __init__(self, seconds):
@@ -176,7 +176,7 @@ def test_teach_tag_pose_falls_back_to_latest_tf_when_strict_sampling_has_no_fres
             is_shutdown=lambda: False,
             sleep=lambda seconds: None,
             loginfo=lambda *items: None,
-            logwarn=lambda *items: warnings.append(items),
+            logwarn=lambda *items: None,
         ),
         "tf": SimpleNamespace(
             Exception=Exception,
@@ -186,12 +186,8 @@ def test_teach_tag_pose_falls_back_to_latest_tf_when_strict_sampling_has_no_fres
         ),
     })
 
-    pose = wait_for_tag_pose_in_base(FakeListener(), args, 4)
-
-    assert pose.pose.position.x == pytest.approx(0.24)
-    assert pose.pose.position.y == pytest.approx(0.08)
-    assert pose.pose.position.z == pytest.approx(0.11)
-    assert warnings
+    with pytest.raises(RuntimeError, match="visible but too old"):
+        wait_for_tag_pose_in_base(FakeListener(), args, 4)
 
 
 def test_filter_tag_translation_samples_requires_five_inliers_after_mad_filtering():
@@ -213,7 +209,7 @@ def test_filter_tag_translation_samples_requires_five_inliers_after_mad_filterin
     assert filtered["position"] == pytest.approx([0.100, 0.200, 0.300])
 
 
-def test_wait_for_tag_pose_keeps_collecting_until_five_mad_inliers():
+def test_wait_for_tag_pose_resets_inactivity_timeout_for_each_unique_tf():
     wait_for_tag_pose_in_base, = load_module_symbols("wait_for_tag_pose_in_base")
     logs = []
 
@@ -270,7 +266,9 @@ def test_wait_for_tag_pose_keeps_collecting_until_five_mad_inliers():
         mode="run_taught_sequence",
         base_frame="base",
         camera_frame="camera_rgb_optical_frame",
-        tf_timeout=1.0,
+        # Five samples take longer than this in total in the fake clock. The
+        # function must still succeed because every unique TF resets the timer.
+        tf_timeout=0.05,
         tag_min_samples=5,
         tag_max_mad_m=0.005,
         tag_max_age_seconds=2.0,
