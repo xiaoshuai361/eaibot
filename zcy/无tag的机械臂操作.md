@@ -371,7 +371,16 @@ Z_height = a_height / 框高像素 + b_height
 真实距离是 `/dev/video2` RGB 镜头平面到楼宇正面的垂直距离。每次测量时车辆和
 摄像机保持正对楼面，楼宇 YOLO 框必须完整，不能碰到画面边缘。
 
-先关闭比赛主程序以及其他占用 `/dev/video2` 的程序，然后按 ID 分别运行：
+该标定是独立的纯视觉程序，只需要下面这一个终端。**不需要**提前启动底盘、
+MoveIt、RViz、Astra、手眼 TF、机械臂节点或比赛主程序。运行前必须关闭
+`zcy_last.main`、楼宇预览以及其他占用 `/dev/video2` 的程序；不确定时可先检查：
+
+```bash
+fuser /dev/video2
+```
+
+没有任何输出表示摄像头空闲；若输出 PID，应先正常退出对应程序，不要直接删除
+文件或强行清理机械臂锁。确认 `/dev/video2` 空闲后，按 ID 分别运行：
 
 ```bash
 source /opt/ros/melodic/setup.bash
