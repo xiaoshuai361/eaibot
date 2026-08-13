@@ -444,6 +444,36 @@ def test_parent_interrupt_always_stops_active_arm_child(monkeypatch):
     assert child.terminated is True
 
 
+def test_repeated_interrupt_during_cleanup_force_kills_child():
+    class FakeChild:
+        def __init__(self):
+            self.running = True
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return None if self.running else -9
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            if not self.killed:
+                raise KeyboardInterrupt()
+            self.running = False
+            return -9
+
+        def kill(self):
+            self.killed = True
+
+    child = FakeChild()
+
+    assert main.stop_child(child) is None
+    assert child.terminated is True
+    assert child.killed is True
+    assert child.poll() == -9
+
+
 def test_parent_handles_terminal_close_and_termination_signals(monkeypatch):
     installed = {}
     monkeypatch.setattr(

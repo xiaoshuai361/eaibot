@@ -509,12 +509,18 @@ def stop_child(child):
         return exc
     try:
         child.wait(timeout=STOP_CHILD_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        try:
-            child.kill()
-            child.wait(timeout=STOP_CHILD_TIMEOUT)
-        except Exception as exc:
-            return exc
+        return None
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        pass
+    except Exception as exc:
+        return exc
+    try:
+        child.kill()
+        while child.poll() is None:
+            try:
+                child.wait(timeout=STOP_CHILD_TIMEOUT)
+            except KeyboardInterrupt:
+                continue
     except Exception as exc:
         return exc
     return None
