@@ -2261,6 +2261,9 @@ def teach_building_contact_release(args, config, detector):
         arm.get_current_pose().pose.orientation)
     assist_pose = build_teach_assist_pose(
         localization, current_orientation, config)
+    assist_pose.pose.position.z = finite_scalar(
+        config["teach_assist_base_z_mm"],
+        "teach_assist_base_z_mm") * 0.001
     validate_pose_workspace(
         assist_pose, config,
         "building_%d_teach_assist_front" % item_id)

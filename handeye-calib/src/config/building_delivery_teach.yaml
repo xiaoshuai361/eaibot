@@ -45,6 +45,8 @@ tf_timeout: 5.0
 
 # 楼宇示教先到检测楼面前40mm，再由RViz微调P。
 teach_assist_distance_mm: 40.0
+# 楼宇框上下边可能被裁切；辅助点使用此前无 Tag 真机约119mm的可达高度。
+teach_assist_base_z_mm: 120.0
 velocity_scale: 0.05
 acceleration_scale: 0.05
 planning_time: 5.0

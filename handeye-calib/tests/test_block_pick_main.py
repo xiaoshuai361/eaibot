@@ -201,6 +201,7 @@ def test_building_teach_assist_constrains_position_only():
 
     assert "arm.set_position_target" in execute_source
     assert "position_only=True" in function_source
+    assert 'config["teach_assist_base_z_mm"]' in function_source
     assert 'pickup_model["orientation_xyzw_base"]' not in function_source
 
 
