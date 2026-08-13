@@ -44,7 +44,7 @@ def test_building_teach_config_maps_all_four_building_classes():
         config = yaml.safe_load(stream)
 
     assert config["frames_required"] == 5
-    assert config["teach_assist_distance_mm"] == pytest.approx(85.0)
+    assert config["teach_assist_distance_mm"] == pytest.approx(40.0)
     assert config["grasp_roi_ratio"] == [0.17, 0.0, 0.54, 1.0]
     assert {
         target: (entry["target_id"], entry["class_id"])

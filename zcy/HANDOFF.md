@@ -300,7 +300,7 @@ A_PICK_PREPARE：停车，启动 Astra/机械臂/无Tag模型
 楼宇视觉标定：/home/eaibot/handeye-calib/config/building_delivery_calibration.json
 ```
 
-无 Tag 投递顺序：楼宇同类框锁定并对准 -> 启动回零 -> 仓内抓取点上方约 5cm -> 仓内抓取点 -> 开泵 -> 直线上升约 5cm -> 共享中转点 -> 该类 P 后方30mm -> 开限位 -> 5mm步长到P -> 2mm步长前探最多65mm -> 关泵等待0.7秒 -> 直退30mm -> idle。走满65mm未触发仍按用户决定强制释放并记成功；限位服务、串口或轨迹错误必须保持泵开启并返回失败。正式循迹投递的底盘视觉仍直接使用任务摄像头，不依赖手眼；但四类 P 示教复用无 Tag 抓取的 Python3+Python2 链路：先到无 Tag idle，再通过 Astra 矫正 RGB、CameraInfo、各类框宽距离模型和已有手眼 TF 定位楼面，自动移动到楼面前约85mm，最后由用户在RViz微调P。持续预览使用 `block_pick_main.py --live-preview` 订阅同一ROS图像话题，不再直接占用 `/dev/video2`。
+无 Tag 投递顺序：楼宇同类框锁定并对准 -> 启动回零 -> 仓内抓取点上方约 5cm -> 仓内抓取点 -> 开泵 -> 直线上升约 5cm -> 共享中转点 -> 该类 P 后方30mm -> 开限位 -> 5mm步长到P -> 2mm步长前探最多65mm -> 关泵等待0.7秒 -> 直退30mm -> idle。走满65mm未触发仍按用户决定强制释放并记成功；限位服务、串口或轨迹错误必须保持泵开启并返回失败。正式循迹投递的底盘视觉仍直接使用任务摄像头，不依赖手眼；但四类 P 示教复用无 Tag 抓取的 Python3+Python2 链路：先到无 Tag idle，再通过 Astra 矫正 RGB、CameraInfo、各类框宽距离模型和已有手眼 TF 定位楼面，自动移动到楼面前约40mm，最后由用户在RViz微调P。持续预览使用 `block_pick_main.py --live-preview` 订阅同一ROS图像话题，不再直接占用 `/dev/video2`。
 
 绝不能覆盖以下真机采集数据：
 

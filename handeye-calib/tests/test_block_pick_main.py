@@ -190,14 +190,18 @@ def test_building_contact_teach_forwards_delivery_and_block_presets():
     assert "--overwrite" in command
 
 
-def test_building_teach_uses_taught_pickup_orientation_after_idle():
+def test_building_teach_assist_constrains_position_only():
     source = Path(main.__file__).with_name(
         "mirobot_pick_test.py").read_text(encoding="utf-8")
+    execute_start = source.index("def execute_pose")
+    execute_source = source[
+        execute_start:source.index("\ndef ", execute_start + 1)]
     start = source.index("def teach_building_contact_release")
     function_source = source[start:source.index("\ndef ", start + 1)]
 
-    assert 'pickup_model["orientation_xyzw_base"]' in function_source
-    assert "arm.get_current_pose().pose.orientation" not in function_source
+    assert "arm.set_position_target" in execute_source
+    assert "position_only=True" in function_source
+    assert 'pickup_model["orientation_xyzw_base"]' not in function_source
 
 
 def test_chassis_sequence_is_targetless_and_ignores_legacy_wait_option():

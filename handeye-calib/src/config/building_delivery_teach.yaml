@@ -43,8 +43,8 @@ camera_frame: camera_rgb_optical_frame
 base_frame: base
 tf_timeout: 5.0
 
-# 与无 Tag 物块示教一致：先到检测楼面前85mm，再由RViz微调P。
-teach_assist_distance_mm: 85.0
+# 楼宇示教先到检测楼面前40mm，再由RViz微调P。
+teach_assist_distance_mm: 40.0
 velocity_scale: 0.05
 acceleration_scale: 0.05
 planning_time: 5.0

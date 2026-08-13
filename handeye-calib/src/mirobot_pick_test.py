@@ -1747,11 +1747,16 @@ def build_move_group(config, group_name):
     return arm
 
 
-def execute_pose(arm, target_pose, label):
+def execute_pose(arm, target_pose, label, position_only=False):
     rospy.loginfo("Executing %s", label)
     for attempt in range(2):
         arm.set_start_state_to_current_state()
-        arm.set_pose_target(target_pose)
+        if position_only:
+            position = target_pose.pose.position
+            arm.set_position_target([
+                position.x, position.y, position.z])
+        else:
+            arm.set_pose_target(target_pose)
         success = arm.go(wait=True)
         arm.stop()
         arm.clear_pose_targets()
@@ -2242,13 +2247,6 @@ def teach_building_contact_release(args, config, detector):
     block_preset = load_block_preset(args.preset_file)
     idle_joint_values = require_joint_values(
         block_preset, "idle_joint_values")
-    block_entry = block_preset.get("targets", {}).get(target)
-    if not isinstance(block_entry, dict):
-        raise RuntimeError(
-            "No taught no-Tag pickup model for target %s." % target)
-    pickup_model = require_block_pickup_model(block_entry, target)
-    pickup_orientation = normalize_quaternion(
-        pickup_model["orientation_xyzw_base"])
     arm = build_move_group(config, args.group)
     prompt_enter(
         u"示教 ID%d=%s：确认路径安全，按 Enter 先自动移动到"
@@ -2259,11 +2257,10 @@ def teach_building_contact_release(args, config, detector):
         "building_%d_teach_idle" % item_id)
 
     localization = compute_block_localization(args, config, detector)
-    assist_orientation = PoseStamped().pose.orientation
-    (assist_orientation.x, assist_orientation.y,
-     assist_orientation.z, assist_orientation.w) = pickup_orientation
+    current_orientation = copy.deepcopy(
+        arm.get_current_pose().pose.orientation)
     assist_pose = build_teach_assist_pose(
-        localization, assist_orientation, config)
+        localization, current_orientation, config)
     validate_pose_workspace(
         assist_pose, config,
         "building_%d_teach_assist_front" % item_id)
@@ -2278,7 +2275,8 @@ def teach_building_contact_release(args, config, detector):
     try:
         execute_pose(
             arm, assist_pose,
-            "building_%d_teach_assist_front" % item_id)
+            "building_%d_teach_assist_front" % item_id,
+            position_only=True)
     except RuntimeError as exc:
         rospy.logwarn(
             "Building teach-assist move failed: %s. Continue with RViz.",
