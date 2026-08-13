@@ -258,6 +258,9 @@ def require_delivery_items(preset, sequence, cargo_pick_preset=None,
     if not contact_release:
         release = validate_joint_values(
             preset.get('delivery_joint_values'), 'delivery_joint_values')
+    shared_contact_target = contact_targets.get('1')
+    if contact_release and not isinstance(shared_contact_target, dict):
+        raise RuntimeError('缺少共享接触投递点，请先示教 ID1。')
     cargo_source = cargo_pick_preset or preset
     cargo_points = cargo_source.get('cargo_pick_joint_values_by_id', {})
     result = {}
@@ -270,16 +273,12 @@ def require_delivery_items(preset, sequence, cargo_pick_preset=None,
             'transit_joint_values': list(transit),
         }
         if contact_release:
-            target = contact_targets.get(key)
-            if not isinstance(target, dict):
-                raise RuntimeError(
-                    'ID%d 缺少独立接触投递示教点。' % item_id)
             item['precontact_joint_values'] = validate_joint_values(
-                target.get('precontact_joint_values'),
-                'ID%d.precontact_joint_values' % item_id)
+                shared_contact_target.get('precontact_joint_values'),
+                '共享ID1.precontact_joint_values')
             item['approach_axis_xyz_base'] = normalize_axis(
-                target.get('approach_axis_xyz_base'),
-                'ID%d.approach_axis_xyz_base' % item_id)
+                shared_contact_target.get('approach_axis_xyz_base'),
+                '共享ID1.approach_axis_xyz_base')
         else:
             item['delivery_joint_values'] = list(release)
         result[key] = item
@@ -438,29 +437,27 @@ def teach_delivery_point(args, arm):
 
 
 def teach_contact_release(args, arm):
+    if args.sequence != [1]:
+        raise RuntimeError('四类楼宇共用 power 投递点，示教时请使用 --sequence 1。')
     preset = load_delivery_preset(args.delivery_file, allow_missing=True)
     targets = preset['contact_delivery_targets_by_id']
     safe_axis = camera_safe_axis_in_base(
         args.base_frame, args.camera_frame, args.tf_timeout)
-    for index, item_id in enumerate(args.sequence, 1):
-        key = str(item_id)
-        if key in targets and not args.overwrite:
-            raise RuntimeError(
-                'ID%d 已有接触投递点，重采时请加 --overwrite。' % item_id)
-        prompt_enter(
-            '示教 ID%d（%d/%d）：预投递点 P\n'
-            '请把车辆放在450mm参考距离，再在RViz中将吸盘移动到'
-            '靠近、正对但不接触对应楼面的姿态。' %
-            (item_id, index, len(args.sequence)))
-        targets[key] = {
-            'precontact_joint_values': record_current_joints(
-                arm, args.teach_settle_seconds),
-            'approach_axis_xyz_base': list(safe_axis),
-        }
-        save_delivery_preset(args.delivery_file, preset)
-        rospy.loginfo(
-            'ID%d 预投递点P已保存：joints=%s safe_axis=%s',
-            item_id, targets[key]['precontact_joint_values'], safe_axis)
+    if '1' in targets and not args.overwrite:
+        raise RuntimeError('已有共享接触投递点，重采时请加 --overwrite。')
+    prompt_enter(
+        '示教四类楼宇共享的预投递点 P\n'
+        '请把车辆放在450mm参考距离，再在RViz中将吸盘移动到'
+        '靠近、正对但不接触 power 楼面的姿态。')
+    targets['1'] = {
+        'precontact_joint_values': record_current_joints(
+            arm, args.teach_settle_seconds),
+        'approach_axis_xyz_base': list(safe_axis),
+    }
+    save_delivery_preset(args.delivery_file, preset)
+    rospy.loginfo(
+        '四类共享预投递点P已保存：joints=%s safe_axis=%s',
+        targets['1']['precontact_joint_values'], safe_axis)
 
 
 def build_delivery_actions(item, idle_joint_values):

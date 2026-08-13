@@ -314,7 +314,7 @@ python3 block_pick_main.py \
 
 ```text
 楼宇视觉距离标定：building_delivery_calibration.json
-四类机械臂投递点P：untagged_delivery_presets.json
+四类楼宇共享的机械臂投递点P（保存在ID1）：untagged_delivery_presets.json
 ```
 
 ### 9.1 先备份真机数据
@@ -406,7 +406,7 @@ python3 -m zcy_last.building_delivery_calibrate \
 保存。旧的 `version: 1/2` 文件不能继续使用，必须备份后重新完成四类
 多距离标定；不要手工修改 JSON 绕过检查。
 
-### 9.3 示教四类机械臂预投递点 P
+### 9.3 示教四类楼宇共享的预投递点 P
 
 楼宇距离标定完成后，把车辆正对楼面停在 `450mm` 参考距离。示教时不再让程序
 根据 YOLO 自动规划辅助点，只手动保存一个靠近楼面但不接触的预投递点 P。
@@ -450,8 +450,7 @@ roslaunch easy_handeye publish.launch \
 |   3 | 有毒气体楼宇 |
 |   4 | 坍塌楼宇     |
 
-终端4，每类单独示教。下面以电力故障楼宇 ID1 为例；将 `--sequence` 改为
-`1~4`，分别执行四次：
+终端4，只需使用电力故障楼宇 ID1 示教一次：
 
 ```bash
 source /opt/ros/melodic/setup.bash
@@ -475,12 +474,12 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
 4. 回到示教终端按 Enter，保存当前六关节角
 ```
 
-四类楼宇的 P 独立保存，因此四类都要各示教一次。程序只保存一个 P，不再采集
-后方参考点，也不再创建自动辅助点。已有该类数据时必须加 `--overwrite` 才会替换。
+ID1 保存为四类楼宇共享的 P；ID2～4 正式投递时也读取这一个姿态和前探方向。
+程序不再采集后方参考点，也不再创建自动辅助点。重采时必须加 `--overwrite`。
 
 ### 9.4 单类空载验证接触投递动作
 
-先确认共享仓内抓取点、无 Tag 中转点以及对应 ID 的 P 都已经示教。验证时可以不
+先确认共享仓内抓取点、无 Tag 中转点以及共享 P 已经示教。验证时可以不
 在载物仓放物资，让吸泵空吸，只检查运动、限位和退回顺序：
 
 ```bash
@@ -512,7 +511,7 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
 
 ## 10. 正式循迹自动投递
 
-完成四类楼宇距离标定和四类 P 示教后，正式任务使用：
+完成四类楼宇距离标定和一次共享 P 示教后，正式任务使用：
 
 ```bash
 cd /home/eaibot/robocom_ws/src

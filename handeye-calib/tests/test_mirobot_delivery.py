@@ -173,15 +173,20 @@ def test_delivery_items_can_share_cargo_pick_points_across_motion_presets():
         untagged_delivery["delivery_joint_values"])
 
 
-def test_contact_delivery_reads_independent_pose_and_axis_for_each_id():
+def test_contact_delivery_uses_power_pose_and_axis_for_every_id():
     require_delivery_items, = load_symbols("require_delivery_items")
     preset = make_contact_delivery_preset(item_ids=(1, 2, 3, 4))
+    preset["contact_delivery_targets_by_id"] = {
+        "1": preset["contact_delivery_targets_by_id"]["1"],
+    }
 
     items = require_delivery_items(
-        preset, [1, 4], contact_release=True)
+        preset, [1, 2, 3, 4], contact_release=True)
 
-    assert items["1"]["precontact_joint_values"] != \
-        items["4"]["precontact_joint_values"]
+    assert all(
+        items[str(item_id)]["precontact_joint_values"] == pytest.approx(
+            items["1"]["precontact_joint_values"])
+        for item_id in (2, 3, 4))
     assert items["1"]["approach_axis_xyz_base"] == pytest.approx(
         [1.0, 0.0, 0.0])
     assert "delivery_joint_values" not in items["1"]
@@ -293,7 +298,7 @@ def test_contact_release_teach_saves_one_manual_pose_per_id(tmp_path):
             sleep=lambda seconds: None, loginfo=lambda *items: None),
     })
     args = SimpleNamespace(
-        delivery_file=str(path), sequence=[2], overwrite=False,
+        delivery_file=str(path), sequence=[1], overwrite=False,
         teach_settle_seconds=0.8, base_frame="base",
         camera_frame="camera", tf_timeout=5.0)
 
@@ -301,7 +306,7 @@ def test_contact_release_teach_saves_one_manual_pose_per_id(tmp_path):
     saved = load_delivery_preset(str(path))
 
     assert len(prompts) == 1
-    assert saved["contact_delivery_targets_by_id"]["2"] == {
+    assert saved["contact_delivery_targets_by_id"]["1"] == {
         "precontact_joint_values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
     }
