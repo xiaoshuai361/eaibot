@@ -223,6 +223,7 @@ def test_pick_command_leaves_startup_homing_to_chassis_sequence():
         pick_velocity_scale=0.1,
         pick_acceleration_scale=0.2,
         pick_motion_settle_seconds=0.4,
+        pick_approach_gap=0.02,
         disable_replanning=True,
     )
 
@@ -240,6 +241,7 @@ def test_pick_command_leaves_startup_homing_to_chassis_sequence():
     assert command[command.index("--tf-timeout") + 1] == "10.0"
     assert command[command.index("--velocity-scale") + 1] == "0.1"
     assert command[command.index("--acceleration-scale") + 1] == "0.2"
+    assert command[command.index("--approach-gap") + 1] == "0.02"
 
 
 def test_pick_failure_is_missing_tf_detects_child_tf_error():
@@ -249,6 +251,14 @@ def test_pick_failure_is_missing_tf_detects_child_tf_error():
         "RuntimeError: TF for tag_2 was not found.", 2) is True
     assert pick_failure_is_missing_tf(
         "RuntimeError: MoveIt failed during taught_grasp.", 2) is False
+
+
+def test_pick_failure_is_contact_miss_requires_marker_and_exit_code():
+    detector, = load_symbols("pick_failure_is_contact_miss")
+
+    assert detector("CONTACT_PROBE_MISS tag_3", 3, 4) is True
+    assert detector("CONTACT_PROBE_MISS tag_3", 3, 1) is False
+    assert detector("CONTACT_PROBE_MISS tag_2", 3, 4) is False
 
 
 def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
@@ -265,6 +275,8 @@ def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
         "--max-detection-age-seconds", "1.5",
         "--chassis-settle-seconds", "0.8",
         "--result-file", "/tmp/tag-result.json",
+        "--show-debug-window",
+        "--debug-window-name", "tag_test",
     ])
 
     assert args.sequence == [1, 2]
@@ -276,6 +288,8 @@ def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
     assert args.max_detection_age_seconds == pytest.approx(1.5)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.result_file == "/tmp/tag-result.json"
+    assert args.show_debug_window is True
+    assert args.debug_window_name == "tag_test"
 
 
 def test_result_file_records_completed_ids_atomically(tmp_path):
@@ -305,9 +319,22 @@ def test_parse_args_defaults_match_competition_short_command():
     assert args.max_detection_age_seconds == pytest.approx(4.0)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.tag_tf_wait_seconds == pytest.approx(10.0)
+    assert args.pick_approach_gap == pytest.approx(0.030)
     assert args.startup_home_settle_seconds == pytest.approx(3.0)
     assert args.pick_velocity_scale == pytest.approx(0.2)
     assert args.pick_acceleration_scale == pytest.approx(0.2)
+    assert args.show_debug_window is False
+    assert args.debug_window_name == "tag_pick_detection"
+
+
+def test_tag_debug_callback_contains_real_display_call():
+    source = SCRIPT.read_text(encoding="utf-8")
+    callback_source = source[
+        source.index("    def image_callback"):source.index(
+            "    def close_debug_window")]
+
+    assert "cv2.imshow(self.args.debug_window_name, image)" in callback_source
+    assert "cv2.waitKey(1)" in callback_source
 
 
 def test_tf_gate_ignores_cached_stamp_and_accepts_next_new_tf():
@@ -495,13 +522,13 @@ def test_run_skips_alignment_timeout_and_continues_with_next_tag():
         ("align", 1),
         ("stop",),
         ("align", 2),
-        ("pick", 2),
         ("home", 2),
+        ("pick", 2),
         ("stop",),
     ]
 
 
-def test_run_calls_controller_startup_home_after_each_successful_pick():
+def test_run_calls_controller_startup_home_before_each_pick():
     ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
     calls = []
 
@@ -537,18 +564,18 @@ def test_run_calls_controller_startup_home_after_each_successful_pick():
 
     assert calls == [
         ("align", 1),
+        ("startup_home", 1),
         ("tf", 1),
         ("pick", 1),
-        ("startup_home", 1),
         ("align", 2),
+        ("startup_home", 2),
         ("tf", 2),
         ("pick", 2),
-        ("startup_home", 2),
         ("stop",),
     ]
 
 
-def test_run_waits_for_key_between_tags_when_enabled():
+def test_run_ignores_legacy_wait_key_between_tags_option():
     ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
     calls = []
 
@@ -574,9 +601,6 @@ def test_run_waits_for_key_between_tags_when_enabled():
         def wait_for_tag_tf_before_pick(self, tag_id):
             return True
 
-        def wait_between_tags(self, tag_id, index, total):
-            calls.append(("wait", tag_id, index, total))
-
         def stop_chassis(self):
             calls.append(("stop",))
 
@@ -585,10 +609,8 @@ def test_run_waits_for_key_between_tags_when_enabled():
     assert calls == [
         ("align", 1),
         ("pick", 1),
-        ("wait", 1, 1, 3),
         ("align", 2),
         ("pick", 2),
-        ("wait", 2, 2, 3),
         ("align", 3),
         ("pick", 3),
         ("stop",),
@@ -620,9 +642,6 @@ def test_run_does_not_wait_between_tags_by_default():
 
         def wait_for_tag_tf_before_pick(self, tag_id):
             return True
-
-        def wait_between_tags(self, tag_id, index, total):
-            calls.append(("wait", tag_id, index, total))
 
         def stop_chassis(self):
             calls.append(("stop",))
@@ -718,12 +737,13 @@ def test_run_continues_when_child_pick_loses_tag_tf_before_motion():
 
     assert calls == [
         ("align", 1),
+        ("startup_home", 1),
         ("tf", 1),
         ("pick", 1),
         ("align", 2),
+        ("startup_home", 2),
         ("tf", 2),
         ("pick", 2),
-        ("startup_home", 2),
         ("stop",),
     ]
 
@@ -796,8 +816,8 @@ def test_run_stops_after_requested_success_count():
     FakeSequence().run()
 
     assert calls == [
-        ("align", 1), ("pick", 1), ("home", 1),
-        ("align", 2), ("pick", 2), ("home", 2),
+        ("align", 1), ("home", 1), ("pick", 1),
+        ("align", 2), ("home", 2), ("pick", 2),
         ("stop",),
     ]
 

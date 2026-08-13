@@ -28,6 +28,7 @@ from block_mono_vision import (
 
 
 DEFAULT_CONFIG_PATH = "/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml"
+CONTACT_PROBE_MISS_EXIT_CODE = 4
 DEFAULT_ARM_SCRIPT = "/home/eaibot/handeye-calib/src/mirobot_pick_test.py"
 DEFAULT_BLOCK_PRESET_FILE = (
     "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json"
@@ -88,7 +89,8 @@ def parse_args(argv=None):
     action.add_argument("--dry-run", action="store_true")
     action.add_argument("--live-preview", action="store_true")
     action.add_argument("--calib-record", action="store_true")
-    action.add_argument("--teach-block-grasp", action="store_true")
+    action.add_argument("--teach-block-pick-place", action="store_true")
+    action.add_argument("--teach-block-pregrasp", action="store_true")
     action.add_argument("--teach-block-place", action="store_true")
     action.add_argument("--teach-block-idle", action="store_true")
     action.add_argument("--teach-block-carry", action="store_true")
@@ -107,16 +109,19 @@ def parse_args(argv=None):
         "--result-file",
         help="底盘连续抓取实际成功物资 ID 的 JSON 输出路径。",
     )
-    parser.add_argument("--wait-key-between-targets", action="store_true")
+    # Kept only so an old field command still starts the now fully automatic
+    # sequence. The value is intentionally ignored.
+    parser.add_argument(
+        "--wait-key-between-targets", action="store_true",
+        help=argparse.SUPPRESS)
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--reset-pickup-model", action="store_true")
     parser.add_argument("--known-z-mm", type=float)
     parser.add_argument("--frames", type=int)
     parser.add_argument("--preview-hz", type=float, default=1.0)
-    parser.add_argument("--pregrasp-distance-mm", type=float)
+    parser.add_argument("--approach-gap-mm", type=float)
     parser.add_argument(
         "--confidence",
         type=float,
@@ -124,6 +129,13 @@ def parse_args(argv=None):
         help="Override config confidence_min for this run, such as 0.55",
     )
     parser.add_argument("--show-rgb", action="store_true")
+    parser.add_argument("--search-before-chassis", action="store_true")
+    parser.add_argument("--search-ready-file")
+    parser.add_argument("--search-trigger-file")
+    parser.add_argument("--search-release-file")
+    parser.add_argument("--search-roi-ratio", default="0.60,0.05,0.98,0.95")
+    parser.add_argument("--search-stable-frames", type=int, default=3)
+    parser.add_argument("--search-poll-hz", type=float, default=3.0)
     parser.add_argument("--arm-timeout", type=float, default=NORMAL_CHILD_TIMEOUT)
     return parser.parse_args(_normalize_signed_args(raw_argv))
 
@@ -138,7 +150,8 @@ def selected_action(args):
         ("dry_run", bool(args.dry_run)),
         ("live_preview", bool(args.live_preview)),
         ("calib_record", bool(args.calib_record)),
-        ("teach_block_grasp", bool(args.teach_block_grasp)),
+        ("teach_block_pick_place", bool(args.teach_block_pick_place)),
+        ("teach_block_pregrasp", bool(args.teach_block_pregrasp)),
         ("teach_block_place", bool(args.teach_block_place)),
         ("teach_block_idle", bool(args.teach_block_idle)),
         ("teach_block_carry", bool(args.teach_block_carry)),
@@ -160,7 +173,8 @@ def selected_action(args):
 
 def child_wait_timeout(args):
     if selected_action(args) in (
-        "teach_block_grasp",
+        "teach_block_pick_place",
+        "teach_block_pregrasp",
         "teach_block_place",
         "teach_block_idle",
         "teach_block_carry",
@@ -184,23 +198,18 @@ def validate_runtime_args(args, config):
     _finite(args.preview_hz, "--preview-hz")
     if args.preview_hz <= 0.0:
         raise ValueError("--preview-hz must be positive")
-    if args.pregrasp_distance_mm is not None:
-        _finite(args.pregrasp_distance_mm, "--pregrasp-distance-mm")
-        if args.pregrasp_distance_mm <= 0.0:
-            raise ValueError("--pregrasp-distance-mm must be positive")
+    if args.approach_gap_mm is not None:
+        _finite(args.approach_gap_mm, "--approach-gap-mm")
+        if args.approach_gap_mm <= 0.0:
+            raise ValueError("--approach-gap-mm must be positive")
     if args.known_z_mm is not None:
         _finite(args.known_z_mm, "--known-z-mm")
         if args.known_z_mm <= 0.0:
             raise ValueError("--known-z-mm must be positive")
     if action == "calib_record" and args.known_z_mm is None:
         raise ValueError("--calib-record requires --known-z-mm")
-    if args.reset_pickup_model and action != "teach_block_grasp":
-        raise ValueError("--reset-pickup-model requires --teach-block-grasp")
     if args.align_only and action != "run_chassis_sequence":
         raise ValueError("--align-only requires --run-chassis-sequence")
-    if args.wait_key_between_targets and action != "run_chassis_sequence":
-        raise ValueError(
-            "--wait-key-between-targets requires --run-chassis-sequence")
     if args.max_targets is not None:
         if action != "run_chassis_sequence":
             raise ValueError("--max-targets requires --run-chassis-sequence")
@@ -215,14 +224,16 @@ def validate_runtime_args(args, config):
     if args.skip_startup_home and action != "run_chassis_sequence":
         raise ValueError("--skip-startup-home requires --run-chassis-sequence")
     targetless_actions = (
-        "dry_run", "live_preview", "teach_block_place", "teach_block_idle",
+        "dry_run", "live_preview", "teach_block_idle",
         "teach_block_carry", "run_chassis_sequence")
     if action not in targetless_actions and args.target is None:
         raise ValueError("--target is required except for all-target --dry-run")
 
     method = str((config or {}).get("distance_method", "theory")).lower()
     if action in (
-        "teach_block_grasp",
+        "teach_block_pick_place",
+        "teach_block_pregrasp",
+        "teach_block_place",
         "preview_taught_block",
         "stop_at_taught_pre_grasp",
         "run_taught_block",
@@ -388,8 +399,10 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--live-preview")
     if args.calib_record:
         command.append("--calib-record")
-    if args.teach_block_grasp:
-        command.append("--teach-block-grasp")
+    if args.teach_block_pick_place:
+        command.append("--teach-block-pick-place")
+    if args.teach_block_pregrasp:
+        command.append("--teach-block-pregrasp")
     if args.teach_block_place:
         command.append("--teach-block-place")
     if args.teach_block_idle:
@@ -404,7 +417,7 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--run-taught-block")
     if args.run_chassis_sequence:
         command.append("--run-chassis-sequence")
-    if args.run_chassis_sequence or (args.teach_block_place and args.target is None):
+    if args.run_chassis_sequence:
         command += ["--sequence", args.sequence]
     if args.max_targets is not None:
         command += ["--max-targets", str(args.max_targets)]
@@ -412,8 +425,6 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--fail-on-skip")
     if args.result_file:
         command += ["--result-file", args.result_file]
-    if args.wait_key_between_targets:
-        command.append("--wait-key-between-targets")
     if args.align_only:
         command.append("--align-only")
     if args.skip_startup_home:
@@ -422,19 +433,25 @@ def build_child_command(args, request_fd, response_fd):
         command += ["--preset-file", args.preset_file]
     if args.overwrite:
         command.append("--overwrite")
-    if args.reset_pickup_model:
-        command.append("--reset-pickup-model")
     if args.known_z_mm is not None:
         command += ["--known-z-mm", str(args.known_z_mm)]
     if args.frames is not None:
         command += ["--frames", str(args.frames)]
     command += ["--preview-hz", str(args.preview_hz)]
-    if args.pregrasp_distance_mm is not None:
-        command += ["--pregrasp-distance-mm", str(args.pregrasp_distance_mm)]
+    if args.approach_gap_mm is not None:
+        command += ["--approach-gap-mm", str(args.approach_gap_mm)]
     if args.confidence is not None:
         command += ["--confidence", str(args.confidence)]
     if args.show_rgb:
         command.append("--show-rgb")
+    if args.search_before_chassis:
+        command.append("--search-before-chassis")
+        command += ["--search-ready-file", args.search_ready_file]
+        command += ["--search-trigger-file", args.search_trigger_file]
+        command += ["--search-release-file", args.search_release_file]
+        command += ["--search-roi-ratio", args.search_roi_ratio]
+        command += ["--search-stable-frames", str(args.search_stable_frames)]
+        command += ["--search-poll-hz", str(args.search_poll_hz)]
     return command
 
 
@@ -498,6 +515,11 @@ def install_shutdown_handlers():
     signal.signal(signal.SIGTERM, request_shutdown)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, request_shutdown)
+    # The ROS/Python2 helper runs in a separate session. Without this,
+    # Ctrl+Z suspends only this supervisor and leaves the helper alive (and,
+    # for arm actions, holding the motion lock).
+    if hasattr(signal, "SIGTSTP"):
+        signal.signal(signal.SIGTSTP, request_shutdown)
 
 
 def run_parent(args):
@@ -507,16 +529,28 @@ def run_parent(args):
     config = load_config(args.config)
     if args.target is not None:
         args.target = resolve_target_alias(args.target, config)
-    if args.run_chassis_sequence or (args.teach_block_place and args.target is None):
+    if args.run_chassis_sequence:
         args.sequence = ",".join(parse_target_sequence(args.sequence, config))
     if args.model:
         config["model_path"] = args.model
     if args.confidence is not None:
         config["confidence_min"] = args.confidence
     args = validate_runtime_args(args, config)
+    if args.search_before_chassis:
+        if not args.run_chassis_sequence:
+            raise RuntimeError(
+                "--search-before-chassis requires --run-chassis-sequence")
+        for path in (args.search_ready_file, args.search_trigger_file,
+                     args.search_release_file):
+            if not path:
+                raise RuntimeError(
+                    "search ready/trigger/release files are required")
+        if args.search_stable_frames <= 0 or args.search_poll_hz <= 0.0:
+            raise RuntimeError(
+                "search stable frames and poll rate must be positive")
     action = selected_action(args)
     detector = None
-    if action not in ("teach_block_place", "teach_block_idle", "teach_block_carry"):
+    if action not in ("teach_block_idle", "teach_block_carry"):
         detector = OnnxYoloDetector(config["model_path"], config)
 
     request_read = request_write = response_read = response_write = None
@@ -544,6 +578,8 @@ def run_parent(args):
         serve_requests(detector, config, request_stream, response_stream)
 
         return_code = child.wait(timeout=child_wait_timeout(args))
+        if return_code == CONTACT_PROBE_MISS_EXIT_CODE:
+            return CONTACT_PROBE_MISS_EXIT_CODE
         if return_code != 0:
             raise RuntimeError("Arm child exited with status %d" % return_code)
         return 0

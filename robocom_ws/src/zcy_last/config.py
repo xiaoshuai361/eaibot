@@ -4,13 +4,22 @@
 
 # ===== 机械臂抓取与投递开关（调试时优先修改） =====
 ENABLE_TAG_PICK = False        # B 点有 Tag 抓取。
-TAG_PICK_COUNT = 1
+TAG_PICK_COUNT = 4             # 开启后默认抓满 4 个 Tag；临时可用命令行覆盖。
 ENABLE_TAG_DELIVERY = True     # B 点抓取开启时，第一圈按街区识别结果投递。
 ENABLE_UNTAGGED_PICK = False   # A 点无 Tag 抓取。
 UNTAGGED_PICK_COUNT = 1
 ENABLE_UNTAGGED_DELIVERY = True # A 点抓取开启时，后两圈按楼宇识别结果投递。
 UNTAGGED_TRIGGER_INTERSECTION = 3
 PICK_CANDIDATE_IDS = (1, 2, 3, 4)
+PICK_DEBUG_VIEW = True        # True 抓取时显示检测框和对准区域。
+UNTAGGED_SEARCH_ROI = (0.60, 0.05, 0.98, 0.95) # A 点物块从画面右侧进入的搜索区。
+UNTAGGED_SEARCH_STABLE_FRAMES = 3 # 右侧连续检测帧数；误触发就加。
+UNTAGGED_SEARCH_POLL_HZ = 3.0 # A 点搜索推理频率；算力不足就降。
+UNTAGGED_SEARCH_FORWARD_SPEED = 0.16 # 第 3 个路口出口摆正后，搜索 A 点物块的固定直行速度。
+TAG_PICK_FIRST_ENTRY_TIME = 5.5 # B 点抓取后绿灯放行的直行时间；起转太早加。
+TAG_PICK_FIRST_TURN_TIME = 4.0 # B 点抓取后第一次右转时间；转不够加。
+UNTAGGED_PICK_NEXT_ENTRY_TIME = 5.5 # A 点抓取后绿灯放行的直行时间；起转太早加。
+UNTAGGED_PICK_NEXT_TURN_TIME = 4.0 # A 点抓取后第 4 个路口左转时间；转不够加。
 
 # ===== 现场启动、摄像头与功能开关（运行前优先检查） =====
 LANE_CAMERA_INDEX = 4          # 巡线摄像头：/dev/video4。
@@ -20,6 +29,8 @@ TRAFFIC_LIGHT_CAMERA_INDEX = 0 # 红绿灯识别摄像头：/dev/video0，仅停
 PROCESS_WIDTH = 640       # 巡线处理图宽度；改动后 PID 和像素距离需要重调。
 TRAFFIC_LIGHT_FRAME_WIDTH = 320 # 红绿灯摄像头采集宽度。
 TRAFFIC_LIGHT_FRAME_HEIGHT = 240 # 红绿灯摄像头采集高度。
+YOLO_FRAME_WIDTH = 320      # 人群、垃圾桶和楼宇任务摄像头采集宽度。
+YOLO_FRAME_HEIGHT = 240     # 任务摄像头原始画面高度；模型内部再 letterbox 到 320×320。
 DRY_RUN = False           # False 发布速度；True 只识别不动车。
 DEBUG_VIEW = True         # True 显示巡线、任务 YOLO 和红绿灯调试窗口。
 YOLO_ENABLED = True       # 是否启用人偶、垃圾桶和楼宇任务识别。
@@ -70,7 +81,7 @@ MANEUVER_MIN_TIME = 1.0   # 路口最短通过时间(s)；过早识别出口就�
 MANEUVER_MAX_TIME = 14.0  # 路口最长通过时间(s)；出口漏检后恢复巡线。
 ENTRY_CLEAR_FRAMES = 5    # 入口横条消失确认帧数；入口被当出口就加。
 EXIT_BAR_FRAMES = 1       # 出口横条确认帧数；误触发就加。
-EXIT_ENTRY_IGNORE_TIME = 2.0 # 出口完成后忽略横条时间(s)；重复触发就加。
+EXIT_ENTRY_IGNORE_TIME = 3.0 # 出口完成后忽略横条时间(s)；重复触发就加。
 FINAL_EXIT_TIME = 6.0     # 第九次出口摆正后继续直行时间(s)。
 
 # ===== 速度与转向 =====
@@ -79,7 +90,7 @@ APPROACH_SPEED = 0.16     # 靠近横条 linear.x 前进速度(m/s)；冲过横�
 MANEUVER_SPEED = 0.16     # 路口内 linear.x 前进速度(m/s)；路口通过慢可小幅加。
 MANEUVER_CENTER_BIAS_PIXELS = 40.0 # 直行路口避障量；只填正数，数值越大避让越多。
 MAX_ANGULAR = 0.50       # angular.z 偏航角速度上限(rad/s)；只影响转头快慢，不提高前进速度。
-FOLLOW_LEFT_ANGULAR_SCALE = 0.76 # 所有巡线左弯力度；左弯太猛就减小。
+FOLLOW_LEFT_ANGULAR_SCALE = 0.83 # 所有巡线左弯力度；左弯太猛就减小。
 FOLLOW_RIGHT_ANGULAR_SCALE = 1.00 # 巡线右弯力度；右弯正常保持 1.0。
 
 # 左右转固定控制；直行路口和普通巡线不使用这两项。
@@ -192,7 +203,7 @@ PROCESSED_WINDOW_NAME = "line_cy_task_processed" # 二值处理结果窗口名�
 
 # ===== YOLO 模型识别 =====
 YOLO_FRAME_INTERVAL = 1      # YOLO 线程每隔多少个任务摄像头新帧做一次模型推理。
-YOLO_PEOPLE_STABLE_FRAMES = 3 # 人群多数类别连续确认帧数；误识别多就加。
+YOLO_PEOPLE_STABLE_FRAMES = 6 # 人群多数类别连续确认帧数；停得早就加，反应慢就减。
 YOLO_CONFIDENCE = 0.60       # 人群 YOLO 置信度阈值。
 YOLO_TRASH_CONFIDENCE = 0.65 # 垃圾桶 YOLO 置信度阈值。
 YOLO_BUILDING_CONFIDENCE = 0.65 # 楼宇 YOLO 置信度阈值。
@@ -281,6 +292,19 @@ YOLO_MODEL_PREFERRED_FILES = (
     "best.onnx",
 )
 YOLO_WINDOW_NAME = "line_cy_task_yolo" # 任务识别调试窗口。
+
+# ===== 无 Tag 楼宇磁吸投递对准 =====
+BUILDING_DELIVERY_CALIBRATION_FILE = \
+    "/home/eaibot/handeye-calib/config/building_delivery_calibration.json"
+BUILDING_DELIVERY_DRIVE_SPEED = 0.012 # 正对后低速接近楼宇。
+BUILDING_DELIVERY_CENTER_TOLERANCE_RATIO = 0.05 # 框中心允许误差，按画宽归一化。
+BUILDING_DELIVERY_STOP_SCALE_FACTOR = 0.95 # 稍早于标定停车尺度刹车。
+BUILDING_DELIVERY_OVERCLOSE_SCALE_FACTOR = 1.10 # 超过标定尺度10%视为过近。
+BUILDING_DELIVERY_STABLE_FRAMES = 3 # 停车条件需要连续新鲜检测帧。
+BUILDING_DELIVERY_ALIGN_TIMEOUT = 25.0
+BUILDING_DELIVERY_MAX_DETECTION_AGE = 0.5
+BUILDING_DELIVERY_ANGULAR_GAIN = 1.0 # 归一化中心误差到角速度的比例。
+BUILDING_DELIVERY_MAX_ANGULAR = 0.12
 
 # ===== 红绿灯等待 =====
 TRAFFIC_GREEN_STABLE_FRAMES = 2 # 连续绿灯确认帧数，防止单帧误放行。

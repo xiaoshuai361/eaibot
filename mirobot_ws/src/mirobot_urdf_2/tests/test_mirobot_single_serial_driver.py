@@ -35,7 +35,7 @@ def test_controller_pauses_measured_query_during_motion_and_keeps_logs_quiet():
 
     assert "g_executing_trajectory" in source
     assert "if (!g_publish_joint_states || isExecutingTrajectory())" in source
-    assert "waitForFirmwareTarget(target_positions, *joint_pub)" in source
+    assert "waitForFirmwareTarget(" in source
     assert "ROS_INFO_STREAM(\"Sending arm command" not in source
     assert "ROS_DEBUG_STREAM(\"Arm GCode:" in source
 
@@ -50,7 +50,9 @@ def test_controller_sparsifies_dense_trajectories_and_repeats_final_target():
     assert "index == 1 ||" in source
     assert "((index - 1) % kTrajectoryWaypointStride) == 0" in source
     assert "sendArmCommand(target_positions, feedrate)" in source
-    assert "repeat < kFinalTargetRepeats" in source
+    assert "repeat < final_target_repeats" in source
+    assert "kContactProbeWaypointSleepSeconds = 0.02" in source
+    assert "kContactProbeCompletionPollSeconds = 0.03" in source
     assert "wait_time = point.time_from_start" not in source
 
 
@@ -88,7 +90,7 @@ def test_controller_requires_firmware_idle_and_target_tolerance_before_success()
     assert "final joint%d error" in source
     assert "measured=%.3f rad, target=%.3f rad" in source
     assert "g_trajectory_goal_tolerance_rad" in source
-    assert "if (!waitForFirmwareTarget(target_positions, *joint_pub))" in source
+    assert "if (!waitForFirmwareTarget(" in source
     assert "moveit_server->setAborted()" in source
     assert '<arg name="trajectory_completion_timeout_seconds" default="15.0" />' in launch
     assert '<arg name="trajectory_goal_tolerance_rad" default="0.05" />' in launch
@@ -130,3 +132,26 @@ def test_controller_exposes_startup_homing_service_that_sends_grbl_home():
     assert "trigger_startup_home" in source
     assert 'nh.advertiseService("mirobot_startup_home", trigger_startup_home)' in source
     assert '_serial.write("$H\\n")' in source
+
+
+def test_controller_owns_contact_signal_on_the_shared_pump_serial():
+    source = CONTROLLER.read_text()
+    launch = LAUNCH.read_text()
+
+    assert "#include <std_srvs/SetBool.h>" in source
+    assert 'kContactTriggeredFrame("3\\r\\n")' in source
+    assert "g_pump_rx_buffer" in source
+    assert "consumePumpSerialFrames" in source
+    assert "frame == kContactTriggeredFrame" in source
+    assert "g_pump_serial_mutex" in source
+    assert '"mirobot_contact_probe_enable"' in source
+    assert '"mirobot_contact_state"' in source
+    assert "Rejecting pump ON while the contact probe is armed." in source
+    assert '<arg name="contact_probe_feedrate" default="1200" />' in launch
+    assert '<param name="contact_probe_feedrate" value="$(arg contact_probe_feedrate)" />' in launch
+    assert "g_contact_probe_armed ? g_contact_probe_feedrate : g_arm_feedrate" in source
+    assert "executeContactProbeTrajectory" in source
+    assert "readContactTriggered(&triggered)" in source
+    assert "for (size_t index = 1; index < point_count; ++index)" in source
+    assert "waitForFirmwareTarget(" in source
+    assert "Contact probe stopped at the current 2 mm waypoint." in source

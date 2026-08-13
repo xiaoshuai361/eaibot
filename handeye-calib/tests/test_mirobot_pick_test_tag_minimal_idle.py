@@ -178,8 +178,14 @@ def test_prompt_and_record_grasp_waits_for_teach_pose_to_settle_before_sampling(
 def test_prompt_and_record_place_waits_for_teach_pose_to_settle_before_sampling():
     prompt_and_record_place, = load_module_symbols("prompt_and_record_place")
     events = []
-    args = SimpleNamespace(teach_settle_seconds=0.8)
-    preset = {"tags": {"1": {"grasp_offset_xyz_base": [0, 0, 0]}}}
+    args = SimpleNamespace(teach_settle_seconds=0.8, base_frame="base")
+    preset = {
+        "place_teach_start_ee_in_base": {
+            "position": [0.2, 0.0, 0.1],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+        "tags": {"1": {"grasp_offset_xyz_base": [0, 0, 0]}},
+    }
 
     class FakeArm:
         def get_current_pose(self):
@@ -190,6 +196,8 @@ def test_prompt_and_record_place_waits_for_teach_pose_to_settle_before_sampling(
             return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 
     prompt_and_record_place.__globals__.update({
+        "transform_to_pose": lambda frame, transform: make_pose(0.2, 0.0, 0.1),
+        "execute_pose": lambda arm, pose, label: events.append("move_start"),
         "prompt_enter": lambda message: events.append("prompt"),
         "rospy": SimpleNamespace(
             sleep=lambda seconds: events.append(("sleep", seconds)),
@@ -199,4 +207,5 @@ def test_prompt_and_record_place_waits_for_teach_pose_to_settle_before_sampling(
 
     prompt_and_record_place(args, FakeArm(), preset, 1)
 
-    assert events[:3] == ["prompt", ("sleep", 0.8), "get_pose"]
+    assert events[:4] == [
+        "move_start", "prompt", ("sleep", 0.8), "get_pose"]

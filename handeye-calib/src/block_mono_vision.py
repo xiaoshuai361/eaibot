@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import io
 import os
 
 import numpy as np
@@ -29,7 +30,8 @@ def _read_yaml_mapping(path):
         import yaml
     except ImportError as exc:
         raise LocalizationError("PyYAML is required to read config: %s" % exc)
-    with open(path, "r") as stream:
+    # Windows 的系统默认编码不是 UTF-8；配置含中文注释时必须显式指定。
+    with io.open(path, "r", encoding="utf-8") as stream:
         loaded = yaml.safe_load(stream) or {}
     if not isinstance(loaded, dict):
         raise LocalizationError("config file must contain a YAML mapping")

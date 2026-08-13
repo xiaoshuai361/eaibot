@@ -17,7 +17,6 @@ from ..config import (
     PROCESS_LOG_ROOT,
     PROCESS_START_TIMEOUT,
     PROCESS_STOP_TIMEOUT,
-    SHARED_OBJECT_CAMERA_INDEX,
 )
 
 
@@ -40,6 +39,23 @@ class ProcessSupervisor(object):
         self.processes = {}
         if self.enabled:
             os.makedirs(self.log_dir, exist_ok=True)
+            self._info("本次运行日志目录：%s" % self.log_dir)
+
+    @staticmethod
+    def _info(message):
+        print("[zcy_last] %s" % message, flush=True)
+
+    @classmethod
+    def _print_log_tail(cls, log_path, line_count=40):
+        try:
+            with open(log_path, "rb") as handle:
+                lines = handle.read().decode("utf-8", "replace").splitlines()
+        except (IOError, OSError) as exc:
+            cls._info("无法读取日志 %s：%s" % (log_path, exc))
+            return
+        cls._info("%s 末尾日志：" % log_path)
+        for line in lines[-max(1, int(line_count)):]:
+            print("  %s" % line, flush=True)
 
     @staticmethod
     def _shell_command(command):
@@ -58,6 +74,7 @@ class ProcessSupervisor(object):
         log_path = os.path.join(self.log_dir, "%s.log" % name)
         log_handle = open(log_path, "ab", buffering=0)
         command = self._shell_command(shell_command)
+        self._info("正在启动 %s，日志：%s" % (name, log_path))
         process = subprocess.Popen(
             command,
             stdout=log_handle,
@@ -68,9 +85,13 @@ class ProcessSupervisor(object):
         self.processes[name] = item
         time.sleep(0.4)
         if process.poll() is not None:
+            code = process.returncode
+            self._print_log_tail(log_path)
             self.stop(name)
             raise RuntimeError(
-                "%s 启动失败，查看日志 %s" % (name, log_path))
+                "%s 启动失败（状态码 %s），查看日志 %s"
+                % (name, code, log_path))
+        self._info("%s 进程已启动" % name)
         return item
 
     def stop(self, name):
@@ -101,22 +122,70 @@ class ProcessSupervisor(object):
             return False
         return result.returncode == 0
 
-    def _assert_shared_camera_available(self):
-        device = "/dev/video%d" % SHARED_OBJECT_CAMERA_INDEX
-        if not os.path.exists(device):
-            raise RuntimeError("共享物体摄像头不存在：%s" % device)
-        if self._probe("fuser -s %s" % device, timeout=2.0):
-            raise RuntimeError("共享物体摄像头正被其他进程占用：%s" % device)
+    def _assert_astra_not_running(self):
+        """Astra 按 USB 设备启动，不依赖不稳定的 /dev/videoN 编号。"""
+        if self._process_alive(self.processes.get("astra")):
+            return
+        if self._probe(
+                "rosnode list 2>/dev/null | grep -qE '^/camera(/|$)'",
+                timeout=2.0):
+            raise RuntimeError(
+                "检测到外部 Astra 相机节点；请先关闭临时启动的 "
+                "astrapro.launch，再运行比赛主程序")
 
-    def wait_until(self, description, probe, timeout=PROCESS_START_TIMEOUT):
+    def wait_until(self, description, probe, timeout=PROCESS_START_TIMEOUT,
+                   watched=()):
         if not self.enabled:
             return
+        self._info("正在等待%s（最长 %.1f 秒）" % (
+            description, float(timeout)))
         deadline = time.time() + float(timeout)
         while time.time() < deadline:
             if probe():
+                self._info("%s已就绪" % description)
                 return
+            for name in watched:
+                item = self.processes.get(name)
+                if item is None or item.process.poll() is None:
+                    continue
+                log_path = os.path.join(self.log_dir, "%s.log" % name)
+                self._print_log_tail(log_path)
+                raise RuntimeError(
+                    "等待%s时 %s 异常退出（状态码 %s），"
+                    "查看日志 %s" % (
+                        description, name, item.process.returncode, log_path))
             time.sleep(0.5)
-        raise RuntimeError("等待%s超时" % description)
+        for name in watched:
+            log_path = os.path.join(self.log_dir, "%s.log" % name)
+            if os.path.isfile(log_path):
+                self._print_log_tail(log_path)
+        raise RuntimeError(
+            "等待%s超时，检查日志目录 %s"
+            % (description, self.log_dir))
+
+    def _base_ready(self):
+        return self._probe(
+            "rosnode list | grep -qx '/xnode_comm' && "
+            "rosnode list | grep -qx '/xnode_vehicle'")
+
+    def start_base(self):
+        if not self.enabled:
+            return
+        if self._base_ready():
+            self._info("检测到外部底盘节点，直接复用")
+            return
+        self.start(
+            "base",
+            "source /opt/ros/melodic/setup.bash && "
+            "source {0}/robocom_ws/devel/setup.bash && "
+            "exec roslaunch xpkg_bringup bringup_basic_ctrl.launch".format(
+                DEPLOY_HOME),
+        )
+        self.wait_until(
+            "底盘节点 /xnode_comm 和 /xnode_vehicle",
+            self._base_ready,
+            watched=("base",),
+        )
 
     def require_external_base(self):
         """确认人工启动的底盘节点可用，但不取得其进程所有权。"""
@@ -124,11 +193,22 @@ class ProcessSupervisor(object):
             return
         self.wait_until(
             "外部底盘节点 /xnode_comm 和 /xnode_vehicle",
-            lambda: self._probe(
-                "rosnode list | grep -qx '/xnode_comm' && "
-                "rosnode list | grep -qx '/xnode_vehicle'"),
+            self._base_ready,
             timeout=5.0,
         )
+
+    def _arm_services_ready(self):
+        return self._probe(
+            "rosservice info /switch_pump_status >/dev/null 2>&1 && "
+            "rosservice info /mirobot_startup_home >/dev/null 2>&1 && "
+            "rostopic list | grep -q '^/move_group/status$'")
+
+    def _handeye_tf_ready(self):
+        return self._probe(
+            "timeout 4 rosrun tf tf_echo {0} {1} 2>/dev/null | "
+            "grep -m1 -q Translation".format(
+                PICK_BASE_FRAME, PICK_CAMERA_FRAME),
+            timeout=5.0)
 
     def start_arm_common(self):
         if not self.enabled:
@@ -138,27 +218,49 @@ class ProcessSupervisor(object):
             "source {0}/mirobot_ws/devel/setup.bash && "
             "source {0}/handeye-calib/devel/setup.bash && "
         ).format(DEPLOY_HOME)
-        self.start(
-            "moveit", source +
-            "exec roslaunch mirobot_moveit_config mirobot.launch start_rviz:=false")
-        self.start(
-            "handeye_tf", source +
-            "exec roslaunch easy_handeye publish.launch "
-            "eye_on_hand:=false tracking_base_frame:=camera_link")
+        if self._arm_services_ready():
+            self._info("检测到外部 MoveIt 和机械臂服务，直接复用")
+        else:
+            self.start(
+                "moveit", source +
+                "exec roslaunch mirobot_moveit_config mirobot.launch "
+                "start_rviz:=false")
+        if self._handeye_tf_ready():
+            self._info("检测到外部手眼标定 TF，直接复用")
+        else:
+            self.start(
+                "handeye_tf", source +
+                # ROS Melodic 的 tf2_py 由 Python 2 编译。比赛主程序
+                # 运行在 Conda Python 3 中，而 easy_handeye/publish.py
+                # 使用 /usr/bin/env python，因此只对该 ROS 子进程
+                # 优先使用系统 Python 2，不改变其他 Python 3 任务。
+                "export PATH=/usr/bin:/bin:$PATH && "
+                "exec roslaunch --screen easy_handeye publish.launch "
+                "eye_on_hand:=false tracking_base_frame:=camera_link")
         self.wait_until(
             "机械臂服务",
-            lambda: self._probe(
-                "rosservice info /switch_pump_status >/dev/null 2>&1 && "
-                "rosservice info /mirobot_startup_home >/dev/null 2>&1 && "
-                "rostopic list | grep -q '^/move_group/status$'"),
+            self._arm_services_ready,
+            watched=("moveit",),
         )
         self.wait_until(
             "手眼标定 TF",
-            lambda: self._probe(
-                "timeout 4 rosrun tf tf_echo {0} {1} 2>/dev/null | "
-                "grep -m1 -q Translation".format(
-                    PICK_BASE_FRAME, PICK_CAMERA_FRAME),
-                timeout=5.0),
+            self._handeye_tf_ready,
+            watched=("moveit", "handeye_tf"),
+        )
+
+    def require_external_arm_common(self):
+        """确认 launch.py 持有的机械臂公共依赖可用，不启动它们。"""
+        if not self.enabled:
+            return
+        self.wait_until(
+            "外部机械臂服务",
+            self._arm_services_ready,
+            timeout=5.0,
+        )
+        self.wait_until(
+            "外部手眼标定 TF",
+            self._handeye_tf_ready,
+            timeout=5.0,
         )
 
     def stop_arm_common(self):
@@ -168,25 +270,41 @@ class ProcessSupervisor(object):
     def start_astra(self):
         if not self.enabled:
             return
-        if not os.path.isfile(ASTRA_CAMERA_INFO_FILE):
-            raise RuntimeError("Astra RGB 内参文件不存在：%s" %
-                               ASTRA_CAMERA_INFO_FILE)
-        self._assert_shared_camera_available()
+        self._assert_astra_not_running()
+        calibration_argument = ""
+        if os.path.isfile(ASTRA_CAMERA_INFO_FILE):
+            calibration_argument = \
+                " rgb_camera_info_url:=file://%s" % ASTRA_CAMERA_INFO_FILE
+            self._info("Astra 使用指定 RGB 内参：%s" %
+                       ASTRA_CAMERA_INFO_FILE)
+        else:
+            self._info(
+                "警告：未找到指定 Astra RGB 内参文件 %s；"
+                "按手动流程使用驱动默认内参启动，"
+                "启动后仍会检查 CameraInfo.K。" %
+                ASTRA_CAMERA_INFO_FILE)
         self.start(
             "astra",
             "source /opt/ros/melodic/setup.bash && "
             "source {0}/mirobot_ws/devel/setup.bash && "
-            "exec roslaunch astra_camera astrapro.launch "
-            "rgb_camera_info_url:=file://{1}".format(
-                DEPLOY_HOME, ASTRA_CAMERA_INFO_FILE),
+            "exec roslaunch astra_camera astrapro.launch{1}".format(
+                DEPLOY_HOME, calibration_argument),
         )
-        self.wait_until(
-            "Astra RGB 和内参",
-            lambda: self._probe(
-                "rostopic echo -n 1 /camera/rgb/camera_info 2>/dev/null | "
-                "grep -E -q '^K: \\[[^]]*[1-9]'",
-                timeout=6.0),
-        )
+        try:
+            self.wait_until(
+                "Astra RGB 有效内参",
+                lambda: self._probe(
+                    "rostopic echo -n 1 /camera/rgb/camera_info 2>/dev/null | "
+                    "grep -E -q '^K: \\[[^]]*[1-9]'",
+                    timeout=6.0),
+                watched=("astra",),
+            )
+        except RuntimeError as exc:
+            if not calibration_argument:
+                raise RuntimeError(
+                    "%s；驱动默认 CameraInfo.K 为空，需要将已标定"
+                    "文件放到 %s" % (exc, ASTRA_CAMERA_INFO_FILE))
+            raise
 
     def stop_astra(self):
         self.stop("astra")
@@ -213,13 +331,15 @@ class ProcessSupervisor(object):
             source +
             "exec roslaunch apriltag_ros continuous_detection.launch "
             "camera_name:=/tag_yolo_quiet image_topic:=image_raw "
-            "publish_tag_detections_image:=true show_image:=false node_output:=log",
+            "publish_tag_detections_image:=true show_image:=false "
+            "node_output:=log",
         )
         self.wait_until(
-            "Tag 检测图像",
+            "Tag 补白相机信息",
             lambda: self._probe(
                 "rostopic echo -n 1 /tag_yolo_quiet/camera_info >/dev/null 2>&1",
                 timeout=6.0),
+            watched=("tag_relay", "apriltag"),
         )
 
     def stop_tag_stack(self):
@@ -253,5 +373,13 @@ class ProcessSupervisor(object):
         return failed
 
     def shutdown(self):
+        errors = []
         for name in list(self.processes.keys())[::-1]:
-            self.stop(name)
+            try:
+                self.stop(name)
+            except Exception as exc:
+                errors.append((name, exc))
+                self._info("关闭 %s 失败：%s；继续清理其他进程" % (
+                    name, exc))
+        if errors:
+            self._info("进程清理完成，但有 %d 个进程关闭异常" % len(errors))

@@ -22,7 +22,8 @@ import rospy
 import mirobot_pick_test_tag as arm_api
 
 
-PRESET_VERSION = 2
+PRESET_VERSION = 3
+COMPATIBLE_PRESET_VERSIONS = (2, PRESET_VERSION)
 DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_DELIVERY_FILE = (
     '/home/eaibot/handeye-calib/config/delivery_presets.json')
@@ -34,6 +35,10 @@ HOME_STABLE_SAMPLES = 3
 DELIVERY_LIFT_METERS = 0.05
 COMPUTE_FK_SERVICE = '/compute_fk'
 COMPUTE_FK_WAIT_SECONDS = 5.0
+CONTACT_STAGING_GAP_METERS = 0.030
+CONTACT_STAGING_STEP_METERS = 0.005
+CONTACT_PROBE_STEP_METERS = 0.002
+CONTACT_PROBE_MAX_TRAVEL_METERS = 0.065
 TEACH_POINTS = {
     'teach_cargo_pick': ('cargo_pick_joint_values', '载物仓抓取点'),
     'teach_transit': ('transit_joint_values', '中间过渡点'),
@@ -85,10 +90,15 @@ def parse_args(argv):
     parser.add_argument(
         '--mode',
         choices=['teach_cargo_pick', 'teach_transit', 'teach_release',
-                 'run_delivery'],
+                 'teach_contact_release', 'run_delivery'],
         required=True)
     parser.add_argument('--sequence', default=DEFAULT_SEQUENCE)
     parser.add_argument('--delivery-file', default=DEFAULT_DELIVERY_FILE)
+    parser.add_argument(
+        '--cargo-pick-file', default=None,
+        help=(
+            '载物仓抓取点配置；省略时继续从 --delivery-file 读取。'
+            '可让不同投递轨迹共用同一组 ID1~4 仓内抓取点。'))
     parser.add_argument('--tag-preset-file', default=DEFAULT_TAG_PRESET_FILE)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--group', default='manipulator')
@@ -101,6 +111,17 @@ def parse_args(argv):
     parser.add_argument('--motion-settle-seconds', type=float, default=0.25)
     parser.add_argument('--pump-on-settle-seconds', type=float, default=1.0)
     parser.add_argument('--pump-off-settle-seconds', type=float, default=0.7)
+    parser.add_argument('--contact-release', action='store_true')
+    parser.add_argument(
+        '--force-release-on-contact-miss', action='store_true')
+    parser.add_argument('--contact-staging-gap', type=float,
+                        default=CONTACT_STAGING_GAP_METERS)
+    parser.add_argument('--contact-staging-step', type=float,
+                        default=CONTACT_STAGING_STEP_METERS)
+    parser.add_argument('--contact-probe-step', type=float,
+                        default=CONTACT_PROBE_STEP_METERS)
+    parser.add_argument('--contact-probe-max-travel', type=float,
+                        default=CONTACT_PROBE_MAX_TRAVEL_METERS)
     parser.add_argument('--startup-home-service',
                         default=arm_api.DEFAULT_STARTUP_HOME_SERVICE)
     parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
@@ -115,6 +136,14 @@ def parse_args(argv):
     nonnegative(args.motion_settle_seconds, '--motion-settle-seconds')
     nonnegative(args.pump_on_settle_seconds, '--pump-on-settle-seconds')
     nonnegative(args.pump_off_settle_seconds, '--pump-off-settle-seconds')
+    positive(args.contact_staging_gap, '--contact-staging-gap')
+    positive(args.contact_staging_step, '--contact-staging-step')
+    positive(args.contact_probe_step, '--contact-probe-step')
+    positive(args.contact_probe_max_travel,
+             '--contact-probe-max-travel')
+    if args.force_release_on_contact_miss and not args.contact_release:
+        raise RuntimeError(
+            '--force-release-on-contact-miss 必须和 --contact-release 一起使用。')
     positive(args.startup_home_wait_seconds, '--startup-home-wait-seconds')
     nonnegative(args.startup_home_settle_seconds,
                 '--startup-home-settle-seconds')
@@ -133,10 +162,23 @@ def validate_joint_values(values, field):
     return result
 
 
+def normalize_axis(values, field):
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        raise RuntimeError('%s 必须包含 3 个方向分量。' % field)
+    result = [float(value) for value in values]
+    if any(math.isnan(value) or math.isinf(value) for value in result):
+        raise RuntimeError('%s 包含非法数值。' % field)
+    length = math.sqrt(sum(value * value for value in result))
+    if length <= 1e-9:
+        raise RuntimeError('%s 不能是零向量。' % field)
+    return [value / length for value in result]
+
+
 def empty_delivery_preset():
     return {
         'version': PRESET_VERSION,
         'cargo_pick_joint_values_by_id': {},
+        'contact_delivery_targets_by_id': {},
     }
 
 
@@ -150,15 +192,22 @@ def load_delivery_preset(path, allow_missing=False):
             preset = json.load(handle)
     except (IOError, ValueError) as exc:
         raise RuntimeError('无法读取投递配置：%s' % exc)
-    if preset.get('version') != PRESET_VERSION:
+    if preset.get('version') not in COMPATIBLE_PRESET_VERSIONS:
         raise RuntimeError('不支持的投递配置版本：%r' % preset.get('version'))
     if not isinstance(preset.get('cargo_pick_joint_values_by_id'), dict):
         raise RuntimeError(
             '投递配置缺少 cargo_pick_joint_values_by_id 对象。')
+    contact_targets = preset.get('contact_delivery_targets_by_id')
+    if contact_targets is None:
+        preset['contact_delivery_targets_by_id'] = {}
+    elif not isinstance(contact_targets, dict):
+        raise RuntimeError(
+            '投递配置 contact_delivery_targets_by_id 必须为对象。')
     return preset
 
 
 def save_delivery_preset(path, preset):
+    preset['version'] = PRESET_VERSION
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
@@ -167,7 +216,10 @@ def save_delivery_preset(path, preset):
         with open(tmp_path, 'w') as handle:
             json.dump(preset, handle, indent=2, sort_keys=True)
             handle.write('\n')
-        os.rename(tmp_path, path)
+        if hasattr(os, 'replace'):
+            os.replace(tmp_path, path)
+        else:
+            os.rename(tmp_path, path)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -186,22 +238,40 @@ def load_idle_joint_values(path):
         preset.get('idle_joint_values'), 'idle_joint_values')
 
 
-def require_delivery_items(preset, sequence):
+def require_delivery_items(preset, sequence, cargo_pick_preset=None,
+                           contact_release=False):
     transit = validate_joint_values(
         preset.get('transit_joint_values'), 'transit_joint_values')
-    release = validate_joint_values(
-        preset.get('delivery_joint_values'), 'delivery_joint_values')
-    cargo_points = preset.get('cargo_pick_joint_values_by_id', {})
+    release = None
+    contact_targets = preset.get('contact_delivery_targets_by_id', {})
+    if not contact_release:
+        release = validate_joint_values(
+            preset.get('delivery_joint_values'), 'delivery_joint_values')
+    cargo_source = cargo_pick_preset or preset
+    cargo_points = cargo_source.get('cargo_pick_joint_values_by_id', {})
     result = {}
     for item_id in sequence:
         key = str(item_id)
-        result[key] = {
+        item = {
             'cargo_pick_joint_values': validate_joint_values(
                 cargo_points.get(key),
                 'ID%d.cargo_pick_joint_values' % item_id),
             'transit_joint_values': list(transit),
-            'delivery_joint_values': list(release),
         }
+        if contact_release:
+            target = contact_targets.get(key)
+            if not isinstance(target, dict):
+                raise RuntimeError(
+                    'ID%d 缺少独立接触投递示教点。' % item_id)
+            item['precontact_joint_values'] = validate_joint_values(
+                target.get('precontact_joint_values'),
+                'ID%d.precontact_joint_values' % item_id)
+            item['approach_axis_xyz_base'] = normalize_axis(
+                target.get('approach_axis_xyz_base'),
+                'ID%d.approach_axis_xyz_base' % item_id)
+        else:
+            item['delivery_joint_values'] = list(release)
+        result[key] = item
     return result
 
 
@@ -306,9 +376,9 @@ def compute_fk_pose(args, arm, joint_values):
 
 
 def teach_delivery_point(args, arm):
-    preset = load_delivery_preset(args.delivery_file, allow_missing=True)
     field, label = TEACH_POINTS[args.mode]
     if args.mode != 'teach_cargo_pick':
+        preset = load_delivery_preset(args.delivery_file, allow_missing=True)
         if field in preset and not args.overwrite:
             raise RuntimeError(
                 '已有共享%s，重采时请加 --overwrite。' % label)
@@ -321,6 +391,9 @@ def teach_delivery_point(args, arm):
         rospy.loginfo('共享%s已保存：%s', label, preset[field])
         return
 
+    cargo_pick_file = (
+        getattr(args, 'cargo_pick_file', None) or args.delivery_file)
+    preset = load_delivery_preset(cargo_pick_file, allow_missing=True)
     cargo_points = preset['cargo_pick_joint_values_by_id']
     for index, item_id in enumerate(args.sequence, 1):
         key = str(item_id)
@@ -334,10 +407,57 @@ def teach_delivery_point(args, arm):
             % (item_id, index, len(args.sequence), label))
         cargo_points[key] = record_current_joints(
             arm, args.teach_settle_seconds)
-        save_delivery_preset(args.delivery_file, preset)
+        save_delivery_preset(cargo_pick_file, preset)
         rospy.loginfo('ID%d %s已保存：%s', item_id, label,
                       cargo_points[key])
-    rospy.loginfo('投递配置已保存：%s', args.delivery_file)
+    rospy.loginfo('共享载物仓抓取点配置已保存：%s', cargo_pick_file)
+
+
+def _pose_position(pose_stamped):
+    position = pose_stamped.pose.position
+    values = [float(position.x), float(position.y), float(position.z)]
+    if any(math.isnan(value) or math.isinf(value) for value in values):
+        raise RuntimeError('当前 Link6 位姿包含非法位置数值。')
+    return values
+
+
+def teach_contact_release(args, arm):
+    preset = load_delivery_preset(args.delivery_file, allow_missing=True)
+    targets = preset['contact_delivery_targets_by_id']
+    for index, item_id in enumerate(args.sequence, 1):
+        key = str(item_id)
+        if key in targets and not args.overwrite:
+            raise RuntimeError(
+                'ID%d 已有接触投递点，重采时请加 --overwrite。' % item_id)
+        prompt_enter(
+            '示教 ID%d（%d/%d）步骤 1/2：墙面后方参考点\n'
+            '请把吸盘保持最终投递姿态，移动到比预投递点 P 更远离墙面的安全位置。'
+            % (item_id, index, len(args.sequence)))
+        rospy.sleep(args.teach_settle_seconds)
+        rear_position = _pose_position(arm.get_current_pose())
+
+        prompt_enter(
+            '示教 ID%d（%d/%d）步骤 2/2：预投递点 P\n'
+            '请沿正前方靠近对应楼面，但不要接触墙面。'
+            % (item_id, index, len(args.sequence)))
+        rospy.sleep(args.teach_settle_seconds)
+        precontact_joints = validate_joint_values(
+            list(arm.get_current_joint_values()),
+            'ID%d 当前关节角' % item_id)
+        precontact_position = _pose_position(arm.get_current_pose())
+        safe_axis = normalize_axis([
+            rear_position[axis] - precontact_position[axis]
+            for axis in range(3)
+        ], 'ID%d P到后方参考点方向' % item_id)
+        targets[key] = {
+            'precontact_joint_values': precontact_joints,
+            'approach_axis_xyz_base': safe_axis,
+        }
+        save_delivery_preset(args.delivery_file, preset)
+        rospy.loginfo(
+            'ID%d 独立接触投递点已原子保存：joints=%s safe_axis=%s',
+            item_id, precontact_joints, safe_axis)
+    rospy.loginfo('接触投递示教已保存：%s', args.delivery_file)
 
 
 def build_delivery_actions(item, idle_joint_values):
@@ -356,16 +476,38 @@ def build_delivery_actions(item, idle_joint_values):
 
 
 def run_delivery(args, arm, pump_proxy):
+    contact_release = bool(getattr(args, 'contact_release', False))
     preset = load_delivery_preset(args.delivery_file)
-    items = require_delivery_items(preset, args.sequence)
+    cargo_pick_file = (
+        getattr(args, 'cargo_pick_file', None) or args.delivery_file)
+    if os.path.abspath(cargo_pick_file) == os.path.abspath(args.delivery_file):
+        cargo_pick_preset = preset
+    else:
+        cargo_pick_preset = load_delivery_preset(cargo_pick_file)
+    items = require_delivery_items(
+        preset, args.sequence, cargo_pick_preset=cargo_pick_preset,
+        contact_release=contact_release)
     idle_joint_values = load_idle_joint_values(args.tag_preset_file)
     if args.dry_run:
         for item_id in args.sequence:
-            rospy.loginfo('Dry-run ID%d 投递动作：%s', item_id,
-                          build_delivery_actions(items[str(item_id)],
-                                                 idle_joint_values))
+            item = items[str(item_id)]
+            actions = (
+                '接触投递：%.0fmm安全点 -> %.0fmm步长到P -> '
+                '%.0fmm步长前探%.0fmm -> 关泵 -> 直退%.0fmm -> idle'
+                % (args.contact_staging_gap * 1000.0,
+                   args.contact_staging_step * 1000.0,
+                   args.contact_probe_step * 1000.0,
+                   args.contact_probe_max_travel * 1000.0,
+                   args.contact_staging_gap * 1000.0)
+                if contact_release else
+                build_delivery_actions(item, idle_joint_values)
+            )
+            rospy.loginfo('Dry-run ID%d 投递动作：%s', item_id, actions)
         rospy.logwarn('Dry-run：未回零、未移动机械臂、未操作吸泵。')
         return
+
+    contact_proxies = arm_api.get_contact_proxies() \
+        if contact_release else None
 
     for index, item_id in enumerate(args.sequence, 1):
         entry = items[str(item_id)]
@@ -393,12 +535,53 @@ def run_delivery(args, arm, pump_proxy):
             arm_api.execute_joint_values(
                 arm, entry['transit_joint_values'],
                 'delivery_%d_transit' % item_id)
-            arm_api.execute_joint_values(
-                arm, entry['delivery_joint_values'],
-                'delivery_%d_release' % item_id)
+            if contact_release:
+                precontact_pose = compute_fk_pose(
+                    args, arm, entry['precontact_joint_values'])
+                pickup_model = {
+                    'approach_axis_xyz_base':
+                        entry['approach_axis_xyz_base'],
+                }
+                staging_pose = arm_api.build_backoff_pose(
+                    precontact_pose, pickup_model,
+                    args.contact_staging_gap, args.base_frame)
+                arm_api.execute_pose(
+                    arm, staging_pose,
+                    'delivery_%d_contact_staging_30mm' % item_id)
+                triggered = arm_api.run_contact_approach(
+                    arm, precontact_pose, pickup_model, args.base_frame,
+                    contact_proxies[0], contact_proxies[1],
+                    staging_step_m=args.contact_staging_step,
+                    probe_step_m=args.contact_probe_step,
+                    max_travel_m=args.contact_probe_max_travel)
+                if not triggered and not \
+                        args.force_release_on_contact_miss:
+                    arm_api.execute_cartesian_pose(
+                        arm, staging_pose,
+                        'delivery_%d_contact_miss_retreat' % item_id,
+                        eef_step=args.contact_staging_step)
+                    raise RuntimeError(
+                        'ID%d 前探 %.0fmm 后限位仍未触发，保持吸泵开启。'
+                        % (item_id,
+                           args.contact_probe_max_travel * 1000.0))
+                if not triggered:
+                    rospy.logwarn(
+                        '!!! ID%d 前探 %.0fmm 未触发限位；按参数要求强制关泵，'
+                        '本次仍记为投递成功。',
+                        item_id, args.contact_probe_max_travel * 1000.0)
+            else:
+                staging_pose = None
+                arm_api.execute_joint_values(
+                    arm, entry['delivery_joint_values'],
+                    'delivery_%d_release' % item_id)
             arm_api.set_pump(pump_proxy, False)
             holding_object = False
             rospy.sleep(args.pump_off_settle_seconds)
+            if contact_release:
+                arm_api.execute_cartesian_pose(
+                    arm, staging_pose,
+                    'delivery_%d_release_retreat_30mm' % item_id,
+                    eef_step=args.contact_staging_step)
             arm_api.execute_joint_values(
                 arm, idle_joint_values, 'idle')
         except Exception:
@@ -422,6 +605,8 @@ def main():
             not args.disable_replanning)
         if args.mode in TEACH_POINTS:
             teach_delivery_point(args, arm)
+        elif args.mode == 'teach_contact_release':
+            teach_contact_release(args, arm)
         else:
             pump_proxy = None if args.dry_run else arm_api.get_pump_proxy()
             run_delivery(args, arm, pump_proxy)

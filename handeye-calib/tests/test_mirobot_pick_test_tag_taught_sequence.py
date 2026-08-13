@@ -61,7 +61,7 @@ def make_pose(x=0.0, y=0.0, z=0.0, q=None, frame="base"):
     return pose
 
 
-def make_v3_preset(tag_ids=(1,), idle_joint_values=None,
+def make_v3_preset(tag_ids=(1, 2), idle_joint_values=None,
                    carry_joint_values=None):
     preset = {
         "version": 3,
@@ -112,12 +112,17 @@ def test_parse_args_has_no_post_pick_place_joint_alignment():
     assert not hasattr(args, "place_align_joints")
     assert not hasattr(args, "carry_joint6_lock")
     assert not hasattr(args, "tag_sample_seconds")
-    assert args.tag_min_samples == 5
+    assert args.tag_min_samples == 3
     assert args.tag_max_age_seconds == pytest.approx(2.0)
     assert args.tf_timeout == pytest.approx(12.0)
+    assert args.approach_gap == pytest.approx(0.030)
+    assert args.assist_front_gap == pytest.approx(0.065)
+    assert args.place_approach_gap == pytest.approx(0.05)
     assert args.velocity_scale == pytest.approx(0.4)
     assert args.acceleration_scale == pytest.approx(0.4)
     assert parse_args(["prog", "--mode", "teach_carry"]).mode == "teach_carry"
+    assert parse_args(["prog", "--mode", "teach_place_start"]).mode == \
+        "teach_place_start"
 
 
 def test_teach_tag_pose_rejects_stale_tf_instead_of_falling_back():
@@ -309,6 +314,84 @@ def test_preplace_moves_along_base_z():
     assert pre_place.pose.position.z == pytest.approx(0.12)
 
 
+def test_runtime_staging_pose_is_behind_taught_pre_grasp():
+    build_backoff_pose, = load_module_symbols("build_backoff_pose")
+    taught_pre_grasp = make_pose(0.24, 0.10, 0.12)
+    pickup_model = {
+        "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
+    }
+
+    staging_pose = build_backoff_pose(
+        taught_pre_grasp, pickup_model, 0.02, "base")
+
+    assert staging_pose.pose.position.x == pytest.approx(0.22)
+    assert staging_pose.pose.position.y == pytest.approx(0.10)
+    assert staging_pose.pose.position.z == pytest.approx(0.12)
+
+
+def test_reteach_records_pre_grasp_and_uses_existing_shared_axis_for_staging():
+    (prompt_and_record_grasp,
+     compute_taught_pre_grasp_pose,
+     build_backoff_pose) = load_module_symbols(
+        "prompt_and_record_grasp",
+        "compute_taught_pre_grasp_pose",
+        "build_backoff_pose",
+    )
+    tag_pose = make_pose(0.25, 0.10, 0.12)
+    taught_pre_grasp = make_pose(0.19, 0.055, 0.12)
+    preset = make_v3_preset()
+    preset["pickup_model"]["approach_axis_xyz_base"] = [-0.8, -0.6, 0.0]
+
+    class FakeArm:
+        def get_current_pose(self):
+            return copy.deepcopy(taught_pre_grasp)
+
+    args = SimpleNamespace(
+        approach_gap=0.06,
+        base_frame="base",
+        pickup_approach_axis_base=[-1.0, 0.0, 0.0],
+        teach_settle_seconds=0.0,
+    )
+    prompt_and_record_grasp.__globals__.update({
+        "prompt_enter": lambda message: None,
+        "rospy": SimpleNamespace(loginfo=lambda *items: None),
+    })
+
+    prompt_and_record_grasp(
+        args, FakeArm(), preset, 1, tag_pose,
+        update_pickup_model=False)
+    rebuilt_pre_grasp = compute_taught_pre_grasp_pose(
+        tag_pose, preset["pickup_model"], preset["tags"]["1"], "base")
+    staging_pose = build_backoff_pose(
+        rebuilt_pre_grasp, preset["pickup_model"], 0.06, "base")
+
+    assert rebuilt_pre_grasp.pose.position.x == pytest.approx(
+        taught_pre_grasp.pose.position.x)
+    assert rebuilt_pre_grasp.pose.position.y == pytest.approx(
+        taught_pre_grasp.pose.position.y)
+    assert staging_pose.pose.position.x == pytest.approx(0.142)
+    assert staging_pose.pose.position.y == pytest.approx(0.019)
+    assert staging_pose.pose.position.z == pytest.approx(0.12)
+
+
+def test_horizontal_tag_outward_axis_keeps_face_yaw():
+    horizontal_tag_outward_axis, = load_module_symbols(
+        "horizontal_tag_outward_axis")
+    root_half = 2 ** 0.5 / 2.0
+    sin_15 = __import__("math").sin(__import__("math").radians(15.0))
+    cos_15 = __import__("math").cos(__import__("math").radians(15.0))
+    tag_pose = make_pose(q=[
+        -sin_15 * root_half,
+        cos_15 * root_half,
+        sin_15 * root_half,
+        cos_15 * root_half,
+    ])
+
+    axis = horizontal_tag_outward_axis(tag_pose)
+
+    assert axis == pytest.approx([3 ** 0.5 / 2.0, 0.5, 0.0])
+
+
 def test_teach_assist_pose_stays_at_tag_height_and_uses_horizontal_orientation():
     build_teach_assist_pose, = load_module_symbols("build_teach_assist_pose")
     root_half = 2 ** 0.5 / 2.0
@@ -370,6 +453,84 @@ def test_record_place_stores_pose_orientation_and_approach_axis_only():
     assert "place_joint_values" not in entry
 
 
+def test_place_teach_start_is_stored_as_a_full_link6_pose():
+    record_start, = load_module_symbols(
+        "record_place_teach_start_in_preset")
+    preset = {}
+    start_pose = make_pose(
+        0.22, -0.03, 0.18, q=[0.1, 0.2, 0.3, 0.9])
+
+    record_start(preset, start_pose)
+
+    stored = preset["place_teach_start_ee_in_base"]
+    assert stored["position"] == pytest.approx([0.22, -0.03, 0.18])
+    assert stored["orientation_xyzw"] == pytest.approx(
+        [0.1, 0.2, 0.3, 0.9])
+
+
+def test_place_teach_requires_the_shared_start_pose():
+    require_start, = load_module_symbols("require_place_teach_start")
+
+    with pytest.raises(RuntimeError, match="teach_place_start"):
+        require_start({})
+
+
+def test_place_teach_moves_to_shared_start_before_manual_adjustment():
+    prompt_and_record_place, = load_module_symbols("prompt_and_record_place")
+    start_pose = make_pose(0.2, 0.0, 0.1)
+    final_pose = make_pose(0.4, -0.2, 0.05, q=[0.2, 0.1, 0.3, 0.9])
+    preset = make_v3_preset()
+    preset["place_teach_start_ee_in_base"] = {
+        "position": [0.2, 0.0, 0.1],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+    events = []
+    prompt_and_record_place.__globals__.update({
+        "transform_to_pose": lambda frame, transform: start_pose,
+        "execute_pose": lambda arm, pose, label: events.append(
+            ("move", pose, label)),
+        "prompt_enter": lambda message: events.append(("prompt", message)),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            sleep=lambda seconds: events.append(("sleep", seconds))),
+    })
+    args = SimpleNamespace(base_frame="base", teach_settle_seconds=0.0)
+    arm = SimpleNamespace(get_current_pose=lambda: final_pose)
+
+    prompt_and_record_place(args, arm, preset, 1)
+
+    assert events[0] == ("move", start_pose, "place_teach_start")
+    assert events[1][0] == "prompt"
+    stored = preset["tags"]["1"]["place_ee_in_base"]
+    assert stored["position"] == pytest.approx([0.4, -0.2, 0.05])
+    assert stored["orientation_xyzw"] == pytest.approx([0.2, 0.1, 0.3, 0.9])
+
+
+def test_tag_grasp_also_updates_the_shared_place_teach_start():
+    prompt_and_record_grasp, = load_module_symbols("prompt_and_record_grasp")
+    probe_start = make_pose(
+        0.25, -0.04, 0.17, q=[0.1, 0.2, 0.3, 0.9])
+    tag_pose = make_pose(
+        0.31, -0.04, 0.17, q=[0.0, 0.70710678, 0.0, 0.70710678])
+    preset = {"tags": {"2": {}}}
+    prompt_and_record_grasp.__globals__.update({
+        "prompt_enter": lambda message: None,
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None, sleep=lambda seconds: None),
+    })
+    args = SimpleNamespace(
+        approach_gap=0.065, base_frame="base", teach_settle_seconds=0.0,
+        pickup_approach_axis_base=[-1.0, 0.0, 0.0])
+    arm = SimpleNamespace(get_current_pose=lambda: probe_start)
+
+    prompt_and_record_grasp(
+        args, arm, preset, 2, tag_pose, update_pickup_model=True)
+
+    stored = preset["place_teach_start_ee_in_base"]
+    assert stored["position"] == pytest.approx([0.25, -0.04, 0.17])
+    assert stored["orientation_xyzw"] == pytest.approx([0.1, 0.2, 0.3, 0.9])
+
+
 def test_load_preset_reports_missing_corrupt_and_missing_tag(tmp_path):
     load_preset, require_preset_tags = load_module_symbols(
         "load_preset",
@@ -386,6 +547,17 @@ def test_load_preset_reports_missing_corrupt_and_missing_tag(tmp_path):
 
     with pytest.raises(RuntimeError, match="tag 2"):
         require_preset_tags({"tags": {"1": {}}}, [1, 2])
+
+
+def test_existing_id2_grasp_is_shared_by_all_ids_without_migration():
+    require_shared_grasp, = load_module_symbols(
+        "require_shared_grasp_offset")
+    preset = make_v3_preset(tag_ids=(1, 2, 3, 4))
+    preset["tags"]["2"]["grasp_offset_xyz_base"] = [-0.07, 0.01, 0.02]
+
+    offset = require_shared_grasp(preset)
+
+    assert offset == pytest.approx([-0.07, 0.01, 0.02])
 
 
 def test_prompt_enter_accepts_enter_and_allows_abort():
@@ -473,8 +645,9 @@ def test_run_taught_sequence_dry_run_does_not_move_or_pump():
         "load_preset": lambda path: preset,
         "wait_for_tag_pose_in_base": lambda listener, args, tag_id: make_pose(0.2, 0.0, 0.1),
         "publish_debug_geometry": lambda *items, **kwargs: events.append("debug"),
-        "execute_pose": lambda *items: events.append("execute_pose"),
-        "execute_cartesian_pose": lambda *items, **kwargs: events.append("cartesian"),
+        "execute_pose": lambda arm, pose, label: events.append(label),
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            events.append(label)),
         "execute_joint_values": lambda *items: events.append("idle"),
         "set_pump": lambda *items: events.append("pump"),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
@@ -520,9 +693,11 @@ def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next
             events.append(("wait_tag", tag_id)) or make_pose(0.2, 0.0, 0.1)
         ),
         "publish_debug_geometry": lambda *items, **kwargs: events.append("debug"),
-        "execute_pose": lambda *items: events.append("execute_pose"),
-        "execute_cartesian_pose": lambda *items, **kwargs: events.append("cartesian"),
+        "execute_pose": lambda arm, pose, label: events.append(label),
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            events.append(label)),
         "execute_joint_values": lambda arm, values, label: events.append(("idle", values, label)),
+        "run_contact_approach": lambda *items: events.append("probe") or True,
         "set_pump": lambda *items: events.append("pump"),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
         "rospy": SimpleNamespace(
@@ -532,10 +707,21 @@ def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next
         ),
     })
 
-    run_taught_sequence(args, object(), object())
+    run_taught_sequence(
+        args, object(), object(), contact_proxies=(object(), object()))
 
     idle_event = ("idle", [0.0, 0.1, 0.2], "idle")
     assert events.count(idle_event) == 2
+    assert events.count("approach_staging") == 2
+    assert events.count("probe") == 2
+    first_wait = events.index(("wait_tag", 1))
+    second_wait = events.index(("wait_tag", 2))
+    first_staging = events.index("approach_staging", first_wait)
+    first_probe = events.index("probe", first_staging)
+    assert first_staging < first_probe < second_wait
+    second_staging = events.index("approach_staging", second_wait)
+    second_probe = events.index("probe", second_staging)
+    assert second_staging < second_probe
     assert events.index(idle_event) < events.index(("wait_tag", 2))
 
 
@@ -557,14 +743,20 @@ def test_run_taught_sequence_moves_to_carry_between_grasp_and_place():
     carry_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
     preset = make_v3_preset(carry_joint_values=carry_values)
     events = []
+    cartesian_targets = {}
+
+    def execute_cartesian(_arm, pose, label, *items, **kwargs):
+        events.append(label)
+        cartesian_targets[label] = copy.deepcopy(pose)
 
     run_taught_sequence.__globals__.update({
         "load_preset": lambda path: preset,
         "wait_for_tag_pose_in_base": lambda listener, args, tag_id: make_pose(0.2, 0.0, 0.1),
         "publish_debug_geometry": lambda *items, **kwargs: None,
         "execute_pose": lambda arm, pose, label: events.append(label),
-        "execute_cartesian_pose": lambda arm, pose, label, *items, **kwargs: events.append(label),
+        "execute_cartesian_pose": execute_cartesian,
         "execute_joint_values": lambda arm, values, label: events.append((label, list(values))),
+        "run_contact_approach": lambda *items: True,
         "set_pump": lambda *items: events.append("pump"),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
         "rospy": SimpleNamespace(
@@ -574,12 +766,17 @@ def test_run_taught_sequence_moves_to_carry_between_grasp_and_place():
         ),
     })
 
-    run_taught_sequence(args, object(), object())
+    run_taught_sequence(
+        args, object(), object(), contact_proxies=(object(), object()))
 
     carry_event = ("carry", carry_values)
     assert carry_event in events
-    assert events.index("taught_grasp_retreat") < events.index(carry_event)
+    assert events.index("approach_staging") < events.index("pickup_retreat")
+    assert events.index("pickup_retreat") < events.index(carry_event)
     assert events.index(carry_event) < events.index("taught_pre_place")
+    # tag x=0.20, taught offset=-0.03, approach axis=-X:
+    # Taught pre-grasp x=0.17; retreat ends 30mm behind it at x=0.14.
+    assert cartesian_targets["pickup_retreat"].pose.position.x == pytest.approx(0.14)
 
 
 def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
@@ -617,6 +814,7 @@ def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
         "execute_pose": lambda arm, pose, label: events.append(label),
         "execute_cartesian_pose": lambda arm, pose, label, *args, **kwargs: events.append(label),
         "execute_joint_values": fake_execute_joint_values,
+        "run_contact_approach": lambda *items: True,
         "set_pump": lambda *items: events.append("pump"),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
         "rospy": SimpleNamespace(
@@ -626,7 +824,8 @@ def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
         ),
     })
 
-    run_taught_sequence(args, FakeArm(), object())
+    run_taught_sequence(
+        args, FakeArm(), object(), contact_proxies=(object(), object()))
 
     assert not any(
         isinstance(event, tuple) and event[0] == "taught_place_align_joints"
@@ -921,6 +1120,7 @@ def test_run_taught_sequence_turns_pump_off_if_failure_happens_after_pickup():
         "execute_pose": lambda *items: None,
         "execute_cartesian_pose": fake_cartesian,
         "execute_joint_values": lambda *items: None,
+        "run_contact_approach": lambda *items: True,
         "set_pump": lambda pump_proxy, enabled: pump_events.append(enabled),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
         "rospy": SimpleNamespace(
@@ -931,9 +1131,10 @@ def test_run_taught_sequence_turns_pump_off_if_failure_happens_after_pickup():
     })
 
     with pytest.raises(RuntimeError, match="place failed"):
-        run_taught_sequence(args, object(), object())
+        run_taught_sequence(
+            args, object(), object(), contact_proxies=(object(), object()))
 
-    assert pump_events == [True, False]
+    assert pump_events == [False, True, False]
 
 
 def test_run_taught_sequence_can_run_startup_home_after_idle_when_requested():
@@ -962,6 +1163,7 @@ def test_run_taught_sequence_can_run_startup_home_after_idle_when_requested():
         "execute_cartesian_pose": lambda *items, **kwargs: events.append("cartesian"),
         "execute_joint_values": lambda arm, values, label: events.append(label),
         "run_startup_home": lambda args: events.append("startup_home"),
+        "run_contact_approach": lambda *items: True,
         "set_pump": lambda *items: events.append("pump"),
         "tf": SimpleNamespace(TransformListener=lambda: object()),
         "rospy": SimpleNamespace(
@@ -971,11 +1173,179 @@ def test_run_taught_sequence_can_run_startup_home_after_idle_when_requested():
         ),
     })
 
-    run_taught_sequence(args, object(), object())
+    run_taught_sequence(
+        args, object(), object(), contact_proxies=(object(), object()))
 
     assert "idle" in events
     assert "startup_home" in events
     assert events.index("idle") < events.index("startup_home")
+
+
+def test_contact_guard_covers_move_to_p_then_sixty_five_mm_probe():
+    run_contact_probe, = load_module_symbols("run_contact_approach")
+    start = make_pose(0.10, 0.20, 0.30)
+    pickup_model = {"approach_axis_xyz_base": [-1.0, 0.0, 0.0]}
+    enable_events = []
+    targets = []
+    cartesian_options = []
+    state_results = iter([False, False, True])
+
+    def enable_proxy(enabled):
+        enable_events.append(enabled)
+        return SimpleNamespace(success=True, message="ok")
+
+    def state_proxy():
+        triggered = next(state_results)
+        return SimpleNamespace(
+            success=triggered,
+            message="TRIGGERED" if triggered else "NOT_TRIGGERED")
+
+    run_contact_probe.__globals__.update({
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            targets.append(copy.deepcopy(pose)),
+            cartesian_options.append(dict(kwargs))),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            sleep=lambda seconds: None,
+        ),
+    })
+
+    assert run_contact_probe(
+        object(), start, pickup_model, "base",
+        enable_proxy, state_proxy) is True
+
+    assert enable_events == [True, False]
+    assert [pose.pose.position.x for pose in targets] == pytest.approx(
+        [0.10, 0.165])
+    assert all(pose.pose.position.y == pytest.approx(0.20)
+               for pose in targets)
+    assert all(pose.pose.position.z == pytest.approx(0.30)
+               for pose in targets)
+    assert all(options["stop_after"] is False
+               for options in cartesian_options)
+    assert all(options["settle"] is False
+               for options in cartesian_options)
+    staging_options = {
+        "eef_step": pytest.approx(0.005),
+        "quiet": True,
+        "settle": False,
+        "stop_after": False,
+        "min_point_interval": pytest.approx(0.5),
+    }
+    probe_options = dict(staging_options)
+    probe_options["eef_step"] = pytest.approx(0.002)
+    assert cartesian_options == [staging_options, probe_options]
+
+
+def test_contact_probe_stops_at_sixty_five_mm_when_switch_never_triggers():
+    run_contact_probe, = load_module_symbols("run_contact_approach")
+    start = make_pose(0.10, 0.20, 0.30)
+    targets = []
+
+    run_contact_probe.__globals__.update({
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            targets.append(copy.deepcopy(pose))),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            sleep=lambda seconds: None,
+        ),
+    })
+    enable_proxy = lambda enabled: SimpleNamespace(success=True, message="ok")
+    state_proxy = lambda: SimpleNamespace(
+        success=False, message="NOT_TRIGGERED")
+
+    assert run_contact_probe(
+        object(), start, {"approach_axis_xyz_base": [-1.0, 0.0, 0.0]},
+        "base", enable_proxy, state_proxy) is False
+
+    assert len(targets) == 2
+    assert targets[0].pose.position.x == pytest.approx(0.10)
+    assert targets[-1].pose.position.x == pytest.approx(0.165)
+
+
+def test_contact_guard_skips_probe_when_switch_triggers_before_p():
+    run_contact_approach, = load_module_symbols("run_contact_approach")
+    start = make_pose(0.10, 0.20, 0.30)
+    targets = []
+    state_results = iter([False, True])
+    run_contact_approach.__globals__.update({
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            targets.append(copy.deepcopy(pose))),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            sleep=lambda seconds: None,
+        ),
+    })
+    enable_proxy = lambda enabled: SimpleNamespace(success=True, message="ok")
+
+    def state_proxy():
+        triggered = next(state_results)
+        return SimpleNamespace(
+            success=triggered,
+            message="TRIGGERED" if triggered else "NOT_TRIGGERED")
+
+    assert run_contact_approach(
+        object(), start, {"approach_axis_xyz_base": [-1.0, 0.0, 0.0]},
+        "base", enable_proxy, state_proxy) is True
+    assert len(targets) == 1
+    assert targets[0].pose.position.x == pytest.approx(0.10)
+
+
+def test_contact_state_serial_error_is_a_hard_failure():
+    contact_is_triggered, = load_module_symbols("contact_is_triggered")
+
+    with pytest.raises(RuntimeError, match="读取限位开关失败"):
+        contact_is_triggered(lambda: SimpleNamespace(
+            success=False, message="ERROR: serial unavailable"))
+
+
+def test_contact_probe_miss_retreats_keeps_pump_off_and_reports_incomplete():
+    run_taught_sequence, contact_error = load_module_symbols(
+        "run_taught_sequence", "ContactProbeIncomplete")
+    args = SimpleNamespace(
+        sequence=[1], preset_file="/tmp/unused.json",
+        base_frame="base", camera_frame="camera", tf_timeout=1.0,
+        approach_gap=0.04, place_approach_gap=0.02,
+        dry_run=False, debug_hold_seconds=0.0, home_after_idle=False,
+        assist_orientation_xyzw=[0.0, 0.0, 0.0, 1.0])
+    preset = make_v3_preset(idle_joint_values=[0.0, 0.1, 0.2])
+    pump_events = []
+    cartesian_labels = []
+    cartesian_targets = {}
+    joint_labels = []
+
+    run_taught_sequence.__globals__.update({
+        "load_preset": lambda path: preset,
+        "wait_for_tag_pose_in_base": lambda listener, args, tag_id: (
+            make_pose(0.2, 0.0, 0.1)),
+        "publish_debug_geometry": lambda *items, **kwargs: None,
+        "execute_pose": lambda *items: None,
+        "run_contact_approach": lambda *items: False,
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            cartesian_labels.append(label),
+            cartesian_targets.update({label: copy.deepcopy(pose)})),
+        "execute_joint_values": lambda arm, values, label: (
+            joint_labels.append(label)),
+        "set_pump": lambda proxy, enabled: pump_events.append(enabled),
+        "tf": SimpleNamespace(TransformListener=lambda: object()),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            logwarn=lambda *items: None,
+            sleep=lambda seconds: None,
+        ),
+    })
+
+    with pytest.raises(contact_error):
+        run_taught_sequence(
+            args, object(), object(),
+            contact_proxies=(object(), object()))
+
+    assert pump_events == [False, False]
+    assert cartesian_labels == ["contact_probe_miss_retreat"]
+    # Tag x=0.20, shared pre-grasp offset=-0.03, then another 30mm back.
+    assert cartesian_targets[
+        "contact_probe_miss_retreat"].pose.position.x == pytest.approx(0.14)
+    assert joint_labels == ["idle"]
 
 
 def test_source_contract_removes_old_tuning_modes_and_parameters():

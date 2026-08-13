@@ -6,7 +6,8 @@
 
 ```text
 zcy_last/
-├── main.py                 # 比赛任务入口和抓取依赖进程托管
+├── launch.py               # 终端一：启动并持有常驻 ROS 依赖
+├── main.py                 # 终端二：用户按需启动的比赛任务
 ├── config.py               # 比赛开关、设备号、路径和调节参数
 ├── algorithms/             # 巡线、横条、补线、YOLO 和红绿灯算法
 ├── control/                # 摄像头、底盘、抓取协调和子进程所有权
@@ -14,17 +15,35 @@ zcy_last/
 └── tests/                  # 新旧算法对比和抓取流程测试
 ```
 
-## 启动底盘
+## 正式启动（两个终端）
 
-底盘驱动必须在独立终端人工启动，`zcy_last` 不启动也不关闭它：
+终端一启动 `launch.py`：启动或复用底盘，临时启动 Astra 建立相机坐标系，再启动 MoveIt 和手眼 TF。就绪后关闭临时 Astra，底盘、MoveIt 和手眼 TF 保持常驻。`launch.py` 不会启动比赛状态机：
 
 ```bash
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/robocom_ws/devel/setup.bash
-roslaunch xpkg_bringup bringup_basic_ctrl.launch
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/robocom_ws/src
+python3 -m zcy_last.launch
 ```
 
-任务启动时只检查 `/xnode_comm` 和 `/xnode_vehicle` 是否存在。
+用户决定是否在终端二启动 `main.py`。`main` 直接使用终端一的常驻依赖，不再重复等待底盘、MoveIt、机械臂服务和手眼 TF，只对 Astra、Tag 节点、YOLO 和抓取子进程进行按阶段托管：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/robocom_ws/devel/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/robocom_ws/src
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 --tag-delivery \
+  --no-untagged-pick
+```
+
+终端二退出不会关闭终端一的常驻依赖。不再需要时，在终端一按 `Ctrl+C`，`launch.py` 会逆序关闭自己启动的进程。
 
 ## 启动任务
 
@@ -39,22 +58,32 @@ conda activate ww
 cd /home/eaibot/robocom_ws/src
 ```
 
-四种比赛组合：
+固定五种比赛组合：
 
 ```bash
-# 纯循迹，不抓取
-python3 -m zcy_last.main
-
-# 仅开始前执行 B 点有 Tag 抓取，并在第一圈自动投递
-python3 -m zcy_last.main --tag-pick --tag-pick-count 2
-
-# 仅第 3 个路口完成后执行 A 点无 Tag 抓取，并在楼宇处自动投递
-python3 -m zcy_last.main --untagged-pick --untagged-pick-count 3
-
-# B 点和 A 点都抓取
+# 1. 只循迹，A/B 都不抓取
 python3 -m zcy_last.main \
-  --tag-pick --tag-pick-count 2 \
-  --untagged-pick --untagged-pick-count 3
+  --no-tag-pick --no-untagged-pick
+
+# 2. B 点抓取 4 个并投递
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 --tag-delivery \
+  --no-untagged-pick
+
+# 3. B 点只抓取 4 个，不投递
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 --no-tag-delivery \
+  --no-untagged-pick
+
+# 4. A 点抓取 3 个并投递
+python3 -m zcy_last.main \
+  --no-tag-pick \
+  --untagged-pick --untagged-pick-count 3 --untagged-delivery
+
+# 5. A 点只抓取 3 个，不投递
+python3 -m zcy_last.main \
+  --no-tag-pick \
+  --untagged-pick --untagged-pick-count 3 --no-untagged-delivery
 ```
 
 命令行开关优先于 `config.py` 顶部默认值。抓取数量范围为 `1..4`，表示必须成功完成的数量；目标按当前画面从左到右选择，目标不足或任一目标失败都会进入 `PICK_FAILED` 永久停车。
@@ -63,21 +92,26 @@ B 点有 Tag 和 A 点无 Tag 各有独立抓取、投递开关。临时只抓�
 
 B 点投递映射：普通人群 `1`、医疗人群 `2`、可回收垃圾 `3`、其他垃圾 `4`。A 点投递映射：电力故障楼宇 `1`、火灾楼宇 `2`、有毒气体楼宇 `3`、坍塌楼宇 `4`。程序只使用抓取脚本返回的实际成功 ID，不使用计划抓取数量代替库存。
 
-已经手动启动全部 ROS 依赖时，可在调试中增加 `--external-ros`。此模式不托管、不检查也不关闭外部进程，不用于正式比赛的一键启动。
+`python3 -m zcy_last.main` 是唯一任务入口。全部 ROS 依赖都由人工管理时可再加 `--external-ros`；此模式不托管、不检查也不关闭外部进程，只用于特殊联调。
 
 ## 状态机
 
 ```text
 STARTUP
-  -> B_PICK_PREPARE -> B_PICKING -> PICK_RECOVER
-  -> FOLLOW -> YOLO_STOP -> DELIVERING -> FOLLOW
+  -> B_PICK_PREPARE -> B_PICKING -> TRAFFIC_WAIT -> MANEUVER
+  -> FOLLOW -> YOLO_STOP -> DELIVERING -> FOLLOW                 # 街区
+  -> FOLLOW -> YOLO_STOP -> BUILDING_DELIVERY_ALIGN
+            -> DELIVERING -> FOLLOW                             # 楼宇
   -> APPROACH -> ALIGN -> TRAFFIC_WAIT
   -> MANEUVER -> EXIT_ALIGN
-  -> A_PICK_PREPARE -> A_PICKING -> PICK_RECOVER
+  -> A_PICK_PREPARE -> A_PICK_SEARCH -> A_PICKING
+  -> TRAFFIC_WAIT -> MANEUVER -> EXIT_ALIGN
   -> FINAL_EXIT -> DONE
 ```
 
-抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。抓取完成后必须连续稳定识别车道才能恢复 `FOLLOW`。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存；投递时底盘停车，完成后恢复 `FOLLOW`。
+实际开启 B 点抓取时，`B_PICKING` 成功后不进入普通 `PICK_RECOVER`：车辆已经越过首个入口横条，会直接进入 `TRAFFIC_WAIT`，确认绿灯后按 `TAG_PICK_FIRST_ENTRY_TIME` 直行、按 `TAG_PICK_FIRST_TURN_TIME` 执行第一次右转，再沿用 `MANEUVER -> EXIT_ALIGN` 识别出口并完成第 1 个路口计数。
+
+抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。A 点先在 `A_PICK_PREPARE` 停车加载 Astra、模型和抓取子进程；子进程进入检测循环后切换到 `A_PICK_SEARCH`，车辆以 `UNTAGGED_SEARCH_FORWARD_SPEED` 保持零角速度直行，不使用车道中心修正。无 Tag 目标在 Astra 画面右侧搜索区连续确认后，车辆先停车，再将底盘控制权交给抓取子进程低速对准左侧抓取 ROI。抓取成功后不进入 `PICK_RECOVER/FOLLOW`，而是等待绿灯，再按 `UNTAGGED_PICK_NEXT_ENTRY_TIME` 直行、按 `UNTAGGED_PICK_NEXT_TURN_TIME` 完成第 4 个路口左转，识别出口横条后恢复普通流程。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存。街区仍按固定点直接投递；楼宇先用 `/dev/video2` 的原始 320×240 框复现对应类别的标定停车位置，连续 3 帧满足中心与尺度条件后才启动机械臂接触投递。丢框、过近或 25 秒超时会立即停车、放弃该 ID 且不重试。
 
 抓取、依赖进程或车道恢复失败会进入 `PICK_FAILED`。投递失败例外：终端输出警告、该 ID 不再自动重试，并继续循迹。
 
@@ -86,12 +120,14 @@ STARTUP
 ```text
 /dev/video4  巡线，任务全程占用
 /dev/video0  红绿灯，只在停止线摆正后打开模型
-/dev/video2  Astra 与任务 YOLO 串行复用
+/dev/video2  任务 YOLO 当前配置的 OpenCV 索引
 ```
 
-B 点流程先由 Astra、Tag 补白和 AprilTag 使用 `/dev/video2`。B 点结束后释放相机，再加载人偶和垃圾桶模型。第 3 个路口后先关闭任务 YOLO，再启动 Astra 执行 A 点无 Tag 抓取。A 点结束后释放 Astra并加载楼宇模型。
+`launch.py` 的启动顺序为底盘 -> 临时 Astra -> MoveIt/手眼 TF -> 关闭临时 Astra，因为手眼发布器需要 Astra 先提供 `camera_link` 内部 TF。`main.py` 执行 B 点时只重新启动 Astra 并启动 Tag 补白/AprilTag，直接使用终端一的常驻机械臂公共栈。Astra 优先使用项目指定的 RGB 内参文件；文件不存在时自动按驱动默认方式启动，但仍要求实际发布的 `CameraInfo.K` 非空。B 点结束后关闭 Astra，再由任务 YOLO 打开 `/dev/video2`。第 3 个路口后先关闭任务 YOLO，再启动 Astra；搜索循环就绪后由 Astra 检查画面右侧的无 Tag 物块。抓取结束后关闭 Astra 并加载楼宇模型。
 
-进程管理器会检查外部底盘节点、共享相机占用、Astra 内参、MoveIt 状态、机械臂服务和手眼 TF。日志保存在 `/home/eaibot/logs/zcy_last/<启动时间>/`。程序退出时先停车，再逆序关闭本次启动的抓取相关进程，不关闭人工启动的底盘或其他外部进程。
+人偶多数类别默认需要连续确认 `6` 帧才停车，由 `YOLO_PEOPLE_STABLE_FRAMES` 调整；垃圾桶和楼宇不使用该帧数。
+
+进程管理器会检查底盘节点、共享相机占用、Astra 内参、MoveIt 状态、机械臂服务和手眼 TF。日志保存在 `/home/eaibot/logs/zcy_last/<启动时间>/`。`launch` 退出时先停车，再逆序关闭本次启动的全部进程；检测到并复用的人工进程不属于本程序，不会被关闭。
 
 ## 故障处理
 

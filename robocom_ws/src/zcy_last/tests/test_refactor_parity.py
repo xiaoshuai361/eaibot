@@ -53,7 +53,6 @@ def test_route_and_control_parameters_match_legacy():
         "LARGE_ERROR_KP",
         "LARGE_ERROR_KD",
         "LANE_WIDTH_PIXELS",
-        "STOP_NEAR_RATIO",
     )
     for name in names:
         assert getattr(config, name) == getattr(legacy, name)

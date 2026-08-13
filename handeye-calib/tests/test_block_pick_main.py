@@ -24,6 +24,16 @@ def test_default_model_and_config_paths_match_robot_layout():
     assert parsed.arm_script == "/home/eaibot/handeye-calib/src/mirobot_pick_test.py"
 
 
+def test_default_no_tag_probe_distances_match_tag_flow():
+    assert main.DEFAULT_CONFIG["teach_assist_distance_mm"] == pytest.approx(85.0)
+    assert main.DEFAULT_CONFIG["approach_gap_mm"] == pytest.approx(30.0)
+    assert main.DEFAULT_CONFIG["contact_probe"]["max_travel_mm"] == pytest.approx(65.0)
+    assert main.DEFAULT_CONFIG["contact_probe"]["staging_step_mm"] == pytest.approx(5.0)
+    assert main.DEFAULT_CONFIG["contact_probe"]["step_mm"] == pytest.approx(2.0)
+    assert main.DEFAULT_CONFIG["contact_probe"]["retreat_extra_mm"] == pytest.approx(30.0)
+    assert "place_preset_file" not in main.DEFAULT_CONFIG
+
+
 def test_target_accepts_numeric_aliases():
     parsed = main.parse_args(["--target", "3", "--dry-run"])
 
@@ -67,16 +77,16 @@ def test_live_preview_is_target_optional_and_forwards_rate():
     assert "--block-target" not in command
 
 
-def test_pregrasp_distance_must_be_positive_and_is_forwarded():
+def test_approach_gap_must_be_positive_and_is_forwarded():
     parsed = args(
-        "--stop-at-taught-pre-grasp", "--pregrasp-distance-mm", "100")
+        "--stop-at-taught-pre-grasp", "--approach-gap-mm", "25")
 
     main.validate_runtime_args(parsed, {"distance_method": "fixed_plane"})
     command = main.build_child_command(parsed, request_fd=11, response_fd=12)
-    assert command[command.index("--pregrasp-distance-mm") + 1] == "100.0"
+    assert command[command.index("--approach-gap-mm") + 1] == "25.0"
 
     invalid = args(
-        "--stop-at-taught-pre-grasp", "--pregrasp-distance-mm", "0")
+        "--stop-at-taught-pre-grasp", "--approach-gap-mm", "0")
     with pytest.raises(ValueError, match="positive"):
         main.validate_runtime_args(invalid, {"distance_method": "fixed_plane"})
 
@@ -137,7 +147,7 @@ def test_build_child_command_forwards_action_and_ros_debug_flags():
 
 def test_build_child_command_forwards_taught_block_actions():
     teach = args(
-        "--teach-block-grasp",
+        "--teach-block-pick-place",
         "--preset-file",
         "/tmp/block_presets.json",
         "--overwrite",
@@ -151,7 +161,7 @@ def test_build_child_command_forwards_taught_block_actions():
     teach_command = main.build_child_command(teach, request_fd=11, response_fd=12)
     run_command = main.build_child_command(run, request_fd=21, response_fd=22)
 
-    assert "--teach-block-grasp" in teach_command
+    assert "--teach-block-pick-place" in teach_command
     assert "--run-taught-block" in run_command
     assert "--preset-file" in teach_command
     assert "/tmp/block_presets.json" in teach_command
@@ -160,7 +170,7 @@ def test_build_child_command_forwards_taught_block_actions():
     assert "--overwrite" in teach_command
 
 
-def test_chassis_sequence_is_targetless_and_forwards_short_options():
+def test_chassis_sequence_is_targetless_and_ignores_legacy_wait_option():
     parsed = main.parse_args([
         "--run-chassis-sequence",
         "--sequence", "power,fire,gas,support",
@@ -174,7 +184,7 @@ def test_chassis_sequence_is_targetless_and_forwards_short_options():
     assert "--block-target" not in command
     assert "--run-chassis-sequence" in command
     assert command[command.index("--sequence") + 1] == "power,fire,gas,support"
-    assert "--wait-key-between-targets" in command
+    assert "--wait-key-between-targets" not in command
     assert "--show-rgb" in command
 
 
@@ -208,6 +218,33 @@ def test_chassis_sequence_forwards_result_file():
         "/tmp/untagged-result.json"
 
 
+def test_chassis_sequence_forwards_right_side_search_handshake():
+    parsed = main.parse_args([
+        "--run-chassis-sequence",
+        "--search-before-chassis",
+        "--search-ready-file", "/tmp/search-ready",
+        "--search-trigger-file", "/tmp/search-trigger",
+        "--search-release-file", "/tmp/search-release",
+        "--search-roi-ratio", "0.60,0.05,0.98,0.95",
+        "--search-stable-frames", "4",
+        "--search-poll-hz", "2.5",
+    ])
+
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+
+    assert "--search-before-chassis" in command
+    assert command[command.index("--search-ready-file") + 1] == \
+        "/tmp/search-ready"
+    assert command[command.index("--search-trigger-file") + 1] == \
+        "/tmp/search-trigger"
+    assert command[command.index("--search-release-file") + 1] == \
+        "/tmp/search-release"
+    assert command[command.index("--search-roi-ratio") + 1] == \
+        "0.60,0.05,0.98,0.95"
+    assert command[command.index("--search-stable-frames") + 1] == "4"
+    assert command[command.index("--search-poll-hz") + 1] == "2.5"
+
+
 def test_result_file_is_only_valid_for_chassis_sequence():
     parsed = args("--dry-run", "--result-file", "/tmp/result.json")
 
@@ -216,7 +253,7 @@ def test_result_file_is_only_valid_for_chassis_sequence():
 
 
 def test_taught_block_actions_require_target_and_non_theory_distance():
-    parsed = main.parse_args(["--teach-block-grasp"])
+    parsed = main.parse_args(["--teach-block-pick-place"])
 
     with pytest.raises(ValueError, match="--target"):
         main.validate_runtime_args(parsed, {"distance_method": "fixed_plane"})
@@ -227,32 +264,26 @@ def test_taught_block_actions_require_target_and_non_theory_distance():
     main.validate_runtime_args(parsed, {"distance_method": "fixed_plane"})
 
 
-def test_place_teaching_supports_single_target_or_sequence():
-    single = main.parse_args(["--target", "3", "--teach-block-place"])
-    sequence = main.parse_args([
-        "--teach-block-place", "--sequence", "1,2,3,4"])
+def test_no_tag_supports_combined_and_separate_teaching_entries():
+    source = Path(main.__file__).read_text(encoding="utf-8")
 
-    main.validate_runtime_args(single, {"distance_method": "calibrated"})
-    main.validate_runtime_args(sequence, {"distance_method": "calibrated"})
-    single_command = main.build_child_command(single, 11, 12)
-    sequence_command = main.build_child_command(sequence, 21, 22)
-
-    assert "--block-target" in single_command
-    assert "--sequence" not in single_command
-    assert "--block-target" not in sequence_command
-    assert sequence_command[sequence_command.index("--sequence") + 1] == "1,2,3,4"
-    assert "--run-chassis-sequence" not in sequence_command
+    assert "--teach-block-grasp" not in source
+    assert "--teach-block-pick-place" in source
+    assert "--teach-block-pregrasp" in source
+    assert "--teach-block-place" in source
 
 
 def test_interactive_teaching_has_no_fixed_child_timeout():
     for option in (
-        "--teach-block-grasp",
+        "--teach-block-pick-place",
+        "--teach-block-pregrasp",
         "--teach-block-place",
         "--teach-block-idle",
         "--teach-block-carry",
     ):
         argv = [option]
-        if option == "--teach-block-grasp":
+        if option in ("--teach-block-pick-place", "--teach-block-pregrasp",
+                      "--teach-block-place"):
             argv = ["--target", "1", option]
         parsed = main.parse_args(argv)
         assert main.child_wait_timeout(parsed) is None
@@ -337,7 +368,7 @@ def test_serve_requests_reports_business_error_without_crashing(tmp_path):
 
 
 def test_parent_interrupt_always_stops_active_arm_child(monkeypatch):
-    parsed = args("--teach-block-grasp")
+    parsed = args("--teach-block-pick-place")
 
     class FakeChild:
         def __init__(self):
@@ -386,3 +417,5 @@ def test_parent_handles_terminal_close_and_termination_signals(monkeypatch):
     assert installed[main.signal.SIGTERM] is main.request_shutdown
     if hasattr(main.signal, "SIGHUP"):
         assert installed[main.signal.SIGHUP] is main.request_shutdown
+    if hasattr(main.signal, "SIGTSTP"):
+        assert installed[main.signal.SIGTSTP] is main.request_shutdown

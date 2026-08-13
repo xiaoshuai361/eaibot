@@ -9,6 +9,11 @@
 
 当前检测模型为 `block_occlusion_yolov5n_640_best.onnx`，固定输入 `640x640`；配置文件中的 `model_path` 和 `input_size` 必须同时保持一致。
 
+退出 `block_pick_main.py` 时优先在预览窗口按 `q`/`Esc`，或在终端按
+`Ctrl+C`。程序也会把 `Ctrl+Z` 当作受控退出并清理 Python2 ROS 子进程，避免
+示教子进程留在后台继续占用 `/tmp/mirobot_arm_motion.lock`。升级前遗留的后台
+进程仍需先按 PID 手动终止一次；不要只删除锁文件。
+
 四类物块沿用有 Tag 放置点的编号对应关系：
 
 | 编号 | 英文名称  | 中文         |
@@ -24,17 +29,19 @@
 
 ### 终端 0：底盘
 
-````bash
+```bash
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/robocom_ws/devel/setup.bash
 roslaunch xpkg_bringup bringup_basic_ctrl.launch
+```
+
 ### 终端 1：RGB 相机
 
 ```bash
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 roslaunch astra_camera astrapro.launch
-````
+```
 
 本方案需要 `/camera/rgb/image_rect_color`，不使用任何 depth 话题。
 
@@ -46,7 +53,7 @@ roslaunch astra_camera astrapro.launch
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
-roslaunch mirobot_moveit_config mirobot.launch start_rviz:=false
+roslaunch mirobot_moveit_config mirobot.launch start_rviz:=true
 ```
 
 比赛运行时可关闭 RViz：
@@ -179,85 +186,9 @@ python3 /home/eaibot/handeye-calib/src/block_distance_collect.py \
 
 每次只摆一个类别，框中心放进红色 ROI。程序按同一距离依次采集四类，再提示调整下一个距离。不要加 `--overwrite`；重复启动会跳过新目录里已经完成的 CSV。
 
-旧数据完整保留在：
+## 6. 抓取和放置示教
 
-```text
-/home/eaibot/handeye-calib/config/block_distance_samples/
-```
-
-本轮新数据和拟合结果单独写入：
-
-```text
-/home/eaibot/handeye-calib/config/block_distance_samples_occlusion640_400/
-```
-
-每类完成后会自动生成 `power_model.yaml`、`fire_model.yaml` 等。将其中的 `width/height` 参数填入 `block_mono_grasp.yaml` 对应类别，四类全部更新后再修改：
-
-```yaml
-distance_method: calibrated
-```
-
-本轮参数已在 `2026-08-08` 写入配置并启用 `calibrated`。其中 gas 的宽/高拟合 RMSE 分别为 `11.86mm/13.72mm`，最大残差达到 `27.56mm`，必须通过下面的独立距离复核才能用于运动。
-
-不要用拟合点本身验证。分别把物块放在 `350、405、450mm`，按下一节执行 `--dry-run --show-rgb`，比较终端打印距离与实测距离。三个验证点都正常后，才能开始机械臂示教或抓取。
-
-当前 `max_axis_distance_disagreement_mm: 0.0`，表示不再因宽、高两轴估距差异阻断抓取，最终距离取两者中位数。
-
-当前 ROI 配置为：
-
-```yaml
-grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
-```
-
-在 `640x480` 图像中约对应 `x=38~154` 的红色竖框。距离采样、dry-run、示教和正式抓取共用这一范围。
-
-示教和抓取与有 Tag 链路一样，确认 `5` 个新鲜稳定观测后立即继续；距离标定仍使用每点 `10` 帧。
-
-## 6. 放置点和抓取点示教
-
-### 6.1 连续示教四个放置点
-
-不写 `--target`，按 `1、2、3、4` 连续示教。程序每完成一个就立即保存；中途退出不会丢失已经完成的结果，也不会删除尚未示教类别的旧值。
-
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-conda activate ww
-cd /home/eaibot/handeye-calib/src
-stty -ixon
-
-python3 block_pick_main.py \
-  --teach-block-place \
-  --sequence 1,2,3,4 \
-  --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
-  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
-```
-
-每一步都在 RViz 中把末端移动到对应载物仓的释放姿态，执行 `Plan/Execute`，确认到位后回终端按 Enter。顺序为 `1=power、2=fire、3=gas、4=support`。
-
-### 6.2 单独示教一个放置点
-
-下面示例只示教 `3=gas`；把数字改为 `1~4` 即可。已有值在本次确认记录后自动替换，不需要 `--overwrite`。
-
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-conda activate ww
-cd /home/eaibot/handeye-calib/src
-stty -ixon
-
-python3 block_pick_main.py \
-  --target 3 \
-  --teach-block-place \
-  --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
-  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
-```
-
-### 6.3 单类抓取点示教
-
-无 Tag 的放置点初始值可沿用有 Tag 数据，但两份 JSON 不会自动同步。抓取点必须逐类示教。正式抓取强制要求 preset 中存在 `carry_joint_values`，缺失时会在机械臂运动和开泵前报错，不再静默跳过过渡点。示教程序先保持当前末端姿态，自动移动到检测目标表面前约 `110mm`；然后通过 RViz `Plan/Execute` 移动到吸盘接触姿态，不能手掰。
+无 Tag 四类物块尺寸和抓取位置差异较大，因此必须分别示教。每次命令只处理一个类别，并在同一次流程中依次采集该类别的“预抓点 P → 无 Tag 入仓放置点”。示教程序先自动移动到检测目标表面前约 `85mm`；如果该辅助移动执行失败，会像有 Tag 流程一样报警但继续示教。随后在 RViz 中 `Plan/Execute` 到靠近、正对但未接触物块的预抓点 P；不要手掰机械臂。
 
 ```bash
 source /opt/ros/melodic/setup.bash
@@ -268,13 +199,62 @@ cd /home/eaibot/handeye-calib/src
 
 python3 block_pick_main.py \
   --target 4 \
-  --teach-block-grasp \
+  --teach-block-pick-place \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
   --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
 ```
 
-已有类别可以直接重复运行同一条示教命令，不需要 `--overwrite`。程序只会在新示教完整成功并确认记录后替换该类别旧抓取偏移；移动失败或中途退出时旧值不变。除非确实要重新定义四类共用的吸盘姿态，否则不要再加 `--reset-pickup-model`。
+`--target` 分别使用 `1、2、3、4`，四条命令都要执行。每条命令的交互顺序固定为：
+
+```text
+稳定检测指定物块
+→ 自动到检测表面前85mm
+→ RViz微调并确认该类别预抓点P
+→ 保持机械臂停在P
+→ 从P开始在RViz移动到该类别无Tag载物仓放置点
+→ 确认后同时保存该类别的完整预抓模型和放置位姿
+```
+
+每个类别分别保存 `pregrasp_offset_xyz_base`、`pickup_model` 和
+`place_ee_in_base`。`pickup_model` 包含该类别实际调整后的 Link6 姿态和限位
+前进轴，不强制使用 `(0,0,0,1)`。只有预抓点和放置点都成功采集后才替换该
+类别旧数据；中途退出不会写入半套数据。
+
+也可以分开重采。只重采该类别预抓点并保留原放置点：
+
+```bash
+python3 block_pick_main.py \
+  --target 3 \
+  --teach-block-pregrasp \
+  --confidence 0.5 \
+  --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
+  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
+```
+
+只重采该类别放置点并保留原预抓数据：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/handeye-calib/src
+python3 block_pick_main.py \
+  --target 4 \
+  --teach-block-place \
+  --confidence 0.5 \
+  --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
+  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
+```
+
+只采放置点时，程序会先根据当前检测和该类别已保存的数据，普通规划到 P 后方
+`30mm`，再直线到 P；此示教移动不开泵。到 P 后再由你在 RViz 中调整到无 Tag
+放置点。该入口要求此类别已经有完整预抓数据。
+
+无 Tag 入仓放置位姿与有 Tag 完全分开，保存在无 Tag preset 的对应类别中；
+重新示教无 Tag 不会修改有 Tag preset。后续投递从载物仓取物的关节角仍与有
+Tag 共用 `delivery_presets.json`，不需要重新示教投递仓内抓取点。
 
 ## 7. 单类验证和抓取
 
@@ -292,25 +272,24 @@ conda activate ww
 cd /home/eaibot/handeye-calib/src
 
 python3 block_pick_main.py \
-  --target 3 \
+  --target 4 \
   --run-taught-block \
-  --pregrasp-distance-mm 70 \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
   --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
 ```
 
-每类均按“示教 → 预览 → 80mm 预抓点 → 正式抓放”的顺序验证。预抓方向不正确时不要执行正式抓取。
+四类示教完成后逐类验证。有 Tag 和无 Tag 正式抓取安全时序统一为“普通规划到示教预抓点 P 后方 30mm → 在这里开启限位 → 以 5mm 步长保持姿态受保护地直线到 P，途中触发立即停止 → 未触发再从 P 以 2mm 步长最多前探 65mm → 触发后开泵 → 沿原路径直线退到 P 后方 30mm → carry/放置 → idle”。两者的检测方法、预抓参数和入仓放置位姿分别读取各自数据；只共用限位安全时序。退回成功前不会执行斜向搬运规划。预抓方向不正确时不要执行正式抓取。
 
 ## 8. 底盘缓慢前进并逐个抓取
 
 该入口移植有 Tag 的自动流程：从当前可见的剩余目标中选择画面最靠左的一个，底盘低速移动到红框，立即停车，等待底盘稳定并确认 `4` 个新鲜检测帧，然后执行“预抓 → 抓取 → 中转点 → 放置 → idle → `$H` 回零”。处理完后再选择下一个目标。检测不到、检测框异常或定位失败时底盘会停车，不会盲目前进。
 
-运行前必须已经完成四类抓取示教，并确认无 Tag preset 同时具有 `pickup_model`、四类抓取/放置数据、`carry_joint_values` 和 `idle_joint_values`。程序会在底盘首次移动前统一检查这些字段。
+运行前必须分别完成四类“预抓点 + 放置点”示教，并确认无 Tag preset 的四个
+类别各自具有 `pickup_model`、`pregrasp_offset_xyz_base` 和
+`place_ee_in_base`，顶层仍具有 `carry_joint_values` 和 `idle_joint_values`。
 
-逐个对准并抓取 `1~4`，每个完成后按 Enter 再继续：
-
-按 Enter 后如果剩余物块尚未出现在画面中，程序会保持底盘停止并持续等待，不会因等待超时退出；将物块放入画面即可继续，需要终止时按 Ctrl+C。
+一键连续对准并抓取 `1~4`，中途不等待 Enter。若剩余物块尚未出现在画面中，程序会保持底盘停止并持续等待；目标进入画面后自动继续，需要终止时按 Ctrl+C。
 
 ```bash
 source /opt/ros/melodic/setup.bash
@@ -323,8 +302,162 @@ cd /home/eaibot/handeye-calib/src
 python3 block_pick_main.py \
   --run-chassis-sequence \
   --sequence 1,2,3,4 \
-  --wait-key-between-targets \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
   --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
 ```
+
+## 9. 楼宇磁吸投递标定
+
+这一节标定的是“从载物仓取出物资并贴到楼宇”，与第 5 节物块抓取距离标定、
+第 6 节抓取后放入载物仓的示教不是一回事。楼宇投递需要完成两类数据：
+
+```text
+楼宇视觉停车标定：building_delivery_calibration.json
+四类机械臂投递点P：untagged_delivery_presets.json
+```
+
+### 9.1 先备份真机数据
+
+```bash
+cp /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  /home/eaibot/handeye-calib/config/untagged_delivery_presets.json.bak
+
+cp /home/eaibot/handeye-calib/config/building_delivery_calibration.json \
+  /home/eaibot/handeye-calib/config/building_delivery_calibration.json.bak
+```
+
+第二个文件首次标定时可能还不存在，此时跳过第二条备份命令。Windows 仓库中的
+文件不能覆盖真机生成的 JSON。
+
+### 9.2 标定四类楼宇的停车画面
+
+楼宇与物资 ID 对应关系：
+
+| ID | 楼宇类别 |
+| ---: | --- |
+| 1 | 电力故障楼宇 |
+| 2 | 火灾楼宇 |
+| 3 | 有毒气体楼宇 |
+| 4 | 坍塌楼宇 |
+
+先关闭比赛主程序以及其他占用 `/dev/video2` 的程序。第一次确定停车位置时，先让
+机械臂处于 idle，人工低速移动底盘，使车身正对楼面且楼宇框完整可见；再在 RViz
+中试走一次“安全点、P、前探方向”，确认 P 后方 `30mm` 可达、从 P 向前最多
+`65mm` 不会碰到楼宇以外的结构，也没有明显关节极限。确认后让机械臂回 idle，
+车辆保持不动，再运行对应 ID 的视觉标定：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/robocom_ws/devel/setup.bash
+conda activate ww
+cd /home/eaibot/robocom_ws/src
+
+python3 -m zcy_last.building_delivery_calibrate --target 1
+```
+
+程序会从 `/dev/video2` 的原始 `320×240` 画面采集该楼宇的 30 个有效框，完成后
+保存框中心中位数、框尺度中位数及 MAD。依次把车辆移动到另外三类楼宇的正确
+位置，并把命令中的 `--target` 改成 `2、3、4`。必须分别执行四次，不能在车辆
+不动时连续标定四类。
+
+每次命令只原子更新当前 ID，不会覆盖另外三类。重复运行同一个 ID 会更新该类
+旧值。默认输出：
+
+```text
+/home/eaibot/handeye-calib/config/building_delivery_calibration.json
+```
+
+如果实际画面不是 `320×240`、检测不到指定类别或模型文件发生变化，程序会拒绝
+保存；不要手工修改 JSON 绕过检查。
+
+### 9.3 示教四类机械臂预投递点 P
+
+保持终端 2 的 MoveIt 和 RViz 运行。该示教不需要 Astra、手眼 TF 或楼宇 YOLO。
+示教某个 ID 时，车辆必须仍停在该类刚才采集视觉标定的同一位置。最稳妥的现场
+顺序是“停好 ID1 -> 标定 ID1 楼宇框 -> 不动底盘示教 ID1 的 P -> 再去 ID2”。
+程序支持一次连续示教多个 ID，但现场推荐按 ID 分开，避免移动底盘后把类别和 P
+对应错。
+
+一次连续示教四类的可选命令：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode teach_contact_release \
+  --sequence 1,2,3,4 \
+  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  --overwrite
+```
+
+只重采一类，例如火灾楼宇 ID2：
+
+```bash
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode teach_contact_release \
+  --sequence 2 \
+  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  --overwrite
+```
+
+每类固定两步：
+
+```text
+步骤1：在 RViz 中移动到远离墙面的后方参考点
+步骤2：保持相同吸盘朝向，沿正前方移动到近墙但不接触的预投递点 P
+```
+
+后方参考点与 P 不要求正好相差 `30mm`，它只用来计算“远离墙面”的安全方向；
+两点必须尽量共线，且吸盘姿态保持一致。程序保存 P 的六关节角，并根据
+“P → 后方参考点”生成单位方向。单类两步都成功后才会原子替换该类旧数据。
+
+### 9.4 单类空载验证接触投递动作
+
+先确认共享仓内抓取点、无 Tag 中转点以及对应 ID 的 P 都已经示教。验证时可以不
+在载物仓放物资，让吸泵空吸，只检查运动、限位和退回顺序：
+
+```bash
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode run_delivery \
+  --sequence 2 \
+  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  --cargo-pick-file /home/eaibot/handeye-calib/config/delivery_presets.json \
+  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
+  --contact-release \
+  --force-release-on-contact-miss \
+  --contact-staging-gap 0.030 \
+  --contact-staging-step 0.005 \
+  --contact-probe-step 0.002 \
+  --contact-probe-max-travel 0.065
+```
+
+正确时序为：
+
+```text
+取对应仓内点 -> 共享中转点 -> 普通规划到P后方30mm
+-> 开启限位 -> 5mm步长到P -> 2mm步长最多前探65mm
+-> 关泵并等待0.7秒 -> 沿原方向直退30mm -> idle
+```
+
+正常走满 `65mm` 仍未触发限位时，会打印醒目警告并按已确认策略强制关泵，进程
+仍返回成功。限位服务、串口或轨迹执行报错不属于“正常未触发”：此时不会强制
+释放，吸泵保持开启并返回失败，需要人工处理。
+
+## 10. 正式循迹自动投递
+
+完成四类楼宇停车标定和四类 P 示教后，正式任务使用：
+
+```bash
+cd /home/eaibot/robocom_ws/src
+python3 -m zcy_last.main \
+  --no-tag-pick \
+  --untagged-pick --untagged-pick-count 4 --untagged-delivery
+```
+
+识别到库存对应楼宇后，程序先进入 `BUILDING_DELIVERY_ALIGN`。它只跟踪锁定类别，
+先校正中心，再以 `0.012m/s` 接近；框尺度达到标定值的 `95%`、中心误差不超过
+画宽 `5%` 且连续满足 3 个新鲜帧后停车并启动机械臂。锁定类别丢失、框尺度超过
+标定值 `110%` 或对准超过 25 秒都会立即停车、放弃该 ID、恢复循迹且不重试。

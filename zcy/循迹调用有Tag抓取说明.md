@@ -1,94 +1,222 @@
-# 循迹程序调用机械臂
+# 有 Tag 抓取与投递：总调度 AI 接口
 
-本文档供 AI 编写循迹联动代码时使用。
+> 更新时间：2026-08-12
+> 本文只面向 `zcy_last` 总调度、循迹状态机和进程编排。示教、AprilTag 调试和人工单步命令见《机械臂操作.md》。
 
-## 前置条件
+## 1. 正式比赛入口（两个终端）
 
-Tag 抓取前，《机械臂操作.md》中的终端 0-5 必须正常运行。投递时至少保持终端 2 运行。
-
-循迹程序的启动终端先执行：
+终端一先用 `launch.py` 启动并常驻底盘、MoveIt 和手眼 TF：
 
 ```bash
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/robocom_ws/devel/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/robocom_ws/src
+python3 -m zcy_last.launch
 ```
 
-## 接口 1：底盘对准并抓取入仓
+保持终端一运行。终端二再启动比赛任务：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/robocom_ws/devel/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/robocom_ws/src
+
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 \
+  --tag-delivery \
+  --no-untagged-pick
+```
+
+只抓不投：
+
+```bash
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 \
+  --no-tag-delivery
+```
+
+同时启用 B 点有 Tag 和 A 点无 Tag 时，只运行一个总任务：
+
+```bash
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 --tag-delivery \
+  --untagged-pick --untagged-pick-count 3 --untagged-delivery
+```
+
+抓取数量只能是 `1..4`，表示必须成功入仓的数量，不代表固定 ID 顺序。不要同时运行两个 `zcy_last.main`，也不要手动并行启动 Tag 抓取、Astra、Tag 检测栈或键盘控制。
+
+## 2. 当前 B 点状态机
+
+有 Tag 抓取在正式循迹前执行：
+
+```text
+启动 zcy_last.main
+-> 直接使用 launch.py 已经常驻的底盘、MoveIt、机械臂和手眼 TF，不重复等待检查
+-> 启动 Astra、YOLO 补白和 AprilTag
+-> B_PICK_PREPARE：停车稳定1.5s
+-> B_PICKING：Tag 子进程独占 /cmd_vel，逐个对准抓取
+-> 成功读取实际库存
+-> 关闭 Tag 检测栈和 Astra，恢复街区任务 YOLO
+-> 等待绿灯
+-> 使用 B 点专用时序直行和第一次右转
+-> 识别出口横条并摆正
+-> 完成第1个路口，进入正常九路口流程
+```
+
+B 点抓取成功后不能直接恢复 `FOLLOW`，因为车辆已经越过第一个入口横条。当前专用参数是：
+
+```text
+TAG_PICK_FIRST_ENTRY_TIME=5.5s
+TAG_PICK_FIRST_TURN_TIME=4.0s
+```
+
+这两个值只控制 B 点后的第一次右转；普通路口仍使用 `TURN_ENTRY_TIME` 和 `TURN_TIME`。
+
+## 3. 协调器实际调用
+
+真实命令由 `zcy_last/control/grasp.py` 构造，等价于：
 
 ```bash
 python2 /home/eaibot/handeye-calib/src/tag_chassis_align_pick_sequence.py \
   --sequence 1,2,3,4 \
-  --tag-tf-wait-seconds 18.0 \
-  --fail-on-skip
-```
-
-该命令会自动完成：底盘对准红框、Tag 抓取、放入对应载物仓、回 idle、启动回零。
-
-`--sequence` 是允许处理的 ID 集合。默认每次抓当前画面中最靠左的剩余 ID，不强制按数字顺序。
-
-## 接口 2：底盘已对准，单独抓取
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py \
-  --mode run_taught_sequence \
-  --sequence 3 \
+  --order left_to_right \
+  --max-targets <要求成功数> \
+  --fail-on-skip \
+  --result-file <临时JSON> \
   --preset-file /home/eaibot/handeye-calib/config/tag_pick_place_presets.json \
-  --velocity-scale 0.2 \
-  --acceleration-scale 0.2 \
-  --tf-timeout 12.0 \
-  --home-after-idle
+  --pick-velocity-scale 0.2 \
+  --pick-acceleration-scale 0.2 \
+  --pick-approach-gap 0.030 \
+  --tag-tf-wait-seconds 12.0
 ```
 
-将 `3` 替换为目标 ID。该命令不控制底盘。
+`PICK_DEBUG_VIEW=True` 时会添加 `--show-debug-window`，正式比赛只显示一个 `tag_pick_detection` 合成窗口：
 
-## 接口 3：从载物仓投递
-
-```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
-  --mode run_delivery \
-  --sequence 1,2,3,4 \
-  --delivery-file /home/eaibot/handeye-calib/config/delivery_presets.json \
-  --tag-preset-file /home/eaibot/handeye-calib/config/tag_pick_place_presets.json
+```text
+AprilTag 检测图底图
++ YOLO Tag ID 框
++ 黄色中心点
++ 红色底盘对准 ROI
++ 当前 Tag 数量
 ```
 
-`--sequence` 必须只包含载物仓中实际存在的 ID。投递不使用视觉。
+AprilTag 自带的 `show_image` 窗口默认关闭，YOLO relay 也不在送给 AprilTag 的输入图上画调试框，避免多窗口和重复框。合成图同时发布到：
 
-比赛任务会让有 Tag 抓取脚本通过 `--result-file` 返回实际成功入仓的 ID，
-第一圈任务 YOLO 识别并停车后按下表投递：
+```text
+/tag_chassis_align/debug_image
+```
 
-| 识别目标 | Tag ID | 物资 |
+需要单独排查原始 AprilTag 输出时，可临时使用 `rqt_image_view /tag_detections_image`，不改正式比赛启动参数。
+
+联动脚本内部调用 `mirobot_pick_test_tag.py`。总调度不得复制第二套抓取算法，也不要自行拼接“对准 + 单 Tag 抓取”。
+
+四个 Tag 一键连续处理，中途不读取终端输入、不等待 Enter。历史参数 `--wait-key-between-tags` 仅保留命令兼容性，当前不会改变连续执行流程。
+
+## 4. 单个 Tag 动作契约
+
+```text
+从当前可见剩余 Tag 中选择最左者
+-> 底盘低速移入红色 ROI，以1个新检测帧确认停车
+-> 启动回零
+-> 等待新的 base -> tag_N TF
+-> 收集3个不同时间戳的新鲜 TF 并过滤
+-> 普通规划到示教预抓点后方30mm（`--pick-approach-gap` 可配置）
+-> 在该后方安全点开启限位检测
+-> 以5mm步长保持姿态受保护地直线伸到示教预抓点；途中触发立即停止
+-> 若尚未触发，再从预抓点最多前探65mm，每2mm检查
+-> 收到精确限位消息 3\r\n 后停止剩余路点
+-> 确认限位后才开泵
+-> 沿原路径退到示教预抓点后方30mm
+-> carry -> ID对应载物仓 -> idle
+```
+
+无论限位在“后方安全点到 P”途中还是 P 前方触发，吸附后都沿原轴直退到 P 后方 `30mm`。限位未触发时也先退到该位置，不得开泵或进入 carry。
+
+四个 Tag 固定共用真机 preset 中 ID2 的 `grasp_offset_xyz_base`，其语义是“近距离、正对、未接触的示教预抓点”。不新增迁移字段。四个 ID 只分别保存自己的载物仓放置点。
+
+总调度不得修改限位时序、直接操作泵串口、给 Joint6 添加硬路径约束或自动重试失败抓取。
+
+## 5. 结果和失败处理
+
+子进程原子写入：
+
+```json
+{"completed_ids": [3, 1]}
+```
+
+只有以下条件同时满足才成功：
+
+- 整批退出码为 `0`；
+- ID 均为 `1..4` 且不重复；
+- 数量严格等于 `--tag-pick-count`。
+
+结果保存到 `tag_inventory`。不能根据 Tag 检测画面、数字顺序或计划数量猜库存。单 Tag 返回码 `4` 表示限位未接触；`--fail-on-skip` 下未达到整批数量就是抓取失败。
+
+- 抓取失败或 TF 超时：进入 `PICK_FAILED`，持续零速度，永久停车，不重试。
+- 投递失败：报警、记录 failed ID、继续循迹，不重试该 ID。
+
+## 6. 有 Tag 投递
+
+| 街区识别 | 库存 ID | 物资 |
 | --- | ---: | --- |
 | 普通人群 | 1 | 基本生活物资 |
 | 医疗人群 | 2 | 医疗包 |
 | 可回收垃圾 | 3 | 常规消杀剂 |
 | 其他垃圾 | 4 | 生物危害专用消杀剂 |
 
-只有对应 ID 确实在载物仓库存中才启动投递。成功后从库存移除该 ID；
-投递失败时终端报警、不自动重试，并恢复循迹继续比赛。
+只有 ID 存在于 `tag_inventory` 且未在失败集合中，才调用：
 
-## Python 阻塞调用
-
-```python
-import subprocess
-
-
-def run_robot_task(command):
-    return subprocess.call(command) == 0
+```bash
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode run_delivery \
+  --sequence <单个库存ID> \
+  --delivery-file /home/eaibot/handeye-calib/config/delivery_presets.json \
+  --cargo-pick-file /home/eaibot/handeye-calib/config/delivery_presets.json \
+  --tag-preset-file /home/eaibot/handeye-calib/config/tag_pick_place_presets.json
 ```
 
-调用前必须停止底盘，并暂停循迹程序对 `/cmd_vel` 的发布。子进程返回后：
+投递不使用视觉。`delivery_presets.json` 中 ID 1~4 的仓内抓取点同时供有 Tag
+和无 Tag 投递使用；有 Tag 的中转点和释放点仍从本文件读取。成功后从库存删除
+ID。如果后续还启用 A 点无 Tag 抓取，总调度会保留机械臂公共栈。
 
-- 返回码 `0`：任务成功，可恢复循迹。
-- 单独调试脚本时返回码非 `0`：保持停车并人工处理。
-- 由 `zcy_last.main` 托管时返回码非 `0`：输出投递失败警告，不自动重试，继续循迹。
+## 7. 资源和数据边界
 
-## 必须遵守
+正式比赛前先在终端一运行：
 
-- 循迹程序、键盘控制和 `tag_chassis_align_pick_sequence.py` 不得同时发布 `/cmd_vel`。
-- 同一站点只触发一次机械臂任务，必须用状态标志防止重复调用。
-- 机械臂任务未返回时，底盘保持停止。
-- 抓取失败后不要盲目重试。
-- 投递失败且吸泵仍开启时，不要自动关泵，避免物块在未知位置掉落。
-- 比赛主任务虽会按配置继续循迹，但终端出现投递失败警告时应立即关注机械臂和吸泵状态。
+```bash
+python3 -m zcy_last.launch
+```
+
+`launch.py` 会启动或复用底盘，临时启动 Astra，再启动 MoveIt 和手眼 TF；成功后关闭临时 Astra，并让底盘、MoveIt、手眼 TF 常驻供 `main.py` 复用。`launch.py` 不自动启动 `main.py`。
+
+默认托管模式下，总任务按需管理 Astra、YOLO 补白、AprilTag 和抓取子进程。`--external-ros` 只用于所有依赖均已人工准备好的调试环境，不建议用于正式比赛。
+
+权威文件：
+
+```text
+/home/eaibot/handeye-calib/src/tag_chassis_align_pick_sequence.py
+/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py
+/home/eaibot/handeye-calib/config/tag_pick_place_presets.json
+/home/eaibot/handeye-calib/config/delivery_presets.json
+/home/eaibot/handeye-calib/config/astra_rgb_640x480.yaml
+```
+
+真机 Tag preset 必须保持版本 3。总调度不得用本地 Windows 同名文件覆盖真机，也不得覆盖 CameraInfo 或手眼标定结果。
+
+## 8. 排错入口
+
+日志：
+
+```text
+/home/eaibot/logs/zcy_last/<启动时间>/pick_tag.log
+```
+
+按顺序分类：YOLO 无框 -> AprilTag 无 TF -> 凑不齐3个新 TF -> 底盘对准失败 -> MoveIt 预抓失败 -> 限位未触发 -> 退到预抓点后方30mm失败 -> 结果 JSON 异常 -> B 点绿灯/专用首转时序异常。
+
+一次只处理一层；不要用新增超时、自动继续、缓存 TF 或堆叠偏移掩盖故障。

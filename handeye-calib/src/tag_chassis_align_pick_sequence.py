@@ -23,8 +23,11 @@ DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_PICK_SCRIPT = '/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py'
 DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.24,1.00'
+DEFAULT_DEBUG_WINDOW_NAME = 'tag_pick_detection'
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
+CONTACT_PROBE_MISS_EXIT_CODE = 4
 DEFAULT_MAX_DETECTION_AGE_SECONDS = 4.0
+DEFAULT_PICK_APPROACH_GAP = 0.030
 
 try:
     STRING_TYPES = (basestring,)
@@ -243,6 +246,7 @@ def build_pick_command(args, tag_id):
         '--velocity-scale', str(args.pick_velocity_scale),
         '--acceleration-scale', str(args.pick_acceleration_scale),
         '--motion-settle-seconds', str(args.pick_motion_settle_seconds),
+        '--approach-gap', str(args.pick_approach_gap),
     ]
     if args.disable_replanning:
         command.append('--disable-replanning')
@@ -252,6 +256,11 @@ def build_pick_command(args, tag_id):
 def pick_failure_is_missing_tf(output, tag_id):
     marker = 'TF for tag_%d was not found' % int(tag_id)
     return marker in output
+
+
+def pick_failure_is_contact_miss(output, tag_id, return_code):
+    marker = 'CONTACT_PROBE_MISS tag_%d' % int(tag_id)
+    return return_code == CONTACT_PROBE_MISS_EXIT_CODE and marker in output
 
 
 def run_pick_command(command, tag_id):
@@ -280,6 +289,11 @@ def run_pick_command(command, tag_id):
             '跳过 ID%d 抓取：机械臂动作前 tag TF 已经消失。',
             tag_id)
         return False
+    if pick_failure_is_contact_miss(output, tag_id, return_code):
+        rospy.logwarn(
+            '跳过 ID%d 抓取：限位探测达到最大距离仍未接触物块。',
+            tag_id)
+        return False
     raise subprocess.CalledProcessError(return_code, command)
 
 
@@ -299,6 +313,9 @@ def parse_args(argv):
     parser.add_argument('--cmd-vel-topic', default='/cmd_vel')
     parser.add_argument('--debug-image-input-topic', default='/tag_detections_image')
     parser.add_argument('--debug-image-topic', default='/tag_chassis_align/debug_image')
+    parser.add_argument('--show-debug-window', action='store_true',
+                        help='显示带 Tag 检测框和底盘对准 ROI 的窗口。')
+    parser.add_argument('--debug-window-name', default=DEFAULT_DEBUG_WINDOW_NAME)
     parser.add_argument('--target-roi-ratio', default=DEFAULT_TARGET_ROI_RATIO)
     parser.add_argument('--max-detection-age-seconds', type=float,
                         default=DEFAULT_MAX_DETECTION_AGE_SECONDS)
@@ -316,14 +333,18 @@ def parse_args(argv):
                         default='forward')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--align-only', action='store_true')
+    # Legacy no-op: the four-Tag production sequence is fully automatic.
     parser.add_argument('--wait-key-between-tags', action='store_true',
-                        help='After each tag is aligned and handled, wait for Enter before continuing.')
+                        help=argparse.SUPPRESS)
     parser.add_argument('--python2', default=sys.executable)
     parser.add_argument('--pick-script', default=DEFAULT_PICK_SCRIPT)
     parser.add_argument('--preset-file', default=DEFAULT_PRESET_FILE)
     parser.add_argument('--pick-velocity-scale', type=float, default=0.2)
     parser.add_argument('--pick-acceleration-scale', type=float, default=0.2)
     parser.add_argument('--pick-motion-settle-seconds', type=float, default=0.25)
+    parser.add_argument('--pick-approach-gap', type=float,
+                        default=DEFAULT_PICK_APPROACH_GAP,
+                        help='示教预抓点后方的安全过渡距离（米），默认 0.030。')
     parser.add_argument('--disable-replanning', action='store_true')
     parser.add_argument('--startup-home-service', default=DEFAULT_STARTUP_HOME_SERVICE,
                         help='Trigger service that sends the same $H homing command as mirobot.launch startup.')
@@ -331,7 +352,7 @@ def parse_args(argv):
     parser.add_argument('--startup-home-settle-seconds', type=float, default=3.0,
                         help='Wait after startup homing before the next chassis/tag step.')
     parser.add_argument('--skip-startup-home', action='store_true',
-                        help='Skip controller startup homing after each successful pick.')
+                        help='Skip controller startup homing before each pick.')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     if args.max_targets is not None and not (
@@ -355,6 +376,8 @@ def parse_args(argv):
         raise RuntimeError('--chassis-settle-seconds must be non-negative.')
     if args.tag_tf_wait_seconds < 0.0:
         raise RuntimeError('--tag-tf-wait-seconds must be non-negative.')
+    if args.pick_approach_gap <= 0.0:
+        raise RuntimeError('--pick-approach-gap must be positive.')
     if args.startup_home_wait_seconds <= 0.0:
         raise RuntimeError('--startup-home-wait-seconds must be positive.')
     if args.startup_home_settle_seconds < 0.0:
@@ -375,6 +398,7 @@ class ChassisAlignPickSequence(object):
         self.args = args
         self.latest_detections = None
         self.pick_in_progress = False
+        self.debug_window_enabled = bool(args.show_debug_window)
         self.bridge = CvBridge()
         self.cmd_pub = rospy.Publisher(args.cmd_vel_topic, Twist, queue_size=1)
         self.debug_image_pub = rospy.Publisher(args.debug_image_topic, Image, queue_size=1)
@@ -412,11 +436,31 @@ class ChassisAlignPickSequence(object):
                 cv2.putText(image, 'ID%d' % int(detection.get('tag_id', 0)),
                             (bx1, max(15, by1 - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(
+                image, 'Tag detections=%d' % len(
+                    self.latest_detections.get('detections', [])),
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 255, 0), 2)
             output = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
             output.header = message.header
             self.debug_image_pub.publish(output)
+            if self.debug_window_enabled:
+                cv2.imshow(self.args.debug_window_name, image)
+                cv2.waitKey(1)
         except Exception as exc:
+            self.debug_window_enabled = False
             rospy.logwarn_throttle(2.0, '无法绘制底盘对准调试图：%s', exc)
+
+    def close_debug_window(self):
+        if not getattr(self.args, 'show_debug_window', False):
+            return
+        try:
+            import cv2
+            cv2.destroyWindow(getattr(
+                self.args, 'debug_window_name', DEFAULT_DEBUG_WINDOW_NAME))
+            cv2.waitKey(1)
+        except Exception:
+            pass
 
     def publish_velocity(self, linear_x):
         if self.args.dry_run:
@@ -576,7 +620,7 @@ class ChassisAlignPickSequence(object):
                 getattr(self.args, 'skip_startup_home', False)):
             return
         rospy.loginfo(
-            'ID%d 抓取完成，调用 %s 执行启动回零。',
+            'ID%d 抓取前调用 %s 执行启动回零。',
             tag_id, self.args.startup_home_service)
         rospy.wait_for_service(
             self.args.startup_home_service,
@@ -628,17 +672,6 @@ class ChassisAlignPickSequence(object):
             tag_id, tag_id, self.args.tag_tf_wait_seconds)
         return False
 
-    def wait_between_tags(self, tag_id, index, total):
-        self.stop_chassis()
-        print('')
-        print('ID%d 已完成对准/处理（%d/%d）。' % (tag_id, index, total))
-        print('请确认现场状态，把下一个 tag 准备好后按 Enter 继续；输入 q 再回车退出。')
-        if hasattr(sys.stdout, 'flush'):
-            sys.stdout.flush()
-        line = sys.stdin.readline()
-        if line.strip().lower() in ('q', 'quit', 'exit'):
-            raise RuntimeError('用户在 ID%d 后主动退出。' % tag_id)
-
     def run(self):
         try:
             remaining_tags = list(self.args.sequence)
@@ -661,33 +694,25 @@ class ChassisAlignPickSequence(object):
                         raise RuntimeError(str(exc))
                     rospy.logwarn('%s 跳过当前 ID，继续处理后续目标。', exc)
                     remaining_tags.remove(tag_id)
-                    if self.args.wait_key_between_tags and processed < total:
-                        self.wait_between_tags(tag_id, processed, total)
                     continue
+                self.run_startup_home(tag_id)
                 needs_pick_tf = not self.args.align_only and not self.args.dry_run
                 if needs_pick_tf and not self.wait_for_tag_tf_before_pick(tag_id):
                     if getattr(self.args, 'fail_on_skip', False):
                         raise RuntimeError(
                             'ID%d tag TF 未在限时内准备完成。' % tag_id)
                     remaining_tags.remove(tag_id)
-                    if self.args.wait_key_between_tags and processed < total:
-                        self.wait_between_tags(tag_id, processed, total)
                     continue
                 pick_completed = self.run_pick(tag_id)
                 if pick_completed is False:
                     if getattr(self.args, 'fail_on_skip', False):
                         raise RuntimeError('ID%d 抓取未完成。' % tag_id)
                     remaining_tags.remove(tag_id)
-                    if self.args.wait_key_between_tags and processed < total:
-                        self.wait_between_tags(tag_id, processed, total)
                     continue
-                self.run_startup_home(tag_id)
                 remaining_tags.remove(tag_id)
                 completed += 1
                 completed_ids.append(tag_id)
                 write_result_file(result_file, completed_ids)
-                if self.args.wait_key_between_tags and completed < total:
-                    self.wait_between_tags(tag_id, processed, total)
             if completed < total and (
                     requested is not None
                     or getattr(self.args, 'fail_on_skip', False)):
@@ -695,6 +720,7 @@ class ChassisAlignPickSequence(object):
                     '仅完成 %d/%d 个 Tag 抓取。' % (completed, total))
         finally:
             self.stop_chassis()
+            self.close_debug_window()
 
 
 def main(argv=None):

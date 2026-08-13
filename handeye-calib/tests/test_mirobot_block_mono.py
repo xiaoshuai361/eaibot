@@ -70,6 +70,35 @@ def test_normalize_vector_rejects_zero_and_returns_unit_vector():
         normalize_vector((0.0, 0.0, 0.0), "axis")
 
 
+def test_search_roi_accepts_right_entry_area_and_rejects_invalid_order():
+    parse_search_roi_ratio, = load_symbols("parse_search_roi_ratio")
+
+    assert parse_search_roi_ratio("0.60,0.05,0.98,0.95") == pytest.approx(
+        [0.60, 0.05, 0.98, 0.95])
+    with pytest.raises(RuntimeError, match="x1<x2"):
+        parse_search_roi_ratio("0.9,0.1,0.6,0.9")
+
+
+def test_search_ready_signal_is_emitted_by_child_search_loop():
+    source = SCRIPT.read_text(encoding="utf-8")
+    function_source = source[
+        source.index("def wait_for_search_trigger"):source.index(
+            "def select_next_sequence_target")]
+
+    assert 'write_search_signal(args.search_ready_file, "ready")' in \
+        function_source
+
+
+def test_search_finishes_chassis_handoff_before_creating_velocity_publisher():
+    source = SCRIPT.read_text(encoding="utf-8")
+    function_source = source[
+        source.index("def run_block_chassis_sequence"):source.index(
+            "def pose_from_camera_xyz_mm")]
+
+    assert function_source.index("wait_for_search_trigger(") < \
+        function_source.index("rospy.Publisher(")
+
+
 def test_arm_child_registers_parent_death_signal():
     enable_watchdog, termination_error = load_symbols(
         "enable_parent_death_signal", "TerminationRequested")
@@ -106,26 +135,26 @@ def test_arm_child_rejects_an_already_dead_supervisor():
         enable_watchdog(4321, object())
 
 
-def test_constrained_block_grasp_replays_translation_with_fixed_orientation():
+def test_taught_block_pregrasp_replays_translation_with_fixed_orientation():
     (
         finite_scalar,
         finite_vector3,
         normalize_quaternion,
-        compute_constrained_block_grasp_pose,
+        compute_taught_block_pregrasp_pose,
     ) = load_symbols(
         "finite_scalar",
         "finite_vector3",
         "normalize_quaternion",
-        "compute_constrained_block_grasp_pose",
+        "compute_taught_block_pregrasp_pose",
     )
     moved_anchor = make_pose(0.40, -0.10, 0.20, q=[0.5, 0.5, 0.5, 0.5])
     pickup_model = {
         "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
         "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
     }
-    entry = {"grasp_offset_xyz_base": [0.05, -0.02, 0.04]}
-    replay = compute_constrained_block_grasp_pose(
-        moved_anchor, pickup_model, entry, "base")
+    offset = [0.05, -0.02, 0.04]
+    replay = compute_taught_block_pregrasp_pose(
+        moved_anchor, pickup_model, offset, "base")
 
     assert replay.pose.position.x == pytest.approx(0.45)
     assert replay.pose.position.y == pytest.approx(-0.12)
@@ -144,13 +173,13 @@ def test_block_preset_roundtrip_and_overwrite_rules(tmp_path):
     preset = {
         "version": 2,
         "base_frame": "base",
-        "pickup_model": {
-            "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
-            "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
-        },
         "targets": {
             "fire": {
-                "grasp_offset_xyz_base": [0.1, 0.2, 0.3],
+                "pregrasp_offset_xyz_base": [0.1, 0.2, 0.3],
+                "pickup_model": {
+                    "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
+                    "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
+                },
                 "place_ee_in_base": {
                     "position": [0.4, 0.5, 0.6],
                     "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -181,21 +210,19 @@ def test_formal_grasp_requires_six_carry_joint_values():
         {"carry_joint_values": values}, "carry_joint_values") == values
 
 
-def test_no_tag_places_match_tag_places():
-    handeye_root = SCRIPT.parents[1]
-    tag_preset = json.loads(
-        (handeye_root / "config" / "tag_pick_place_presets.json").read_text(
-            encoding="utf-8"))
-    block_preset = json.loads(
-        (handeye_root / "config" / "block_mono_pick_place_presets.json").read_text(
-            encoding="utf-8"))
-    mapping = {"power": "1", "fire": "2", "gas": "3", "support": "4"}
+def test_no_tag_place_is_loaded_from_its_own_target_entry():
+    load_place, = load_symbols("load_block_place_pose")
+    transform = {
+        "position": [1.0, 2.0, 3.0],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+    load_place.__globals__.update({
+        "transform_to_pose": lambda frame, value: (frame, value),
+    })
 
-    assert block_preset["version"] == 2
-    assert block_preset["idle_joint_values"] == tag_preset["idle_joint_values"]
-    for target, tag_id in mapping.items():
-        assert block_preset["targets"][target]["place_ee_in_base"] == (
-            tag_preset["tags"][tag_id]["place_ee_in_base"])
+    assert load_place(
+        {"place_ee_in_base": transform}, "fire", "base") == (
+            "base", transform)
 
 
 def test_old_block_preset_is_rejected(tmp_path):
@@ -251,7 +278,8 @@ def test_get_action_supports_taught_actions():
         "dry_run": False,
         "live_preview": False,
         "calib_record": False,
-        "teach_block_grasp": False,
+        "teach_block_pick_place": False,
+        "teach_block_pregrasp": False,
         "teach_block_place": False,
         "teach_block_idle": False,
         "teach_block_carry": False,
@@ -262,8 +290,16 @@ def test_get_action_supports_taught_actions():
     }
 
     values = dict(base)
-    values["teach_block_grasp"] = True
-    assert get_action(SimpleNamespace(**values)) == "teach_block_grasp"
+    values["teach_block_pick_place"] = True
+    assert get_action(SimpleNamespace(**values)) == "teach_block_pick_place"
+
+    values = dict(base)
+    values["teach_block_pregrasp"] = True
+    assert get_action(SimpleNamespace(**values)) == "teach_block_pregrasp"
+
+    values = dict(base)
+    values["teach_block_place"] = True
+    assert get_action(SimpleNamespace(**values)) == "teach_block_place"
 
     values = dict(base)
     values["live_preview"] = True
@@ -277,75 +313,54 @@ def test_get_action_supports_taught_actions():
         get_action(SimpleNamespace(**base))
 
 
-def test_place_teach_targets_use_one_target_or_the_requested_sequence():
-    select_targets, = load_symbols("block_place_teach_targets")
-    select_targets.__globals__["parse_target_sequence"] = (
-        lambda text, _config: text.split(","))
+def test_each_target_requires_its_own_pregrasp_offset():
+    finite_scalar, finite_vector3, require_offset = load_symbols(
+        "finite_scalar", "finite_vector3", "require_block_pregrasp_offset")
 
-    assert select_targets(
-        SimpleNamespace(block_target="gas", sequence="1,2,3,4"), {}) == ["gas"]
-    assert select_targets(
-        SimpleNamespace(block_target=None, sequence="power,fire"), {}) == [
-            "power", "fire"]
+    assert require_offset(
+        {"pregrasp_offset_xyz_base": [0.1, 0.2, 0.3]}, "fire",
+    ) == pytest.approx((0.1, 0.2, 0.3))
+    with pytest.raises(RuntimeError, match="Re-teach"):
+        require_offset(
+            {"shared_pregrasp_offset_xyz_base": [0.4, 0.5, 0.6]},
+            "fire")
 
 
-def test_place_reteaching_replaces_value_only_after_confirmation():
-    record_place, = load_symbols("record_block_place")
-    new_pose = object()
-    events = []
-    preset = {
-        "targets": {
-            "power": {"place_ee_in_base": {"position": [1, 2, 3]}}
-        }
+def test_target_entry_requires_independent_model_offset_and_place():
+    (
+        finite_scalar,
+        finite_vector3,
+        normalize_quaternion,
+        normalize_vector,
+        require_pickup_model,
+        require_pregrasp_offset,
+        require_entry,
+    ) = load_symbols(
+        "finite_scalar",
+        "finite_vector3",
+        "normalize_quaternion",
+        "normalize_vector",
+        "require_block_pickup_model",
+        "require_block_pregrasp_offset",
+        "require_block_target_entry",
+    )
+    fire = {
+        "pickup_model": {
+            "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
+            "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
+        },
+        "pregrasp_offset_xyz_base": [0.1, 0.2, 0.3],
+        "place_ee_in_base": {"position": [0.4, 0.5, 0.6]},
     }
-    record_place.__globals__.update({
-        "print_utf8": lambda message: events.append(("notice", message)),
-        "safe_log_text": str,
-        "prompt_enter": lambda message: events.append(("prompt", message)),
-        "pose_to_transform": lambda pose: {"new_pose": pose is new_pose},
-        "pose_to_text": lambda *_items: "saved",
-        "rospy": SimpleNamespace(loginfo=lambda *_items: None),
-    })
-    arm = SimpleNamespace(get_current_pose=lambda: new_pose)
+    preset = {"targets": {"fire": fire}}
 
-    record_place(arm, preset, "power")
+    entry, model, offset = require_entry(preset, "fire")
 
-    assert preset["targets"]["power"]["place_ee_in_base"] == {
-        "new_pose": True}
-    assert [event[0] for event in events] == ["notice", "prompt"]
-
-
-def test_continuous_place_teaching_saves_after_each_target():
-    teach_places, = load_symbols("do_teach_block_mono")
-    preset = {"targets": {}}
-    events = []
-
-    def record(_arm, current_preset, target):
-        current_preset["targets"][target] = {"place_ee_in_base": target}
-        events.append(("record", target))
-
-    teach_places.__globals__.update({
-        "build_move_group": lambda *_items: object(),
-        "load_or_create_block_preset": lambda *_items: preset,
-        "block_place_teach_targets": lambda *_items: [
-            "power", "fire", "gas", "support"],
-        "record_block_place": record,
-        "save_block_preset": lambda *_items, **_kwargs: events.append(
-            ("save", copy.deepcopy(preset))),
-        "print_utf8": lambda *_items: None,
-        "safe_log_text": str,
-        "ascii_log_text": str,
-        "rospy": SimpleNamespace(loginfo=lambda *_items: None),
-    })
-    args = SimpleNamespace(
-        group="manipulator", preset_file="/tmp/preset.json",
-        block_target=None)
-
-    teach_places(args, {"base_frame": "base"}, None, "teach_block_place")
-
-    assert [item[1] for item in events if item[0] == "record"] == [
-        "power", "fire", "gas", "support"]
-    assert len([item for item in events if item[0] == "save"]) == 4
+    assert entry is fire
+    assert model is fire["pickup_model"]
+    assert offset == pytest.approx([0.1, 0.2, 0.3])
+    with pytest.raises(RuntimeError, match="power"):
+        require_entry(preset, "power")
 
 
 def test_motion_lock_rejects_a_second_arm_command(tmp_path):
@@ -357,7 +372,8 @@ def test_motion_lock_rejects_a_second_arm_command(tmp_path):
         "dry_run": False,
         "live_preview": False,
         "calib_record": False,
-        "teach_block_grasp": True,
+        "teach_block_pick_place": True,
+        "teach_block_pregrasp": False,
         "teach_block_place": False,
         "teach_block_idle": False,
         "teach_block_carry": False,
@@ -389,7 +405,8 @@ def test_visual_only_actions_do_not_create_moveit_clients(tmp_path):
         "dry_run": False,
         "live_preview": True,
         "calib_record": False,
-        "teach_block_grasp": False,
+        "teach_block_pick_place": False,
+        "teach_block_pregrasp": False,
         "teach_block_place": False,
         "teach_block_idle": False,
         "teach_block_carry": False,
@@ -421,19 +438,88 @@ def test_active_script_does_not_restore_removed_direct_motion_route():
     assert 'rospy.init_node("mirobot_pick_test", anonymous=True)' in source
 
 
-def test_grasp_reteaching_replaces_only_after_success_without_overwrite_flag():
+def test_pick_place_reteaching_replaces_target_only_after_both_poses_exist():
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "record_block_grasp"
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "record_block_teaching"
     )
     function_source = ast.get_source_segment(
         SCRIPT.read_text(encoding="utf-8"), function)
 
     assert "_require_overwrite" not in function_source
-    assert 'if "grasp_offset_xyz_base" in entry' in function_source
-    assert "完整示教成功后自动替换" in function_source
-    assert 'entry["grasp_offset_xyz_base"] =' in function_source
+    assert "本次要求的点全部采集成功后才替换" in function_source
+    capture_place = function_source.index("capture_block_place(")
+    replace_target = function_source.index("targets[target] = entry")
+    assert capture_place < replace_target
+    assert "remove_obsolete_shared_block_teaching(preset)" in function_source
+    assert 'entry["place_ee_in_base"] = pose_to_transform(place_pose)' in function_source
+
+
+def test_separate_pregrasp_and_place_teaching_preserve_the_other_half():
+    record_teaching, = load_symbols("record_block_teaching")
+    old_place = {"position": [0.1, 0.2, 0.3]}
+    preset = {"targets": {"fire": {
+        "pregrasp_offset_xyz_base": [9.0, 9.0, 9.0],
+        "pickup_model": {"old": True},
+        "place_ee_in_base": old_place,
+    }}}
+    new_pregrasp = {
+        "pregrasp_offset_xyz_base": [0.1, 0.2, 0.3],
+        "pickup_model": {"new": True},
+    }
+    record_teaching.__globals__.update({
+        "require_taught_target": lambda _args, _action: "fire",
+        "capture_block_pregrasp": lambda *_args: (object(), new_pregrasp),
+        "capture_block_place": lambda *_args: pytest.fail(
+            "pregrasp-only teaching must preserve place without recapturing"),
+        "move_to_saved_block_pregrasp": lambda *_args: pytest.fail(
+            "pregrasp-only teaching must capture a new pregrasp"),
+        "remove_obsolete_shared_block_teaching": lambda _preset: None,
+        "print_utf8": lambda *_args: None,
+        "pose_to_text": lambda *_args: "pose",
+        "ascii_log_text": str,
+        "rospy": SimpleNamespace(loginfo=lambda *_args: None),
+    })
+
+    record_teaching(
+        object(), object(), object(), object(), preset,
+        "teach_block_pregrasp")
+
+    entry = preset["targets"]["fire"]
+    assert entry["pregrasp_offset_xyz_base"] == [0.1, 0.2, 0.3]
+    assert entry["pickup_model"] == {"new": True}
+    assert entry["place_ee_in_base"] == old_place
+
+    new_place_pose = object()
+    record_teaching.__globals__.update({
+        "capture_block_pregrasp": lambda *_args: pytest.fail(
+            "place-only teaching must preserve pregrasp without recapturing"),
+        "move_to_saved_block_pregrasp": lambda *_args: object(),
+        "capture_block_place": lambda *_args: new_place_pose,
+        "pose_to_transform": lambda pose: {"captured": pose is new_place_pose},
+    })
+
+    record_teaching(
+        object(), object(), object(), object(), preset,
+        "teach_block_place")
+
+    entry = preset["targets"]["fire"]
+    assert entry["pregrasp_offset_xyz_base"] == [0.1, 0.2, 0.3]
+    assert entry["pickup_model"] == {"new": True}
+    assert entry["place_ee_in_base"] == {"captured": True}
+
+
+def test_no_tag_runtime_reads_model_offset_and_place_from_selected_target():
+    source = SCRIPT.read_text(encoding="utf-8")
+    start = source.index("def do_run_taught_block_mono")
+    function_source = source[start:source.index("\ndef ", start + 1)]
+
+    assert "require_block_target_entry(\n        preset, target)" in function_source
+    assert "anchor_pose, pickup_model, pregrasp_offset" in function_source
+    assert "entry, target, localization[\"base_frame\"]" in function_source
+    assert "shared_pregrasp_offset_xyz_base" not in function_source
 
 
 def test_teach_confirmation_rejects_pasted_commands_and_requires_empty_enter():
@@ -463,13 +549,19 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     assert 'parser.add_argument("--result-file")' in source
     assert "write_chassis_sequence_result(result_file, completed_ids)" in source
     assert "completed_ids.append(target_number(config, target))" in source
-    assert 'do_run_taught_block_mono(\n                    args, config, localization, "run_taught_block")' in source
+    assert "do_run_taught_block_mono(" in source
+    assert "except ContactProbeMiss:" in source
     assert "compute_drive_command(" in source
     assert 'require_joint_values(preset, "carry_joint_values")' in source
     assert 'require_joint_values(preset, "idle_joint_values")' in source
     assert "signal.signal(signal.SIGTERM, raise_termination_requested)" in source
     assert "finally:\n        publisher.shutdown()" in source
     assert 'deadline = time.time() + float(settings["max_align_seconds"])' in source
+    sequence_start = source.index("def run_block_chassis_sequence")
+    home_call = source.index("run_sequence_startup_home(", sequence_start)
+    localization_call = source.index(
+        "localization = compute_block_localization(", sequence_start)
+    assert home_call < localization_call
     assert "stopped confirmation: %d/%d fresh frames" in source
     selection_function = next(
         node for node in ast.parse(source).body
@@ -478,6 +570,147 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     selection_source = ast.get_source_segment(source, selection_function)
     assert "while not rospy.is_shutdown():" in selection_source
     assert "selection timeout" not in selection_source
+    sequence_source = source[sequence_start:source.index(
+        "\ndef ", sequence_start + 1)]
+    assert "wait_key_between_targets" not in sequence_source
+    assert "wait_between_sequence_targets" not in source
+
+
+def test_contact_probe_end_moves_toward_the_object():
+    finite_scalar, finite_vector3, normalize_vector, build_end = load_symbols(
+        "finite_scalar", "finite_vector3", "normalize_vector",
+        "build_contact_probe_end_pose")
+    build_end.__globals__["rospy"] = SimpleNamespace(
+        Time=SimpleNamespace(now=lambda: None))
+    start = make_pose(0.10, 0.20, 0.30)
+    model = {"approach_axis_xyz_base": [-1.0, 0.0, 0.0]}
+
+    end = build_end(start, model, 100.0, "base")
+
+    assert end.pose.position.x == pytest.approx(0.20)
+    assert end.pose.position.y == pytest.approx(0.20)
+    assert end.pose.position.z == pytest.approx(0.30)
+
+
+def test_block_backoff_moves_away_from_taught_pregrasp():
+    finite_scalar, finite_vector3, normalize_vector, build_backoff = load_symbols(
+        "finite_scalar", "finite_vector3", "normalize_vector",
+        "build_block_backoff_pose")
+    build_backoff.__globals__["rospy"] = SimpleNamespace(
+        Time=SimpleNamespace(now=lambda: None))
+    taught_pregrasp = make_pose(0.20, 0.10, 0.30)
+    model = {"approach_axis_xyz_base": [-1.0, 0.0, 0.0]}
+
+    staging = build_backoff(taught_pregrasp, model, 20.0, "base")
+    retreat = build_backoff(taught_pregrasp, model, 30.0, "base")
+
+    assert staging.pose.position.x == pytest.approx(0.18)
+    assert retreat.pose.position.x == pytest.approx(0.17)
+
+
+def test_contact_guard_covers_staging_to_p_then_probe_and_always_disarms():
+    finite_scalar, run_probe = load_symbols(
+        "finite_scalar", "run_contact_approach")
+    events = []
+    states = iter([False, False, True])
+    taught_pregrasp = object()
+    run_probe.__globals__.update({
+        "finite_scalar": finite_scalar,
+        "set_contact_probe_enabled": lambda _proxy, enabled: events.append(
+            ("armed", enabled)),
+        "contact_is_triggered": lambda _proxy: next(states),
+        "build_contact_probe_end_pose": lambda *_args: "probe-end",
+        "execute_cartesian_pose": lambda *args, **kwargs: events.append(
+            ("execute", args[1], kwargs)),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *_args: None,
+            sleep=lambda seconds: events.append(("sleep", seconds))),
+    })
+    settings = {
+        "max_travel_mm": 100.0,
+        "staging_step_mm": 5.0,
+        "step_mm": 2.0,
+        "point_interval_seconds": 0.5,
+        "poll_seconds": 0.02,
+    }
+
+    assert run_probe(
+        object(), taught_pregrasp, object(), "base", settings,
+        object(), object()) is True
+
+    assert events[0] == ("armed", True)
+    assert events[-1] == ("armed", False)
+    executes = [item for item in events if item[0] == "execute"]
+    assert [item[1] for item in executes] == [taught_pregrasp, "probe-end"]
+    assert executes[0][2]["eef_step"] == pytest.approx(0.005)
+    assert executes[1][2]["eef_step"] == pytest.approx(0.002)
+    assert executes[1][2]["min_point_interval"] == pytest.approx(0.5)
+    assert executes[1][2]["stop_after"] is False
+
+
+def test_contact_guard_stops_before_probe_when_triggered_on_way_to_p():
+    finite_scalar, run_probe = load_symbols(
+        "finite_scalar", "run_contact_approach")
+    targets = []
+    states = iter([False, True])
+    run_probe.__globals__.update({
+        "finite_scalar": finite_scalar,
+        "set_contact_probe_enabled": lambda *_args: None,
+        "contact_is_triggered": lambda _proxy: next(states),
+        "build_contact_probe_end_pose": lambda *_args: pytest.fail(
+            "65mm probe must not start after early contact"),
+        "execute_cartesian_pose": lambda _arm, pose, _label, **_kwargs: (
+            targets.append(pose)),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *_args: None, sleep=lambda _seconds: None),
+    })
+    taught_pregrasp = object()
+    settings = {
+        "max_travel_mm": 65.0,
+        "staging_step_mm": 5.0,
+        "step_mm": 2.0,
+        "point_interval_seconds": 0.5,
+        "poll_seconds": 0.02,
+    }
+
+    assert run_probe(
+        object(), taught_pregrasp, object(), "base", settings,
+        object(), object()) is True
+    assert targets == [taught_pregrasp]
+
+
+def test_no_tag_pick_retreats_past_pregrasp_before_carry_planning():
+    source = SCRIPT.read_text(encoding="utf-8")
+    function_start = source.index("def do_run_taught_block_mono")
+    function_source = source[function_start:source.index("\ndef ", function_start + 1)]
+    pump_on = source.index("set_pump(pump_proxy, True)", function_start)
+    retreat = source.index(
+        'execute_cartesian_pose(arm, retreat_pose, "taught_block_retreat")',
+        pump_on)
+    carry = source.index(
+        'execute_joint_values(arm, carry_joint_values, "block_carry")',
+        retreat)
+
+    assert pump_on < retreat < carry
+    assert ('taught_pre_grasp_pose, pickup_model,\n'
+            '        probe_settings["retreat_extra_mm"]') in function_source
+    assert (
+        'arm, retreat_pose, "block_contact_probe_miss_retreat"'
+        in function_source)
+
+
+def test_no_tag_runtime_uses_tag_style_staging_then_taught_pregrasp():
+    source = SCRIPT.read_text(encoding="utf-8")
+    function_start = source.index("def do_run_taught_block_mono")
+    function_source = source[function_start:source.index("\ndef ", function_start + 1)]
+
+    staging = function_source.index(
+        'execute_pose(arm, approach_staging_pose, "block_approach_staging")')
+    taught_pregrasp = function_source.index(
+        'arm, taught_pre_grasp_pose, "taught_block_pre_grasp"', staging)
+    contact_probe = function_source.index("if not run_contact_approach(", taught_pregrasp)
+
+    assert staging < taught_pregrasp < contact_probe
 
 
 def test_no_tag_chassis_sequence_result_file_records_completed_ids(tmp_path):
@@ -610,11 +843,12 @@ def test_chassis_velocity_keeper_refreshes_only_fresh_commands():
     assert keeper._timer.stopped is True
 
 
-def test_block_grasp_teaching_uses_current_orientation_for_assist_move():
+def test_block_pick_place_teaching_uses_current_orientation_for_assist_move():
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "record_block_grasp"
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "capture_block_pregrasp"
     )
     function_source = ast.get_source_segment(
         SCRIPT.read_text(encoding="utf-8"), function)
@@ -624,6 +858,8 @@ def test_block_grasp_teaching_uses_current_orientation_for_assist_move():
     assert "execute_pose(arm, assist_pose" in function_source
     assert "execute_cartesian_pose" not in function_source
     assert 'pickup_model["orientation_xyzw_base"]' not in function_source
+    assert "except RuntimeError as exc:" in function_source
+    assert "靠近、正对但未接触" in function_source
 
 
 def test_teach_assist_stops_80mm_before_surface_and_keeps_orientation():

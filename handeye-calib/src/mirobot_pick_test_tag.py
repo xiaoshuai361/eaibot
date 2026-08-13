@@ -29,16 +29,28 @@ from visualization_msgs.msg import Marker, MarkerArray
 PRESET_VERSION = 3
 DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
-DEFAULT_ASSIST_FRONT_GAP = 0.03
+DEFAULT_ASSIST_FRONT_GAP = 0.065
 DEFAULT_ASSIST_ORIENTATION_XYZW = '0,0,0,1'
 DEFAULT_TEACH_SETTLE_SECONDS = 0.8
 DEFAULT_MOTION_SETTLE_SECONDS = 0.25
-DEFAULT_TAG_MIN_SAMPLES = 5
+DEFAULT_TAG_MIN_SAMPLES = 3
 DEFAULT_TAG_MAX_MAD_M = 0.005
 DEFAULT_TAG_MAX_AGE_SECONDS = 2.0
 DEFAULT_PICKUP_APPROACH_AXIS_BASE = '-1,0,0'
+DEFAULT_SHARED_GRASP_REFERENCE_TAG = 2
 DEFAULT_VELOCITY_SCALE = 0.4
 DEFAULT_ACCELERATION_SCALE = 0.4
+DEFAULT_APPROACH_GAP = 0.030
+DEFAULT_PLACE_APPROACH_GAP = 0.05
+CONTACT_STAGING_STEP_M = 0.005
+CONTACT_PROBE_STEP_M = 0.002
+CONTACT_PROBE_MAX_TRAVEL_M = 0.065
+CONTACT_RETREAT_EXTRA_M = 0.030
+CONTACT_PROBE_POLL_SECONDS = 0.02
+CONTACT_PROBE_EXPECTED_POINT_SECONDS = 0.5
+CONTACT_PROBE_ENABLE_SERVICE = '/mirobot_contact_probe_enable'
+CONTACT_STATE_SERVICE = '/mirobot_contact_state'
+CONTACT_PROBE_MISS_EXIT_CODE = 4
 POSE_DONE_POSITION_TOLERANCE = 0.015
 POSE_DONE_ORIENTATION_TOLERANCE_RAD = 0.35
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
@@ -52,6 +64,15 @@ except NameError:
 
 class UserAbort(Exception):
     pass
+
+
+class ContactProbeIncomplete(Exception):
+    def __init__(self, tag_ids):
+        self.tag_ids = list(tag_ids)
+        Exception.__init__(
+            self,
+            '限位探测未触发，未完成的 tag：%s。'
+            % ','.join(str(tag_id) for tag_id in self.tag_ids))
 
 
 def parse_sequence(text):
@@ -113,6 +134,7 @@ def parse_args(argv):
         epilog=(
             'Common modes:\n'
             '  teach_tag_grasp      record a tag pickup point\n'
+            '  teach_place_start    record the shared place-teach start pose\n'
             '  teach_tag_place      record a fixed bin place point\n'
             '  teach_carry          record the safe carry pose after pickup\n'
             '  teach_idle           record the idle/waiting pose\n'
@@ -124,7 +146,8 @@ def parse_args(argv):
             '    --overwrite'))
     parser.add_argument('--mode',
                         choices=['teach_tag_sequence', 'teach_tag_grasp',
-                                 'teach_tag_place', 'teach_carry',
+                                 'teach_place_start', 'teach_tag_place',
+                                 'teach_carry',
                                  'teach_idle',
                                  'run_taught_sequence'],
                         required=True)
@@ -143,8 +166,11 @@ def parse_args(argv):
                         default=DEFAULT_TAG_MAX_AGE_SECONDS)
     parser.add_argument('--pickup-approach-axis-base',
                         default=DEFAULT_PICKUP_APPROACH_AXIS_BASE)
-    parser.add_argument('--approach-gap', type=float, default=0.03)
-    parser.add_argument('--place-approach-gap', type=float, default=0.02)
+    parser.add_argument('--approach-gap', type=float,
+                        default=DEFAULT_APPROACH_GAP,
+                        help='Backoff behind the taught pre-grasp pose before the straight approach.')
+    parser.add_argument('--place-approach-gap', type=float,
+                        default=DEFAULT_PLACE_APPROACH_GAP)
     parser.add_argument('--planning-time', type=float, default=2.0)
     parser.add_argument('--disable-replanning', action='store_true')
     parser.add_argument('--velocity-scale', type=float,
@@ -364,8 +390,8 @@ def pose_to_transform(pose_stamped):
     }
 
 
-def compute_constrained_grasp_pose(tag_base_pose, pickup_model, entry,
-                                   base_frame):
+def compute_taught_pre_grasp_pose(tag_base_pose, pickup_model, entry,
+                                  base_frame):
     offset = entry['grasp_offset_xyz_base']
     orientation = normalize_quaternion(
         pickup_model['orientation_xyzw_base'])
@@ -385,21 +411,38 @@ def compute_constrained_grasp_pose(tag_base_pose, pickup_model, entry,
     return pose
 
 
-def build_constrained_pre_grasp_pose(grasp_pose, pickup_model,
-                                     approach_gap, base_frame):
+def build_backoff_pose(reference_pose, pickup_model,
+                       distance_m, base_frame):
     axis = normalize_axis(pickup_model['approach_axis_xyz_base'])
-    pre_grasp = copy.deepcopy(grasp_pose)
-    pre_grasp.header.frame_id = base_frame
-    pre_grasp.header.stamp = ros_time_now()
-    pre_grasp.pose.position.x += axis[0] * approach_gap
-    pre_grasp.pose.position.y += axis[1] * approach_gap
-    pre_grasp.pose.position.z += axis[2] * approach_gap
-    return pre_grasp
+    target = copy.deepcopy(reference_pose)
+    target.header.frame_id = base_frame
+    target.header.stamp = ros_time_now()
+    target.pose.position.x += axis[0] * distance_m
+    target.pose.position.y += axis[1] * distance_m
+    target.pose.position.z += axis[2] * distance_m
+    return target
+
+
+def build_contact_probe_pose(probe_start_pose, pickup_model,
+                             travel_m, base_frame):
+    axis = normalize_axis(pickup_model['approach_axis_xyz_base'])
+    target = copy.deepcopy(probe_start_pose)
+    target.header.frame_id = base_frame
+    target.header.stamp = ros_time_now()
+    target.pose.position.x -= axis[0] * travel_m
+    target.pose.position.y -= axis[1] * travel_m
+    target.pose.position.z -= axis[2] * travel_m
+    return target
 
 
 def tag_plus_z_axis(tag_base_pose):
     matrix = pose_to_matrix(tag_base_pose)
     return [matrix[0][2], matrix[1][2], matrix[2][2]]
+
+
+def horizontal_tag_outward_axis(tag_base_pose):
+    normal = tag_plus_z_axis(tag_base_pose)
+    return normalize_axis([normal[0], normal[1], 0.0])
 
 
 def normalize_axis(axis):
@@ -456,17 +499,18 @@ def current_pose_is_close_to_target(arm, target_pose, label):
 
 
 def build_teach_assist_pose(tag_base_pose, front_gap, orientation_xyzw, base_frame):
-    normal = tag_plus_z_axis(tag_base_pose)
-    horizontal_norm = math.sqrt(normal[0] * normal[0] + normal[1] * normal[1])
-    if horizontal_norm < 1e-6:
-        raise RuntimeError('Tag +Z normal has no horizontal component for teach assist.')
-    unit_x = normal[0] / horizontal_norm
-    unit_y = normal[1] / horizontal_norm
+    try:
+        outward_axis = horizontal_tag_outward_axis(tag_base_pose)
+    except RuntimeError:
+        raise RuntimeError(
+            'Tag +Z normal has no horizontal component for teach assist.')
     pose = PoseStamped()
     pose.header.frame_id = base_frame
     pose.header.stamp = ros_time_now()
-    pose.pose.position.x = tag_base_pose.pose.position.x + unit_x * front_gap
-    pose.pose.position.y = tag_base_pose.pose.position.y + unit_y * front_gap
+    pose.pose.position.x = (
+        tag_base_pose.pose.position.x + outward_axis[0] * front_gap)
+    pose.pose.position.y = (
+        tag_base_pose.pose.position.y + outward_axis[1] * front_gap)
     pose.pose.position.z = tag_base_pose.pose.position.z
     qx, qy, qz, qw = normalize_quaternion(orientation_xyzw)
     pose.pose.orientation.x = qx
@@ -591,6 +635,9 @@ def migrate_legacy_preset_for_teach(preset):
         migrated['carry_joint_values'] = [
             float(value) for value in preset['carry_joint_values']
         ]
+    if 'place_teach_start_ee_in_base' in preset:
+        migrated['place_teach_start_ee_in_base'] = copy.deepcopy(
+            preset['place_teach_start_ee_in_base'])
     for tag_id, entry in preset.get('tags', {}).items():
         migrated_entry = {}
         if 'place_ee_in_base' in entry:
@@ -643,7 +690,10 @@ def save_preset(path, preset, overwrite=False):
         with open(tmp_path, 'w') as handle:
             json.dump(preset, handle, indent=2, sort_keys=True)
             handle.write('\n')
-        os.rename(tmp_path, path)
+        if hasattr(os, 'replace'):
+            os.replace(tmp_path, path)
+        else:
+            os.rename(tmp_path, path)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -694,6 +744,24 @@ def require_tag_fields(preset, tag_id, fields, mode):
     return entry
 
 
+def require_shared_grasp_offset(preset):
+    reference_tag = DEFAULT_SHARED_GRASP_REFERENCE_TAG
+    entry = require_tag_fields(
+        preset, reference_tag, ['grasp_offset_xyz_base'],
+        'shared Tag grasp')
+    offset = entry['grasp_offset_xyz_base']
+    if not isinstance(offset, (list, tuple)) or len(offset) != 3:
+        raise RuntimeError(
+            'Tag %d grasp_offset_xyz_base must contain three values.'
+            % reference_tag)
+    values = [float(value) for value in offset]
+    if any(math.isnan(value) or math.isinf(value) for value in values):
+        raise RuntimeError(
+            'Tag %d grasp_offset_xyz_base must contain finite values.'
+            % reference_tag)
+    return values
+
+
 def require_field_overwrite(preset, sequence, field, overwrite):
     if overwrite:
         return
@@ -708,18 +776,22 @@ def require_field_overwrite(preset, sequence, field, overwrite):
             % (field, ','.join(existing)))
 
 
-def record_tag_grasp_in_preset(preset, tag_id, tag_pose, grasp_pose,
-                               approach_axis_base=None):
+def record_tag_grasp_in_preset(preset, tag_id, tag_pose, taught_pre_grasp_pose,
+                               approach_axis_base=None,
+                               replace_pickup_model=False):
     entry = preset.setdefault('tags', {}).setdefault(str(tag_id), {})
     entry['grasp_offset_xyz_base'] = [
-        float(grasp_pose.pose.position.x - tag_pose.pose.position.x),
-        float(grasp_pose.pose.position.y - tag_pose.pose.position.y),
-        float(grasp_pose.pose.position.z - tag_pose.pose.position.z),
+        float(taught_pre_grasp_pose.pose.position.x -
+              tag_pose.pose.position.x),
+        float(taught_pre_grasp_pose.pose.position.y -
+              tag_pose.pose.position.y),
+        float(taught_pre_grasp_pose.pose.position.z -
+              tag_pose.pose.position.z),
     ]
-    if 'pickup_model' not in preset:
+    if 'pickup_model' not in preset or replace_pickup_model:
         preset['pickup_model'] = {
             'orientation_xyzw_base': normalize_quaternion(
-                quaternion_msg_to_list(grasp_pose.pose.orientation)),
+                quaternion_msg_to_list(taught_pre_grasp_pose.pose.orientation)),
             'approach_axis_xyz_base': normalize_axis(
                 approach_axis_base or [-1.0, 0.0, 0.0]),
         }
@@ -742,6 +814,21 @@ def record_tag_place_in_preset(preset, tag_id, place_pose):
     entry['place_approach_axis_in_base'] = [0.0, 0.0, 1.0]
     entry.pop('place_joint_values', None)
     return entry['place_ee_in_base']
+
+
+def require_place_teach_start(preset):
+    transform = preset.get('place_teach_start_ee_in_base')
+    if not isinstance(transform, dict):
+        raise RuntimeError(
+            'Preset is missing place_teach_start_ee_in_base. Run '
+            '--mode teach_place_start first.')
+    transform_to_matrix(transform)
+    return transform
+
+
+def record_place_teach_start_in_preset(preset, pose):
+    preset['place_teach_start_ee_in_base'] = pose_to_transform(pose)
+    return preset['place_teach_start_ee_in_base']
 
 
 def record_idle_in_preset(preset, arm):
@@ -809,6 +896,27 @@ def get_startup_home_type():
             'std_srvs/Trigger is unavailable. Source the ROS workspaces first.')
 
 
+def get_contact_service_types():
+    try:
+        from std_srvs.srv import SetBool, Trigger
+        return SetBool, Trigger
+    except ImportError:
+        raise RuntimeError(
+            'std_srvs contact service types are unavailable. Source the ROS workspaces first.')
+
+
+def get_contact_proxies():
+    enable_type, state_type = get_contact_service_types()
+    rospy.loginfo('等待限位探测服务：%s、%s',
+                  CONTACT_PROBE_ENABLE_SERVICE, CONTACT_STATE_SERVICE)
+    rospy.wait_for_service(CONTACT_PROBE_ENABLE_SERVICE, timeout=5.0)
+    rospy.wait_for_service(CONTACT_STATE_SERVICE, timeout=5.0)
+    return (
+        rospy.ServiceProxy(CONTACT_PROBE_ENABLE_SERVICE, enable_type),
+        rospy.ServiceProxy(CONTACT_STATE_SERVICE, state_type),
+    )
+
+
 def run_startup_home(args):
     service_name = getattr(
         args, 'startup_home_service', DEFAULT_STARTUP_HOME_SERVICE)
@@ -828,6 +936,22 @@ def set_pump(pump_proxy, enabled):
     response = pump_proxy(enabled)
     if not response.Sucess:
         raise RuntimeError('吸泵服务返回失败。')
+
+
+def set_contact_probe_enabled(enable_proxy, enabled):
+    response = enable_proxy(bool(enabled))
+    if not response.success:
+        raise RuntimeError(
+            '限位探测%s失败：%s'
+            % ('启用' if enabled else '关闭', response.message))
+
+
+def contact_is_triggered(state_proxy):
+    response = state_proxy()
+    message = str(response.message or '')
+    if not response.success and message.startswith('ERROR:'):
+        raise RuntimeError('读取限位开关失败：%s' % message)
+    return bool(response.success)
 
 
 def pose_from_tf_sample(frame_id, trans, rot):
@@ -1013,9 +1137,10 @@ def pose_to_text(name, pose_stamped):
 
 DISPLAY_LABELS = {
     'tag_in_base': 'tag在base下位姿',
-    'taught_pre_grasp': '预抓点',
-    'taught_grasp': '抓取接触点',
-    'taught_grasp_retreat': '抓取后退点',
+    'place_teach_start': '共用放置示教起点',
+    'approach_staging': '预抓点后方安全点',
+    'taught_pre_grasp': '示教预抓点',
+    'pickup_retreat': '吸附后退点',
     'carry': '搬运中间姿态',
     'taught_pre_place': '放置上方点',
     'taught_place': '放置接触点',
@@ -1058,8 +1183,8 @@ def publish_debug_geometry(base_frame, poses):
     marker_colors = {
         'tag_in_base': (0.1, 0.4, 0.9),
         'teach_assist_front': (0.2, 0.95, 0.35),
+        'approach_staging': (0.95, 0.75, 0.1),
         'taught_pre_grasp': (0.95, 0.75, 0.1),
-        'taught_grasp': (0.95, 0.2, 0.2),
         'taught_pre_place': (0.8, 0.3, 0.95),
         'taught_place': (0.25, 0.95, 0.95),
     }
@@ -1135,9 +1260,12 @@ def log_current_pose(arm, label):
 
 def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
                            jump_threshold=0.0, retry_without_collisions=False,
-                           fallback_to_pose=False):
-    rospy.loginfo('执行直线动作：%s',
-                  pose_to_text(display_label(label), target_pose))
+                           fallback_to_pose=False, quiet=False,
+                           settle=True, stop_after=True,
+                           min_point_interval=0.0):
+    if not quiet:
+        rospy.loginfo('执行直线动作：%s',
+                      pose_to_text(display_label(label), target_pose))
     for attempt in range(2):
         arm.set_start_state_to_current_state()
         plan, fraction = arm.compute_cartesian_path(
@@ -1164,11 +1292,18 @@ def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
         if not plan.joint_trajectory.points:
             raise RuntimeError('MoveIt 为 %s 返回了空直线轨迹。' %
                                display_label(label))
+        if min_point_interval > 0.0:
+            for point_index, point in enumerate(plan.joint_trajectory.points):
+                minimum_seconds = point_index * min_point_interval
+                if point.time_from_start.to_sec() < minimum_seconds:
+                    point.time_from_start = rospy.Duration(minimum_seconds)
         success = arm.execute(plan, wait=True)
-        arm.stop()
+        if stop_after or not success:
+            arm.stop()
         arm.clear_pose_targets()
         if success:
-            settle_after_motion()
+            if settle:
+                settle_after_motion()
             return
         if attempt == 0:
             rospy.logwarn(
@@ -1176,6 +1311,50 @@ def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
                 display_label(label))
             rospy.sleep(0.5)
     raise RuntimeError('MoveIt 执行 %s 直线动作失败。' % display_label(label))
+
+
+def run_contact_approach(arm, taught_pre_grasp_pose, pickup_model, base_frame,
+                         enable_proxy, state_proxy,
+                         staging_step_m=CONTACT_STAGING_STEP_M,
+                         probe_step_m=CONTACT_PROBE_STEP_M,
+                         max_travel_m=CONTACT_PROBE_MAX_TRAVEL_M,
+                         poll_seconds=CONTACT_PROBE_POLL_SECONDS,
+                         point_interval=CONTACT_PROBE_EXPECTED_POINT_SECONDS):
+    set_contact_probe_enabled(enable_proxy, True)
+    try:
+        if contact_is_triggered(state_proxy):
+            return True
+        rospy.loginfo(
+            '限位已在预抓点后方安全点开启：先以 %.0fmm 步长受保护地'
+            '直线移动到 P，未触发再从 P 前探 %.0fmm，步长 %.0fmm。',
+            staging_step_m * 1000.0,
+            max_travel_m * 1000.0,
+            probe_step_m * 1000.0,
+            )
+        execute_cartesian_pose(
+            arm, taught_pre_grasp_pose, 'guarded_to_taught_pre_grasp',
+            eef_step=staging_step_m,
+            quiet=True, settle=False, stop_after=False,
+            min_point_interval=point_interval)
+        rospy.sleep(poll_seconds)
+        if contact_is_triggered(state_proxy):
+            rospy.loginfo('到达示教预抓点 P 之前已触发限位，停止继续前探。')
+            return True
+        probe_end_pose = build_contact_probe_pose(
+            taught_pre_grasp_pose, pickup_model,
+            max_travel_m, base_frame)
+        execute_cartesian_pose(
+            arm, probe_end_pose, 'contact_probe_path',
+            eef_step=probe_step_m,
+            quiet=True, settle=False, stop_after=False,
+            min_point_interval=point_interval)
+        rospy.sleep(poll_seconds)
+        triggered = contact_is_triggered(state_proxy)
+        if triggered:
+            rospy.loginfo('限位开关已触发，底层已停止后续探测路点。')
+        return triggered
+    finally:
+        set_contact_probe_enabled(enable_proxy, False)
 
 
 def cache_tag_pose_for_teach(listener, args, tag_id, index, total_tags):
@@ -1220,28 +1399,82 @@ def move_to_teach_assist(args, arm, tag_id, tag_pose):
             tag_id, exc)
 
 
-def prompt_and_record_grasp(args, arm, preset, tag_id, tag_pose):
+def prompt_and_record_grasp(args, arm, preset, tag_id, tag_pose,
+                            update_pickup_model=False):
+    approach_gap = getattr(args, 'approach_gap', DEFAULT_APPROACH_GAP)
     prompt_enter(
-        '步骤 3：记录 tag_%d 的抓取接触姿态\n'
-        '现在请在 RViz 里微调吸盘末端，主要调 XY，必要时小幅调 Z。\n'
-        '目标：泵头水平、吸盘刚好贴住 tag 面。RViz Plan/Execute 到位后回这里按 Enter。'
-        % tag_id)
+        '步骤 3：记录 tag_%d 的预抓姿态\n'
+        '请在 RViz 里微调 XY/Z 和吸盘朝向，使吸盘近距离正对物块，但不要贴住。\n'
+        'Plan/Execute 到位后回这里按 Enter 保存。正式抓取会先停在该预抓点后方 %.0fmm，'
+        '再直线伸到预抓点并启动限位慢速前探。'
+        % (tag_id, approach_gap * 1000.0))
     settle_seconds = getattr(args, 'teach_settle_seconds', 0.0)
     if settle_seconds > 0.0:
         rospy.loginfo('等待 %.2fs，让关节状态刷新稳定后再记录抓取点。', settle_seconds)
         rospy.sleep(settle_seconds)
-    grasp_pose = arm.get_current_pose()
+    taught_pre_grasp_pose = arm.get_current_pose()
+    if update_pickup_model or 'place_teach_start_ee_in_base' not in preset:
+        record_place_teach_start_in_preset(preset, taught_pre_grasp_pose)
+    if update_pickup_model:
+        approach_axis = horizontal_tag_outward_axis(tag_pose)
+    elif isinstance(preset.get('pickup_model'), dict):
+        approach_axis = normalize_axis(
+            preset['pickup_model']['approach_axis_xyz_base'])
+    else:
+        approach_axis = args.pickup_approach_axis_base
     record_tag_grasp_in_preset(
-        preset, tag_id, tag_pose, grasp_pose,
-        approach_axis_base=args.pickup_approach_axis_base)
-    rospy.loginfo('步骤 3 完成：已记录 tag_%d 抓取接触姿态。', tag_id)
-    rospy.loginfo(pose_to_text('tag_%d_grasp_ee_in_base' % tag_id, grasp_pose))
+        preset, tag_id, tag_pose, taught_pre_grasp_pose,
+        approach_axis_base=approach_axis,
+        replace_pickup_model=update_pickup_model)
+    if update_pickup_model:
+        rospy.loginfo(
+            '已更新所有 tag 共用的吸盘姿态和限位前进轴：[%.4f, %.4f, %.4f]。',
+            approach_axis[0], approach_axis[1], approach_axis[2])
+    rospy.loginfo('步骤 3 完成：已记录 tag_%d 预抓姿态。', tag_id)
+    if update_pickup_model:
+        rospy.loginfo(
+            '该预抓 Link6 位姿已同时更新为有 Tag/无 Tag 共用的放置示教起点。')
+    rospy.loginfo(pose_to_text(
+        'tag_%d_taught_pre_grasp_in_base' % tag_id,
+        taught_pre_grasp_pose))
+
+
+def move_to_place_teach_start(args, arm, preset):
+    start_pose = transform_to_pose(
+        args.base_frame, require_place_teach_start(preset))
+    rospy.loginfo(
+        '放置示教前先移动到有 Tag/无 Tag 共用的预抓姿态。')
+    rospy.loginfo(pose_to_text('place_teach_start', start_pose))
+    execute_pose(arm, start_pose, 'place_teach_start')
+
+
+def teach_place_start(args, arm):
+    preset = load_preset(args.preset_file)
+    if ('place_teach_start_ee_in_base' in preset and not args.overwrite):
+        raise RuntimeError(
+            'Preset already contains place_teach_start_ee_in_base. '
+            'Use --overwrite to update it.')
+    prompt_enter(
+        '示教有 Tag/无 Tag 共用的放置示教起点\n'
+        '请在 RViz 中 Plan/Execute 到稳定的向前伸展预抓姿态。\n'
+        '这里只记录当前 Link6 完整位姿，不会强制修改后续放置姿态。')
+    settle_seconds = getattr(args, 'teach_settle_seconds', 0.0)
+    if settle_seconds > 0.0:
+        rospy.sleep(settle_seconds)
+    start_pose = arm.get_current_pose()
+    record_place_teach_start_in_preset(preset, start_pose)
+    save_preset(args.preset_file, preset, overwrite=True)
+    rospy.loginfo('共用放置示教起点已保存：%s', args.preset_file)
+    rospy.loginfo(pose_to_text('place_teach_start', start_pose))
 
 
 def prompt_and_record_place(args, arm, preset, tag_id):
+    move_to_place_teach_start(args, arm, preset)
     prompt_enter(
         '步骤 4：记录 tag_%d 的载物仓释放姿态\n'
-        '请在 RViz 里移动吸盘到对应载物仓释放位置，Plan/Execute 到位后回这里按 Enter。'
+        '机械臂已到共用的预抓姿态。\n'
+        '请从这里在 RViz 里移动吸盘到对应载物仓释放位置，Plan/Execute 到位后回这里按 Enter。\n'
+        '最终保存你实际调整后的 Link6 完整位姿，不锁定姿态四元数。'
         % tag_id)
     settle_seconds = getattr(args, 'teach_settle_seconds', 0.0)
     if settle_seconds > 0.0:
@@ -1264,7 +1497,9 @@ def teach_tag_sequence(args, arm):
         tag_pose = cache_tag_pose_for_teach(
             listener, args, tag_id, index, total_tags)
         move_to_teach_assist(args, arm, tag_id, tag_pose)
-        prompt_and_record_grasp(args, arm, preset, tag_id, tag_pose)
+        prompt_and_record_grasp(
+            args, arm, preset, tag_id, tag_pose,
+            update_pickup_model=(index == 1))
         prompt_and_record_place(args, arm, preset, tag_id)
     save_preset(args.preset_file, preset,
                 overwrite=(preset_existed or args.overwrite))
@@ -1272,6 +1507,12 @@ def teach_tag_sequence(args, arm):
 
 
 def teach_tag_grasp(args, arm):
+    if args.sequence != [DEFAULT_SHARED_GRASP_REFERENCE_TAG]:
+        raise RuntimeError(
+            'teach_tag_grasp uses tag_%d as the single shared reference. '
+            'Run with --sequence %d.'
+            % (DEFAULT_SHARED_GRASP_REFERENCE_TAG,
+               DEFAULT_SHARED_GRASP_REFERENCE_TAG))
     preset = load_preset_for_grasp_teach(args.preset_file)
     require_field_overwrite(preset, args.sequence, 'grasp_offset_xyz_base',
                             args.overwrite)
@@ -1285,7 +1526,9 @@ def teach_tag_grasp(args, arm):
         tag_pose = cache_tag_pose_for_teach(
             listener, args, tag_id, index, total_tags)
         move_to_teach_assist(args, arm, tag_id, tag_pose)
-        prompt_and_record_grasp(args, arm, preset, tag_id, tag_pose)
+        prompt_and_record_grasp(
+            args, arm, preset, tag_id, tag_pose,
+            update_pickup_model=(index == 1))
         rospy.loginfo('tag_%d 原来的载物仓释放姿态已保留，不会覆盖。', tag_id)
     save_preset(args.preset_file, preset, overwrite=True)
     rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
@@ -1293,11 +1536,10 @@ def teach_tag_grasp(args, arm):
 
 def teach_tag_place(args, arm):
     preset = load_preset(args.preset_file)
+    require_place_teach_start(preset)
     require_field_overwrite(preset, args.sequence, 'place_ee_in_base',
                             args.overwrite)
-    for tag_id in args.sequence:
-        require_tag_fields(preset, tag_id, ['grasp_offset_xyz_base'],
-                           'teach_tag_place')
+    require_shared_grasp_offset(preset)
     require_pickup_model(preset)
     total_tags = len(args.sequence)
     for index, tag_id in enumerate(args.sequence, 1):
@@ -1339,39 +1581,60 @@ def teach_carry(args, arm):
     rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
 
 
-def run_taught_sequence(args, arm, pump_proxy):
+def run_taught_sequence(args, arm, pump_proxy, contact_proxies=None):
     preset = load_preset(args.preset_file)
     require_preset_tags(preset, args.sequence)
     pickup_model = require_pickup_model(preset)
+    shared_grasp_offset = require_shared_grasp_offset(preset)
+    rospy.loginfo(
+        '四个 Tag 共用 ID%d 的示教抓取偏移。',
+        DEFAULT_SHARED_GRASP_REFERENCE_TAG)
     listener = tf.TransformListener()
     rospy.sleep(0.5)
+    if not args.dry_run and contact_proxies is None:
+        contact_proxies = get_contact_proxies()
+    enable_contact_proxy = None if args.dry_run else contact_proxies[0]
+    contact_state_proxy = None if args.dry_run else contact_proxies[1]
     total_tags = len(args.sequence)
+    incomplete_tags = []
     for index, tag_id in enumerate(args.sequence, 1):
         rospy.loginfo('开始处理 tag_%d（%d/%d）。', tag_id, index, total_tags)
         entry = preset['tags'][str(tag_id)]
         require_tag_fields(
             preset, tag_id,
-            ['grasp_offset_xyz_base', 'place_ee_in_base'],
+            ['place_ee_in_base'],
             'run_taught_sequence')
         tag_pose = wait_for_tag_pose_in_base(listener, args, tag_id)
-        grasp_pose = compute_constrained_grasp_pose(
-            tag_pose, pickup_model, entry, args.base_frame)
-        pre_grasp_pose = build_constrained_pre_grasp_pose(
-            grasp_pose, pickup_model,
+        taught_pre_grasp_pose = compute_taught_pre_grasp_pose(
+            tag_pose, pickup_model,
+            {'grasp_offset_xyz_base': shared_grasp_offset},
+            args.base_frame)
+        approach_staging_pose = build_backoff_pose(
+            taught_pre_grasp_pose, pickup_model,
             args.approach_gap, args.base_frame)
         place_pose = transform_to_pose(args.base_frame, entry['place_ee_in_base'])
         pre_place_pose = build_pre_place_pose(
             place_pose, args.place_approach_gap, args.base_frame)
+        probe_end_pose = build_contact_probe_pose(
+            taught_pre_grasp_pose, pickup_model,
+            CONTACT_PROBE_MAX_TRAVEL_M, args.base_frame)
+        retreat_pose = build_backoff_pose(
+            taught_pre_grasp_pose, pickup_model,
+            CONTACT_RETREAT_EXTRA_M, args.base_frame)
 
         rospy.loginfo(pose_to_text('tag_%d在base下位姿' % tag_id, tag_pose))
-        rospy.loginfo(pose_to_text('预抓点', pre_grasp_pose))
-        rospy.loginfo(pose_to_text('抓取接触点', grasp_pose))
+        rospy.loginfo(pose_to_text('预抓点后方安全点', approach_staging_pose))
+        rospy.loginfo(pose_to_text('示教预抓点', taught_pre_grasp_pose))
+        rospy.loginfo(pose_to_text('限位探测最远点', probe_end_pose))
+        rospy.loginfo(pose_to_text('抓取后退点', retreat_pose))
         rospy.loginfo(pose_to_text('放置上方点', pre_place_pose))
         rospy.loginfo(pose_to_text('放置接触点', place_pose))
         publish_debug_geometry(args.base_frame, {
             'tag_in_base': tag_pose,
-            'taught_pre_grasp': pre_grasp_pose,
-            'taught_grasp': grasp_pose,
+            'approach_staging': approach_staging_pose,
+            'taught_pre_grasp': taught_pre_grasp_pose,
+            'contact_probe_end': probe_end_pose,
+            'pickup_retreat': retreat_pose,
             'taught_pre_place': pre_place_pose,
             'taught_place': place_pose,
         })
@@ -1382,12 +1645,30 @@ def run_taught_sequence(args, arm, pump_proxy):
 
         holding_object = False
         try:
-            execute_pose(arm, pre_grasp_pose, 'taught_pre_grasp')
-            execute_cartesian_pose(arm, grasp_pose, 'taught_grasp')
+            set_pump(pump_proxy, False)
+            execute_pose(arm, approach_staging_pose, 'approach_staging')
+            if not run_contact_approach(
+                    arm, taught_pre_grasp_pose, pickup_model, args.base_frame,
+                    enable_contact_proxy, contact_state_proxy):
+                rospy.logwarn(
+                    'CONTACT_PROBE_MISS tag_%d：前进 %.0fmm 仍未触发限位，退回并跳过当前物块。',
+                    tag_id, CONTACT_PROBE_MAX_TRAVEL_M * 1000.0)
+                set_pump(pump_proxy, False)
+                execute_cartesian_pose(
+                    arm, retreat_pose, 'contact_probe_miss_retreat')
+                if preset.get('idle_joint_values'):
+                    execute_joint_values(
+                        arm, preset['idle_joint_values'], 'idle')
+                    rospy.sleep(0.5)
+                incomplete_tags.append(tag_id)
+                continue
             set_pump(pump_proxy, True)
             holding_object = True
             rospy.sleep(0.8)
-            execute_cartesian_pose(arm, pre_grasp_pose, 'taught_grasp_retreat')
+            rospy.loginfo(
+                '吸附完成，沿原接近路径直线退过预抓点 %.0fmm，再进入搬运规划。',
+                CONTACT_RETREAT_EXTRA_M * 1000.0)
+            execute_cartesian_pose(arm, retreat_pose, 'pickup_retreat')
             if preset.get('carry_joint_values'):
                 execute_joint_values(arm, preset['carry_joint_values'], 'carry')
                 rospy.sleep(0.5)
@@ -1421,6 +1702,8 @@ def run_taught_sequence(args, arm, pump_proxy):
         rospy.loginfo('保持调试位姿话题 %.1f 秒。',
                       args.debug_hold_seconds)
         rospy.sleep(args.debug_hold_seconds)
+    if incomplete_tags:
+        raise ContactProbeIncomplete(incomplete_tags)
 
 
 def main():
@@ -1430,6 +1713,7 @@ def main():
     rospy.init_node('mirobot_pick_test_tag', anonymous=False)
     moveit_commander.roscpp_initialize(sys.argv)
     arm = None
+    exit_code = 0
     try:
         arm = build_move_group(
             args.group, args.base_frame, args.velocity_scale,
@@ -1439,6 +1723,8 @@ def main():
             teach_tag_sequence(args, arm)
         elif args.mode == 'teach_tag_grasp':
             teach_tag_grasp(args, arm)
+        elif args.mode == 'teach_place_start':
+            teach_place_start(args, arm)
         elif args.mode == 'teach_tag_place':
             teach_tag_place(args, arm)
         elif args.mode == 'teach_carry':
@@ -1447,8 +1733,13 @@ def main():
             teach_idle(args, arm)
         else:
             pump_proxy = None if args.dry_run else get_pump_proxy()
-            run_taught_sequence(args, arm, pump_proxy)
+            contact_proxies = None if args.dry_run else get_contact_proxies()
+            run_taught_sequence(
+                args, arm, pump_proxy, contact_proxies=contact_proxies)
         rospy.loginfo('Tag 示教/抓取流程结束。')
+    except ContactProbeIncomplete as exc:
+        rospy.logwarn(str(exc))
+        exit_code = CONTACT_PROBE_MISS_EXIT_CODE
     except UserAbort as exc:
         rospy.logwarn(str(exc))
     except rospy.ROSInterruptException:
@@ -1460,6 +1751,8 @@ def main():
         raise
     finally:
         moveit_commander.roscpp_shutdown()
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == '__main__':

@@ -11,6 +11,7 @@ import threading
 
 from ..config import (
     PICK_CANDIDATE_IDS,
+    PICK_DEBUG_VIEW,
     TAG_ALIGN_SCRIPT,
     TAG_DELIVERY_PRESET_FILE,
     TAG_DELIVERY_SCRIPT,
@@ -19,6 +20,9 @@ from ..config import (
     UNTAGGED_DELIVERY_PRESET_FILE,
     UNTAGGED_PICK_SCRIPT,
     UNTAGGED_PRESET_FILE,
+    UNTAGGED_SEARCH_POLL_HZ,
+    UNTAGGED_SEARCH_ROI,
+    UNTAGGED_SEARCH_STABLE_FRAMES,
 )
 
 
@@ -42,6 +46,12 @@ class GraspCoordinator(object):
             result_directory, "tag_pick_result_%d.json" % os.getpid())
         self.untagged_result_file = os.path.join(
             result_directory, "untagged_pick_result_%d.json" % os.getpid())
+        self.untagged_search_ready_file = os.path.join(
+            result_directory, "untagged_search_ready_%d" % os.getpid())
+        self.untagged_search_trigger_file = os.path.join(
+            result_directory, "untagged_search_trigger_%d" % os.getpid())
+        self.untagged_search_release_file = os.path.join(
+            result_directory, "untagged_search_release_%d" % os.getpid())
 
     @staticmethod
     def _sequence_text():
@@ -52,7 +62,7 @@ class GraspCoordinator(object):
             os.unlink(self.tag_result_file)
         except OSError:
             pass
-        return [
+        command = [
             "/usr/bin/python2", TAG_ALIGN_SCRIPT,
             "--sequence", self._sequence_text(),
             "--order", "left_to_right",
@@ -62,8 +72,12 @@ class GraspCoordinator(object):
             "--preset-file", TAG_PRESET_FILE,
             "--pick-velocity-scale", "0.2",
             "--pick-acceleration-scale", "0.2",
+            "--pick-approach-gap", "0.030",
             "--tag-tf-wait-seconds", "12.0",
         ]
+        if PICK_DEBUG_VIEW:
+            command.append("--show-debug-window")
+        return command
 
     def _delivery_command(self, source, item_ids):
         sequence = ",".join(str(int(item_id)) for item_id in item_ids)
@@ -75,13 +89,24 @@ class GraspCoordinator(object):
             idle_preset_file = UNTAGGED_PRESET_FILE
         else:
             raise ValueError("未知投递来源：%s" % source)
-        return [
+        command = [
             "/usr/bin/python2", TAG_DELIVERY_SCRIPT,
             "--mode", "run_delivery",
             "--sequence", sequence,
             "--delivery-file", delivery_file,
+            "--cargo-pick-file", TAG_DELIVERY_PRESET_FILE,
             "--tag-preset-file", idle_preset_file,
         ]
+        if source == "untagged":
+            command.extend([
+                "--contact-release",
+                "--force-release-on-contact-miss",
+                "--contact-staging-gap", "0.030",
+                "--contact-staging-step", "0.005",
+                "--contact-probe-step", "0.002",
+                "--contact-probe-max-travel", "0.065",
+            ])
+        return command
 
     def _read_pick_result(self, path, expected_count, label):
         try:
@@ -102,12 +127,22 @@ class GraspCoordinator(object):
                 % (label, int(expected_count), completed_ids))
         return completed_ids
 
-    def _untagged_command(self, count):
-        try:
-            os.unlink(self.untagged_result_file)
-        except OSError:
-            pass
-        return [
+    @staticmethod
+    def _remove_files(paths):
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _untagged_command(self, count, search_before_pick=False):
+        self._remove_files((
+            self.untagged_result_file,
+            self.untagged_search_ready_file,
+            self.untagged_search_trigger_file,
+            self.untagged_search_release_file,
+        ))
+        command = [
             self.python3, UNTAGGED_PICK_SCRIPT,
             "--run-chassis-sequence",
             "--sequence", self._sequence_text(),
@@ -118,6 +153,21 @@ class GraspCoordinator(object):
             "--config", UNTAGGED_CONFIG_FILE,
             "--preset-file", UNTAGGED_PRESET_FILE,
         ]
+        if PICK_DEBUG_VIEW:
+            command.append("--show-rgb")
+        if search_before_pick:
+            command.extend([
+                "--search-before-chassis",
+                "--search-ready-file", self.untagged_search_ready_file,
+                "--search-trigger-file", self.untagged_search_trigger_file,
+                "--search-release-file", self.untagged_search_release_file,
+                "--search-roi-ratio", ",".join(
+                    str(float(value)) for value in UNTAGGED_SEARCH_ROI),
+                "--search-stable-frames",
+                str(int(UNTAGGED_SEARCH_STABLE_FRAMES)),
+                "--search-poll-hz", str(float(UNTAGGED_SEARCH_POLL_HZ)),
+            ])
+        return command
 
     def _run(self, kind, payload):
         success = False
@@ -126,24 +176,25 @@ class GraspCoordinator(object):
         try:
             if kind == "tag":
                 command = self._tag_command(payload)
-            elif kind == "untagged":
+            elif kind in ("untagged", "untagged_search"):
                 self.supervisor.start_astra()
-                command = self._untagged_command(payload)
+                command = self._untagged_command(
+                    payload, search_before_pick=(kind == "untagged_search"))
             elif kind == "delivery":
-                self.supervisor.start_arm_common()
                 source, item_ids = payload
                 result_items = [int(item_id) for item_id in item_ids]
                 command = self._delivery_command(source, result_items)
             else:
                 raise ValueError("未知抓取类型：%s" % kind)
-            job_name = "delivery" if kind == "delivery" else "pick_%s" % kind
+            job_name = "delivery" if kind == "delivery" else \
+                "pick_%s" % ("untagged" if kind == "untagged_search" else kind)
             code = self.supervisor.run_job(job_name, command)
             if code != 0:
                 raise subprocess.CalledProcessError(code, command)
             if kind == "tag":
                 result_items = self._read_pick_result(
                     self.tag_result_file, payload, "有 Tag")
-            elif kind == "untagged":
+            elif kind in ("untagged", "untagged_search"):
                 result_items = self._read_pick_result(
                     self.untagged_result_file, payload, "无 Tag")
             success = True
@@ -155,7 +206,7 @@ class GraspCoordinator(object):
                 self.supervisor.stop_astra()
                 if not self.keep_arm_after_tag:
                     self.supervisor.stop_arm_common()
-            elif kind == "untagged":
+            elif kind in ("untagged", "untagged_search"):
                 self.supervisor.stop_astra()
                 if not self.keep_arm_after_untagged:
                     self.supervisor.stop_arm_common()
@@ -178,6 +229,19 @@ class GraspCoordinator(object):
                 target=self._run, args=(self.kind, int(count)))
             self.thread.daemon = True
             self.thread.start()
+
+    def start_untagged_search(self, count):
+        self.start("untagged_search", count)
+
+    def untagged_search_ready(self):
+        return os.path.isfile(self.untagged_search_ready_file)
+
+    def untagged_search_triggered(self):
+        return os.path.isfile(self.untagged_search_trigger_file)
+
+    def release_untagged_search(self):
+        with open(self.untagged_search_release_file, "w") as handle:
+            handle.write("release\n")
 
     def start_delivery(self, source, item_ids):
         source = str(source)

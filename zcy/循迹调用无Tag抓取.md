@@ -1,10 +1,9 @@
-# 循迹调用无 Tag 抓取
+# 无 Tag 抓取与投递：总调度 AI 接口
 
-循迹程序负责底盘，无 Tag 程序只执行单个物块的“抓取 → 中转 → 放置 → idle”。不要在循迹中调用 `--run-chassis-sequence`，否则两个程序会同时控制 `/cmd_vel`。
+> 更新时间：2026-08-13
+> 本文只面向 `zcy_last` 总调度、循迹状态机和进程编排。示教、标定和人工单步命令见《无tag的机械臂操作.md》。
 
-## 1. 启动环境
-
-运行循迹前先加载完整环境，并确保 Astra RGB、Mirobot + MoveIt、手眼 TF 已启动：
+## 1. 唯一比赛入口
 
 ```bash
 source /opt/ros/melodic/setup.bash
@@ -13,25 +12,13 @@ source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
 conda activate ww
 cd /home/eaibot/robocom_ws/src
-```
 
-目标编号：
-
-```text
-1=power  2=fire  3=gas  4=support
-```
-
-## 新版 `zcy_last` 自动抓取与投递
-
-新版主任务会在第 3 个路口完成后独占底盘和 Astra，按画面从左到右抓取，并记录实际成功入仓的物资 ID。开启 A 点抓取和楼宇投递：
-
-```bash
 python3 -m zcy_last.main \
   --untagged-pick --untagged-pick-count 3 \
   --untagged-delivery
 ```
 
-只抓取、不投递：
+只抓不投：
 
 ```bash
 python3 -m zcy_last.main \
@@ -39,131 +26,193 @@ python3 -m zcy_last.main \
   --no-untagged-delivery
 ```
 
-楼宇与物资 ID 的关系：电力故障 `1`、火灾 `2`、有毒气体 `3`、坍塌 `4`。只有实际库存中存在对应 ID 才启动投递。投递失败只在终端报警、不重试，并继续循迹。
-
-A 点使用独立投递示教文件：
-
-```text
-/home/eaibot/handeye-calib/config/untagged_delivery_presets.json
-```
-
-比赛前依次示教载物仓抓取点、中转点和投递点：
+同时启用 B 点有 Tag 和 A 点无 Tag 时，只运行一个总任务：
 
 ```bash
-python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
-  --mode teach_cargo_pick --sequence 1,2,3,4 \
-  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
-  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
-
-python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
-  --mode teach_transit \
-  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
-  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
-
-python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
-  --mode teach_release \
-  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
-  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 --tag-delivery \
+  --untagged-pick --untagged-pick-count 3 --untagged-delivery
 ```
 
-下面的单目标调用仅用于旧版或独立调试。运行 `zcy_last.main` 时不要同时手动启动这些抓取命令。
+抓取数量只能是 `1..4`，表示必须成功入仓的数量，不代表固定类别顺序。不要同时运行两个 `zcy_last.main`，也不要手动并行启动无 Tag 抓取或键盘控制。
 
-## 2. 单独测试调用
+## 2. 当前 A 点状态机
 
-底盘停稳、目标中心已经进入红色 ROI 后，以 `1=power` 为例：
+无 Tag 抓取在第 3 个路口完成后触发，不是停车后立即把底盘交给抓取：
+
+```text
+完成第3个路口
+-> 关闭任务 YOLO
+-> A_PICK_PREPARE：停车，启动 Astra、机械臂公共栈和无Tag模型
+-> 子进程写 search_ready 文件
+-> A_PICK_SEARCH：总调度继续拥有 /cmd_vel，以固定零角速度向前直行
+-> 无Tag模型只检查画面右侧搜索区
+-> 右侧目标连续3帧稳定，子进程写 search_trigger 文件
+-> 总调度先发布零速度
+-> 总调度写 search_release 文件
+-> /cmd_vel 所有权切换给抓取子进程
+-> A_PICKING：子进程慢速把目标移到左侧抓取区并抓取
+-> 成功读取实际库存
+-> 关闭 Astra，恢复楼宇任务 YOLO
+-> 等待绿灯
+-> 按 A 点独立时间直行并完成第 4 个路口左转
+-> 识别出口横条并摆正后恢复普通流程
+```
+
+如果到达第 4 个路口入口时仍未触发无 Tag 抓取，任务进入 `PICK_FAILED`，不会带病继续。
+
+两个 ROI 不能混用：
+
+```text
+右侧搜索区：zcy_last/config.py 的 UNTAGGED_SEARCH_ROI=(0.60,0.05,0.98,0.95)
+左侧抓取区：block_mono_grasp.yaml 的 grasp_roi_ratio=(0.06,0.00,0.24,1.00)
+搜索直行速度：UNTAGGED_SEARCH_FORWARD_SPEED=0.16
+A 点抓取后直行时间：UNTAGGED_PICK_NEXT_ENTRY_TIME=5.5
+A 点抓取后左转时间：UNTAGGED_PICK_NEXT_TURN_TIME=4.0
+```
+
+## 3. 协调器实际调用
+
+真实命令由 `zcy_last/control/grasp.py` 构造。A 点比赛流程等价于：
 
 ```bash
 python3 /home/eaibot/handeye-calib/src/block_pick_main.py \
-  --target 1 \
-  --run-taught-block \
+  --run-chassis-sequence \
+  --sequence 1,2,3,4 \
+  --max-targets <要求成功数> \
+  --fail-on-skip \
+  --result-file <临时JSON> \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
-  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
+  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
+  --search-before-chassis \
+  --search-ready-file <ready文件> \
+  --search-trigger-file <trigger文件> \
+  --search-release-file <release文件> \
+  --search-roi-ratio 0.6,0.05,0.98,0.95 \
+  --search-stable-frames 3 \
+  --search-poll-hz 3.0
 ```
 
-返回码 `0` 表示抓放完成；非 `0` 表示失败，底盘必须保持停止，不能自动继续循迹。
+`PICK_DEBUG_VIEW=True` 时协调器还会添加 `--show-rgb`。
 
-## 3. 在 `line_cy_task.py` 中调用
+必须保留 `--run-chassis-sequence`。旧版“循迹直接调用单目标抓取”的接法已废弃；当前通过 ready/trigger/release 明确交接 `/cmd_vel`。
 
-文件顶部增加：
+该连续入口一键处理 `1,2,3,4`，物块之间不读取终端输入、不等待 Enter。旧命令即使仍带 `--wait-key-between-targets` 也会忽略该兼容参数并自动继续。
 
-```python
-import subprocess
-import sys
+## 4. 单个物块动作契约
+
+| ID | 类别 | 物资 |
+| ---: | --- | --- |
+| 1 | `power` | 应急电源 |
+| 2 | `fire` | 灭火装置 |
+| 3 | `gas` | 气体净化装置 |
+| 4 | `support` | 结构支撑装置 |
+
+```text
+从当前可见剩余目标中选择最左者
+-> 底盘慢速对准左侧抓取 ROI 并以4个新鲜帧确认
+-> 启动回零
+-> 回零后重新取得5个新鲜稳定定位观测
+-> 普通规划到示教预抓点 P 后方30mm
+-> 在该后方安全点开启限位检测
+-> 以5mm步长保持姿态受保护地直线伸到示教预抓点 P；途中触发立即停止
+-> 若尚未触发，再从 P 最多前探65mm，每2mm检查
+-> 收到精确限位消息 3\r\n 后停止剩余路点
+-> 确认限位后才开泵
+-> 沿原路径退到预抓点后方30mm
+-> carry -> 对应载物仓 -> idle
 ```
 
-在 `LaneFollower.__init__()` 增加：
+无论限位在“后方安全点到 P”途中还是 P 前方触发，吸附后都沿原轴直退到 P 后方 `30mm`。限位未触发时也先退到该位置，不得开泵或进入 carry。
 
-```python
-self.block_pick_process = None
-self.block_pick_target = None
-self.completed_block_picks = set()
+无 Tag 与有 Tag 都使用“P 后方30mm -> 开启限位 -> 受保护地到 P -> 未触发再前探 -> P 后方30mm”的安全动作语义。总调度不得直接操作泵串口、修改限位时序或增加自动重试。
+
+## 5. 结果和失败处理
+
+子进程原子写入：
+
+```json
+{"completed_ids": [1, 3, 4]}
 ```
 
-在类中增加：
+只有以下条件同时满足才成功：
 
-```python
-def start_block_pick(self, target_id):
-    target_id = int(target_id)
-    if (self.block_pick_process is not None
-            or target_id in self.completed_block_picks):
-        return False
-    self.publish(0, 0)
-    command = [
-        sys.executable,
-        "/home/eaibot/handeye-calib/src/block_pick_main.py",
-        "--target", str(target_id),
-        "--run-taught-block",
-        "--confidence", "0.5",
-        "--config",
-        "/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml",
-        "--preset-file",
-        "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json",
-    ]
-    self.block_pick_target = target_id
-    self.block_pick_process = subprocess.Popen(command)
-    self._set_state("ARM_PICK")
-    return True
+- 整批退出码为 `0`；
+- ID 均为 `1..4` 且不重复；
+- 数量严格等于 `--untagged-pick-count`。
 
-def handle_block_pick(self):
-    self.publish(0, 0)
-    result = self.block_pick_process.poll()
-    if result is None:
-        return
-    target = self.block_pick_target
-    self.block_pick_process = None
-    self.block_pick_target = None
-    if result == 0:
-        rospy.loginfo("无 Tag 目标 %d 抓放完成，恢复循迹", target)
-        self.completed_block_picks.add(target)
-        self.stop_hits = 0
-        self._set_state("FOLLOW")
-    else:
-        rospy.logerr("无 Tag 目标 %d 抓放失败，底盘保持停止", target)
-        self._set_state("PICK_FAILED")
+结果保存到 `untagged_inventory`。不能根据检测画面、目标顺序或计划数量猜库存。单目标返回码 `4` 表示限位未接触，但总调度层仍把未达到整批数量视为抓取失败。
+
+- 抓取失败：进入 `PICK_FAILED`，持续零速度，永久停车，不重试。
+- 投递失败：报警、记录 failed ID、继续循迹，不重试该 ID。
+
+## 6. 无 Tag 投递
+
+| 楼宇 | 库存 ID |
+| --- | ---: |
+| 电力故障 | 1 |
+| 火灾 | 2 |
+| 有毒气体 | 3 |
+| 坍塌 | 4 |
+
+只有 ID 存在于 `untagged_inventory` 且未在失败集合中，才调用：
+
+```bash
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode run_delivery \
+  --sequence <单个库存ID> \
+  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  --cargo-pick-file /home/eaibot/handeye-calib/config/delivery_presets.json \
+  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
+  --contact-release \
+  --force-release-on-contact-miss \
+  --contact-staging-gap 0.030 \
+  --contact-staging-step 0.005 \
+  --contact-probe-step 0.002 \
+  --contact-probe-max-travel 0.065
 ```
 
-在 `process()` 的状态分支中增加：
+机械臂启动前，状态机先用 `/dev/video2` 的原始 320×240 楼宇框复现该类标定停车位置。连续3个新鲜帧满足中心误差不超过5%、尺度达到标定值95%才进入投递；丢框、尺度超过110%或25秒超时立即停车并放弃。仓内抓取点共用 `delivery_presets.json`；无 Tag 中转点和四类独立 P 从 `untagged_delivery_presets.json` 读取。到 P 后方30mm开启限位，5mm步长到P，再以2mm步长最多前探65mm；释放后直退30mm再回 idle。
 
-```python
-elif self.state == "ARM_PICK":
-    self.handle_block_pick()
+走满65mm未触发时按已确认策略强制关泵并返回成功，库存会被消费；限位服务、串口或轨迹执行报错不会走强制释放，泵保持开启并返回投递失败。
 
-elif self.state == "PICK_FAILED":
-    self.publish(0, 0)
+## 7. 资源和数据边界
+
+默认托管模式下，总调度管理 Astra、无 Tag 子进程、任务 YOLO 切换以及必要时的机械臂公共栈。底盘可由一键准备脚本启动并作为外部常驻进程复用。
+
+正式比赛前推荐：
+
+```bash
+bash /home/eaibot/robocom_ws/src/zcy_last/比赛一键准备.sh
 ```
 
-循迹到达物资点并确认底盘停稳后，只调用一次：
+权威文件：
 
-```python
-if self.start_block_pick(1):  # 抓 power
-    return
+```text
+/home/eaibot/handeye-calib/src/block_pick_main.py
+/home/eaibot/handeye-calib/src/mirobot_pick_test.py
+/home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml
+/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
+/home/eaibot/handeye-calib/config/tag_pick_place_presets.json
+/home/eaibot/handeye-calib/config/untagged_delivery_presets.json
+/home/eaibot/handeye-calib/config/building_delivery_calibration.json
 ```
 
-## 4. 必须满足
+无 Tag 四类分别读取自己独立示教的预抓偏移、Link6 姿态、限位前进轴和入仓
+放置位姿，全部保存在 `block_mono_pick_place_presets.json` 对应类别中。
+有 Tag preset 不参与无 Tag 入仓放置。投递阶段的仓内抓取点仍按用户确认共用
+`delivery_presets.json`，不要拆分。总调度不得覆盖 preset、CameraInfo 或
+手眼标定结果。
 
-- 调用前先连续发布零速度，确认底盘完全停稳。
-- 物块中心必须已经进入无 Tag 红色 ROI；该单目标入口不会移动底盘找物块。
-- 四类抓取点、放置点、`carry_joint_values` 和 `idle_joint_values` 必须已经示教完成。
-- 抓取期间循迹主循环继续运行，但 `ARM_PICK` 状态只能发布零速度。
-- 同一个物资点要设置“已执行”标记，避免恢复 `FOLLOW` 后重复触发抓取。
+## 8. 排错入口
+
+日志：
+
+```text
+/home/eaibot/logs/zcy_last/<启动时间>/pick_untagged.log
+```
+
+按顺序分类：搜索模型未 ready -> 右侧未 trigger -> release/底盘所有权失败 -> 左侧对准失败 -> 定位失败 -> MoveIt 失败 -> 限位未触发 -> 退到预抓点后方 30mm 失败 -> 结果 JSON 异常。
+
+一次只处理一层；不要用新增超时、自动继续或堆叠偏移掩盖故障。

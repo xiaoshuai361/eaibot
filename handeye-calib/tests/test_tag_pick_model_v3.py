@@ -88,8 +88,8 @@ def test_version_2_migration_discards_fixed_z_grasp_but_preserves_place():
         legacy["tags"]["1"]["place_ee_in_base"])
 
 
-def test_constrained_grasp_uses_tag_xyz_but_fixed_orientation():
-    compute, = load_module_symbols("compute_constrained_grasp_pose")
+def test_taught_pre_grasp_uses_tag_xyz_but_fixed_orientation():
+    compute, = load_module_symbols("compute_taught_pre_grasp_pose")
     preset = v3_preset()
     root_half = 2 ** 0.5 / 2.0
     noisy_rotated_tag = make_pose(
@@ -112,18 +112,16 @@ def test_constrained_grasp_uses_tag_xyz_but_fixed_orientation():
     ] == pytest.approx([0.1 / norm, -0.2 / norm, 0.3 / norm, 0.9 / norm])
 
 
-def test_constrained_pregrasp_uses_fixed_base_approach_axis():
-    compute, build_pre = load_module_symbols(
-        "compute_constrained_grasp_pose",
-        "build_constrained_pre_grasp_pose")
+def test_staging_backoff_uses_fixed_base_approach_axis():
+    compute, build_backoff = load_module_symbols(
+        "compute_taught_pre_grasp_pose",
+        "build_backoff_pose")
     preset = v3_preset()
     grasp = compute(
         make_pose(0.25, 0.10, 0.2),
         preset["pickup_model"], preset["tags"]["1"], "base")
 
-    pre = build_pre(
-        grasp, preset["pickup_model"], approach_gap=0.03,
-        base_frame="base")
+    pre = build_backoff(grasp, preset["pickup_model"], 0.03, "base")
 
     assert pre.pose.position.x == pytest.approx(grasp.pose.position.x - 0.03)
     assert pre.pose.position.y == pytest.approx(grasp.pose.position.y)
@@ -131,7 +129,7 @@ def test_constrained_pregrasp_uses_fixed_base_approach_axis():
 
 
 def test_tag_z_translation_moves_grasp_z_by_same_amount():
-    compute, = load_module_symbols("compute_constrained_grasp_pose")
+    compute, = load_module_symbols("compute_taught_pre_grasp_pose")
     preset = v3_preset()
 
     low = compute(

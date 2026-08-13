@@ -2,6 +2,7 @@
 #include <actionlib/server/simple_action_server.h>
 #include <control_msgs/FollowJointTrajectoryAction.h>
 #include <serial/serial.h>
+#include <std_srvs/SetBool.h>
 #include <std_srvs/Trigger.h>
 #include <mirobot_urdf_2/mirobotPump.h>
 #include <sensor_msgs/JointState.h>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -33,6 +35,7 @@ namespace
 	double g_pose_query_timeout_seconds = 0.40;
 	double g_pose_query_poll_seconds = 0.02;
 	int g_arm_feedrate = 1200;
+	int g_contact_probe_feedrate = 1200;
 	double g_trajectory_completion_timeout_seconds = 15.0;
 	double g_trajectory_completion_poll_seconds = 0.15;
 	double g_trajectory_goal_tolerance_rad = 0.05;
@@ -40,11 +43,18 @@ namespace
 	const size_t kTrajectoryWaypointStride = 4;
 	const size_t kFinalTargetRepeats = 3;
 	const double kSparseWaypointSleepSeconds = 0.15;
+	const double kContactProbeWaypointSleepSeconds = 0.02;
+	const double kContactProbeCompletionPollSeconds = 0.03;
 	const std::string kPumpOnCommand("1");
 	const std::string kPumpOffCommand("2");
+	const std::string kContactTriggeredFrame("3\r\n");
 	boost::mutex g_arm_serial_mutex;
+	boost::mutex g_pump_serial_mutex;
 	boost::mutex g_execution_state_mutex;
 	bool g_executing_trajectory = false;
+	bool g_contact_probe_armed = false;
+	bool g_contact_triggered = false;
+	std::string g_pump_rx_buffer;
 	ros::Time g_next_pose_query_time;
 
 	void setExecutingTrajectory(bool executing)
@@ -189,10 +199,76 @@ namespace
 		{
 			g_pump_serial.read(g_pump_serial.available());
 		}
+		g_pump_rx_buffer.clear();
+	}
+
+	void consumePumpSerialFrames()
+	{
+		if (!g_pump_serial.isOpen())
+		{
+			return;
+		}
+
+		if (g_pump_serial.available())
+		{
+			g_pump_rx_buffer += g_pump_serial.read(g_pump_serial.available());
+		}
+
+		size_t newline = g_pump_rx_buffer.find('\n');
+		while (newline != std::string::npos)
+		{
+			const std::string frame = g_pump_rx_buffer.substr(0, newline + 1);
+			g_pump_rx_buffer.erase(0, newline + 1);
+			if (g_contact_probe_armed && frame == kContactTriggeredFrame)
+			{
+				g_contact_triggered = true;
+				ROS_INFO("Suction contact limit switch triggered.");
+			}
+			newline = g_pump_rx_buffer.find('\n');
+		}
+
+		if (g_pump_rx_buffer.size() > 256)
+		{
+			ROS_WARN("Discarding oversized partial pump-controller frame.");
+			g_pump_rx_buffer.clear();
+		}
+	}
+
+	int activeArmFeedrate()
+	{
+		boost::mutex::scoped_lock lock(g_pump_serial_mutex);
+		return g_contact_probe_armed ? g_contact_probe_feedrate : g_arm_feedrate;
+	}
+
+	bool isContactProbeArmed()
+	{
+		boost::mutex::scoped_lock lock(g_pump_serial_mutex);
+		return g_contact_probe_armed;
+	}
+
+	bool readContactTriggered(bool *triggered)
+	{
+		boost::mutex::scoped_lock lock(g_pump_serial_mutex);
+		try
+		{
+			if (!ensurePumpSerialOpen())
+			{
+				return false;
+			}
+			consumePumpSerialFrames();
+			*triggered = g_contact_triggered;
+			return true;
+		}
+		catch (const std::exception &exc)
+		{
+			ROS_ERROR_STREAM("Contact switch serial read failed: " << exc.what());
+			return false;
+		}
 	}
 
 	bool sendPumpCommand(const std::string &command, std::string *response)
 	{
+		boost::mutex::scoped_lock lock(g_pump_serial_mutex);
 		if (!ensurePumpSerialOpen())
 		{
 			return false;
@@ -215,6 +291,7 @@ namespace
 
 	void closePumpSerialIfOpen()
 	{
+		boost::mutex::scoped_lock lock(g_pump_serial_mutex);
 		if (g_pump_serial.isOpen())
 		{
 			g_pump_serial.close();
@@ -427,7 +504,8 @@ namespace
 
 	bool waitForFirmwareTarget(
 		const std::vector<double> &target_positions,
-		const ros::Publisher &joint_pub)
+		const ros::Publisher &joint_pub,
+		double poll_seconds)
 	{
 		const ros::Time deadline = ros::Time::now() + ros::Duration(
 			g_trajectory_completion_timeout_seconds);
@@ -437,8 +515,7 @@ namespace
 			if (!queryCurrentPoseUnlocked(
 					&pose, g_pose_query_timeout_seconds))
 			{
-				ros::Duration(
-					g_trajectory_completion_poll_seconds).sleep();
+				ros::Duration(poll_seconds).sleep();
 				continue;
 			}
 			publishMeasuredJointState(pose, joint_pub);
@@ -464,13 +541,67 @@ namespace
 					error.measured, error.target);
 				return false;
 			}
-			ros::Duration(g_trajectory_completion_poll_seconds).sleep();
+			ros::Duration(poll_seconds).sleep();
 		}
 		markPoseQueryMiss();
 		ROS_ERROR(
 			"Timed out after %.1fs waiting for Mirobot firmware Idle at the target.",
 			g_trajectory_completion_timeout_seconds);
 		return false;
+	}
+
+	bool executeContactProbeTrajectory(
+		const control_msgs::FollowJointTrajectoryGoalConstPtr &goal_ptr,
+		Server *moveit_server,
+		const ros::Publisher &joint_pub,
+		const char *feedrate)
+	{
+		const size_t point_count = goal_ptr->trajectory.points.size();
+		for (size_t index = 1; index < point_count; ++index)
+		{
+			if (moveit_server->isPreemptRequested() || !ros::ok())
+			{
+				moveit_server->setPreempted();
+				return false;
+			}
+
+			bool triggered = false;
+			if (!readContactTriggered(&triggered))
+			{
+				ROS_ERROR("Aborting contact probe because the contact serial read failed.");
+				return false;
+			}
+			if (triggered)
+			{
+				ROS_INFO("Contact probe stopped before the next guarded waypoint.");
+				return true;
+			}
+
+			const trajectory_msgs::JointTrajectoryPoint &point =
+				goal_ptr->trajectory.points[index];
+			std::vector<double> target_positions(
+				point.positions.begin(), point.positions.begin() + 6);
+			sendArmCommand(target_positions, feedrate);
+			ros::Duration(kContactProbeWaypointSleepSeconds).sleep();
+			if (!waitForFirmwareTarget(
+					target_positions, joint_pub,
+					kContactProbeCompletionPollSeconds))
+			{
+				return false;
+			}
+
+			if (!readContactTriggered(&triggered))
+			{
+				ROS_ERROR("Aborting contact probe because the contact serial read failed.");
+				return false;
+			}
+			if (triggered)
+			{
+				ROS_INFO("Contact probe stopped at the current guarded waypoint.");
+				return true;
+			}
+		}
+		return true;
 	}
 
 	void measuredJointStateTimer(const ros::TimerEvent &, ros::Publisher *joint_pub)
@@ -558,7 +689,12 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 	}
 
 	char feedrate[16];
-	sprintf(feedrate, "%d", g_arm_feedrate);
+	sprintf(feedrate, "%d", activeArmFeedrate());
+	const bool contact_probe_active = isContactProbeArmed();
+	const size_t final_target_repeats = kFinalTargetRepeats;
+	const double waypoint_sleep_seconds = kSparseWaypointSleepSeconds;
+	const double completion_poll_seconds =
+		g_trajectory_completion_poll_seconds;
 	std::vector<double> target_positions(6, 0.0);
 
 	const size_t n_tra_points = goalPtr->trajectory.points.size();
@@ -581,6 +717,20 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 			return;
 		}
 	}
+	if (contact_probe_active)
+	{
+		if (!executeContactProbeTrajectory(
+				goalPtr, moveit_server, *joint_pub, feedrate))
+		{
+			if (!moveit_server->isPreemptRequested())
+			{
+				moveit_server->setAborted();
+			}
+			return;
+		}
+		moveit_server->setSucceeded();
+		return;
+	}
 
 	for (size_t index = 0; index < n_tra_points; ++index)
 	{
@@ -600,14 +750,14 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 		std::vector<double> commanded_positions(
 			point.positions.begin(), point.positions.begin() + 6);
 		sendArmCommand(commanded_positions, feedrate);
-		ros::Duration(kSparseWaypointSleepSeconds).sleep();
+		ros::Duration(waypoint_sleep_seconds).sleep();
 	}
 
 	const trajectory_msgs::JointTrajectoryPoint &final_point =
 		goalPtr->trajectory.points[n_tra_points - 1];
 	target_positions.assign(
 		final_point.positions.begin(), final_point.positions.begin() + 6);
-	for (size_t repeat = 0; repeat < kFinalTargetRepeats; ++repeat)
+	for (size_t repeat = 0; repeat < final_target_repeats; ++repeat)
 	{
 		if (moveit_server->isPreemptRequested() || !ros::ok())
 		{
@@ -616,10 +766,11 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 			return;
 		}
 		sendArmCommand(target_positions, feedrate);
-		ros::Duration(kSparseWaypointSleepSeconds).sleep();
+		ros::Duration(waypoint_sleep_seconds).sleep();
 	}
 
-	if (!waitForFirmwareTarget(target_positions, *joint_pub))
+	if (!waitForFirmwareTarget(
+			target_positions, *joint_pub, completion_poll_seconds))
 	{
 		moveit_server->setAborted();
 		return;
@@ -638,6 +789,13 @@ void execute_callback(const control_msgs::FollowJointTrajectoryGoalConstPtr &goa
 bool toggle_pump(mirobot_urdf_2::mirobotPump::Request &req,
 				 mirobot_urdf_2::mirobotPump::Response &res)
 {
+	if (req.Status && isContactProbeArmed())
+	{
+		ROS_ERROR("Rejecting pump ON while the contact probe is armed.");
+		res.Sucess = false;
+		return true;
+	}
+
 	std::string pump_response;
 	const std::string &pump_command = req.Status ? kPumpOnCommand : kPumpOffCommand;
 
@@ -648,6 +806,66 @@ bool toggle_pump(mirobot_urdf_2::mirobotPump::Request &req,
 	}
 
 	res.Sucess = true;
+	return true;
+}
+
+bool set_contact_probe_enabled(std_srvs::SetBool::Request &req,
+							   std_srvs::SetBool::Response &res)
+{
+	boost::mutex::scoped_lock lock(g_pump_serial_mutex);
+	try
+	{
+		if (!ensurePumpSerialOpen())
+		{
+			res.success = false;
+			res.message = "Could not open pump controller serial port.";
+			return true;
+		}
+
+		if (req.data)
+		{
+			clearPumpSerialInput();
+			g_contact_triggered = false;
+			g_contact_probe_armed = true;
+			res.message = "Contact probe armed; stale serial input cleared.";
+		}
+		else
+		{
+			g_contact_probe_armed = false;
+			res.message = "Contact probe disarmed.";
+		}
+		res.success = true;
+	}
+	catch (const std::exception &exc)
+	{
+		res.success = false;
+		res.message = std::string("Pump controller serial error: ") + exc.what();
+	}
+	return true;
+}
+
+bool get_contact_state(std_srvs::Trigger::Request &req,
+					   std_srvs::Trigger::Response &res)
+{
+	(void)req;
+	boost::mutex::scoped_lock lock(g_pump_serial_mutex);
+	try
+	{
+		if (!ensurePumpSerialOpen())
+		{
+			res.success = false;
+			res.message = "ERROR: pump controller serial port is unavailable.";
+			return true;
+		}
+		consumePumpSerialFrames();
+		res.success = g_contact_triggered;
+		res.message = g_contact_triggered ? "TRIGGERED" : "NOT_TRIGGERED";
+	}
+	catch (const std::exception &exc)
+	{
+		res.success = false;
+		res.message = std::string("ERROR: pump controller serial read failed: ") + exc.what();
+	}
 	return true;
 }
 
@@ -691,6 +909,7 @@ int main(int argc, char *argv[])
 	private_nh.param("joint_state_publish_hz", g_joint_state_publish_hz, 5.0);
 	private_nh.param("pose_query_timeout_seconds", g_pose_query_timeout_seconds, 0.40);
 	private_nh.param("arm_feedrate", g_arm_feedrate, 1200);
+	private_nh.param("contact_probe_feedrate", g_contact_probe_feedrate, 1200);
 	private_nh.param("trajectory_completion_timeout_seconds", g_trajectory_completion_timeout_seconds, 15.0);
 	private_nh.param("trajectory_completion_poll_seconds", g_trajectory_completion_poll_seconds, 0.15);
 	private_nh.param("trajectory_goal_tolerance_rad", g_trajectory_goal_tolerance_rad, 0.05);
@@ -707,6 +926,10 @@ int main(int argc, char *argv[])
 	if (g_arm_feedrate < 1)
 	{
 		g_arm_feedrate = 1200;
+	}
+	if (g_contact_probe_feedrate < 1)
+	{
+		g_contact_probe_feedrate = 1200;
 	}
 	if (g_trajectory_completion_timeout_seconds < 1.0)
 	{
@@ -739,6 +962,10 @@ int main(int argc, char *argv[])
 						 boost::bind(&execute_callback, _1, &moveit_server, &joint_pub), false);
 	moveit_server.start();
 	ros::ServiceServer service = nh.advertiseService("switch_pump_status", toggle_pump);
+	ros::ServiceServer contact_probe_service = nh.advertiseService(
+		"mirobot_contact_probe_enable", set_contact_probe_enabled);
+	ros::ServiceServer contact_state_service = nh.advertiseService(
+		"mirobot_contact_state", get_contact_state);
 	ros::ServiceServer startup_home_service = nh.advertiseService("mirobot_startup_home", trigger_startup_home);
 
 	ros::AsyncSpinner spinner(2);

@@ -65,7 +65,6 @@ rgb_timeout: 5.0
 camera_frame: camera_rgb_optical_frame
 base_frame: base
 tf_timeout: 5.0
-
 distance_models:
   # calibrated 模式分别拟合 Z=a/框宽+b 和 Z=a/框高+b，再取中位数。
   power:
@@ -85,9 +84,21 @@ distance_models:
 max_axis_distance_disagreement_mm: 0.0
 
 fixed_z_mm: 330.0
-# 示教时自动停在检测目标表面前 110mm，再由 RViz 移动到接触姿态。
-teach_assist_distance_mm: 110.0
-pregrasp_distance_mm: 80.0
+# 无 Tag 示教时先自动停在检测目标表面前 85mm，再由 RViz 微调并保存未接触预抓点 P。
+teach_assist_distance_mm: 85.0
+# 正式抓取先规划到 P 后方 30mm，再保持姿态直线移动到 P。
+approach_gap_mm: 30.0
+# 视觉和示教只负责把吸盘送到 P；限位开关决定真实接触位置。
+contact_probe:
+  max_travel_mm: 65.0
+  # P 后方安全点到 P：限位已开启，但使用较大的直线采样步长。
+  staging_step_mm: 5.0
+  # 从 P 继续寻找真实接触点时保持精细步长。
+  step_mm: 2.0
+  point_interval_seconds: 0.5
+  poll_seconds: 0.02
+  # 吸附后沿原接近轴退到预抓点后方 30mm，再进行搬运规划。
+  retreat_extra_mm: 30.0
 velocity_scale: 0.05
 acceleration_scale: 0.05
 planning_time: 5.0

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""九路口比赛任务唯一启动入口。"""
+"""九路口比赛任务入口；底盘可由外部启动或由 launch.py 托管。"""
 
 import argparse
+import inspect
 import sys
 
 import rospy
@@ -11,6 +12,32 @@ from . import config
 from .control.grasp import GraspCoordinator
 from .control.processes import ProcessSupervisor
 from .task.competition import LaneFollower
+
+
+def validate_runtime_interfaces():
+    """在启动相机和机械臂前检查 zcy_last 是否混入旧模块。"""
+    required = {
+        "grasp_coordinator",
+        "process_supervisor",
+        "enable_tag_pick",
+        "tag_pick_count",
+        "enable_tag_delivery",
+        "enable_untagged_pick",
+        "untagged_pick_count",
+        "enable_untagged_delivery",
+    }
+    signature = inspect.signature(LaneFollower.__init__)
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+           for parameter in signature.parameters.values()):
+        return
+    parameters = set(signature.parameters)
+    missing = sorted(required - parameters)
+    if missing:
+        raise RuntimeError(
+            "zcy_last 模块版本不一致："
+            "task/competition.py 缺少参数 %s。"
+            "请完整同步 /home/eaibot/robocom_ws/src/zcy_last/，"
+            "不要只替换单个文件。" % ", ".join(missing))
 
 
 def parse_args(argv=None):
@@ -65,38 +92,52 @@ def parse_args(argv=None):
     return options, ros_args
 
 
-def main(argv=None):
-    options, ros_args = parse_args(argv)
+def run_competition(options, ros_args, supervisor):
+    """复用 launch.py 的常驻依赖并运行比赛状态机。"""
     sys.argv = [sys.argv[0]] + list(ros_args)
+    print(
+        "[zcy_last] 任务配置：Tag抓取=%s 数量=%d Tag投递=%s "
+        "无Tag抓取=%s 数量=%d 无Tag投递=%s" % (
+            options.tag_pick, options.tag_pick_count,
+            options.tag_delivery, options.untagged_pick,
+            options.untagged_pick_count, options.untagged_delivery,
+        ),
+        flush=True,
+    )
+    if options.tag_pick:
+        supervisor.start_astra()
+        supervisor.start_tag_stack()
+
+    coordinator = GraspCoordinator(
+        supervisor,
+        keep_arm_after_tag=(
+            options.tag_delivery or options.untagged_pick),
+        keep_arm_after_untagged=options.untagged_delivery,
+        python3=sys.executable,
+    )
+    follower = LaneFollower(
+        grasp_coordinator=coordinator,
+        process_supervisor=supervisor,
+        enable_tag_pick=options.tag_pick,
+        tag_pick_count=options.tag_pick_count,
+        enable_tag_delivery=options.tag_delivery,
+        enable_untagged_pick=options.untagged_pick,
+        untagged_pick_count=options.untagged_pick_count,
+        enable_untagged_delivery=options.untagged_delivery,
+    )
+    follower.run()
+
+
+def main(argv=None):
+    """任务入口：复用 launch.py 常驻依赖，按任务开关托管阶段资源。"""
+    options, ros_args = parse_args(argv)
+    validate_runtime_interfaces()
     supervisor = ProcessSupervisor(
         enabled=config.MANAGE_ROS_PROCESSES and not options.external_ros,
         python3=sys.executable,
     )
     try:
-        supervisor.require_external_base()
-        if options.tag_pick or options.untagged_pick:
-            supervisor.start_arm_common()
-        if options.tag_pick:
-            supervisor.start_astra()
-            supervisor.start_tag_stack()
-        coordinator = GraspCoordinator(
-            supervisor,
-            keep_arm_after_tag=(
-                options.tag_delivery or options.untagged_pick),
-            keep_arm_after_untagged=options.untagged_delivery,
-            python3=sys.executable,
-        )
-        follower = LaneFollower(
-            grasp_coordinator=coordinator,
-            process_supervisor=supervisor,
-            enable_tag_pick=options.tag_pick,
-            tag_pick_count=options.tag_pick_count,
-            enable_tag_delivery=options.tag_delivery,
-            enable_untagged_pick=options.untagged_pick,
-            untagged_pick_count=options.untagged_pick_count,
-            enable_untagged_delivery=options.untagged_delivery,
-        )
-        follower.run()
+        run_competition(options, ros_args, supervisor)
     finally:
         supervisor.shutdown()
 
