@@ -98,8 +98,8 @@ def parse_args(argv):
     parser.add_argument(
         '--cargo-pick-file', default=None,
         help=(
-            '载物仓抓取点配置；省略时继续从 --delivery-file 读取。'
-            '可让不同投递轨迹共用同一组 ID1~4 仓内抓取点。'))
+            '共享载物仓抓取点和中转点配置；省略时继续从 '
+            '--delivery-file 读取。'))
     parser.add_argument('--tag-preset-file', default=DEFAULT_TAG_PRESET_FILE)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--group', default='manipulator')
@@ -249,10 +249,12 @@ def load_idle_joint_values(path):
         preset.get('idle_joint_values'), 'idle_joint_values')
 
 
-def require_delivery_items(preset, sequence, cargo_pick_preset=None,
+def require_delivery_items(preset, sequence, shared_motion_preset=None,
                            contact_release=False):
+    shared_motion_preset = shared_motion_preset or preset
     transit = validate_joint_values(
-        preset.get('transit_joint_values'), 'transit_joint_values')
+        shared_motion_preset.get('transit_joint_values'),
+        'transit_joint_values')
     release = None
     contact_targets = preset.get('contact_delivery_targets_by_id', {})
     if not contact_release:
@@ -261,8 +263,8 @@ def require_delivery_items(preset, sequence, cargo_pick_preset=None,
     shared_contact_target = contact_targets.get('1')
     if contact_release and not isinstance(shared_contact_target, dict):
         raise RuntimeError('缺少共享接触投递点，请先示教 ID1。')
-    cargo_source = cargo_pick_preset or preset
-    cargo_points = cargo_source.get('cargo_pick_joint_values_by_id', {})
+    cargo_points = shared_motion_preset.get(
+        'cargo_pick_joint_values_by_id', {})
     result = {}
     for item_id in sequence:
         key = str(item_id)
@@ -481,11 +483,11 @@ def run_delivery(args, arm, pump_proxy):
     cargo_pick_file = (
         getattr(args, 'cargo_pick_file', None) or args.delivery_file)
     if os.path.abspath(cargo_pick_file) == os.path.abspath(args.delivery_file):
-        cargo_pick_preset = preset
+        shared_motion_preset = preset
     else:
-        cargo_pick_preset = load_delivery_preset(cargo_pick_file)
+        shared_motion_preset = load_delivery_preset(cargo_pick_file)
     items = require_delivery_items(
-        preset, args.sequence, cargo_pick_preset=cargo_pick_preset,
+        preset, args.sequence, shared_motion_preset=shared_motion_preset,
         contact_release=contact_release)
     idle_joint_values = load_idle_joint_values(args.tag_preset_file)
     if args.dry_run:

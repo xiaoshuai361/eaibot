@@ -479,13 +479,14 @@ ID1 保存为四类楼宇共享的 P；ID2～4 正式投递时也读取这一个
 
 ### 9.4 单类空载验证接触投递动作
 
-先确认共享仓内抓取点、无 Tag 中转点以及共享 P 已经示教。验证时可以不
+先确认 `delivery_presets.json` 中的共享仓内抓取点和中转点，以及楼宇共享 P
+已经示教。验证时可以不
 在载物仓放物资，让吸泵空吸，只检查运动、限位和退回顺序：
 
 ```bash
 python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
   --mode run_delivery \
-  --sequence 2 \
+  --sequence 1 \
   --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
   --cargo-pick-file /home/eaibot/handeye-calib/config/delivery_presets.json \
   --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
