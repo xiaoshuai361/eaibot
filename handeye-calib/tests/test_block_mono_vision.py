@@ -1,4 +1,3 @@
-import json
 import math
 import sys
 from pathlib import Path
@@ -18,12 +17,10 @@ from block_mono_vision import (
     estimate_distance_from_box_mm,
     estimate_distance_mm,
     is_detection_usable,
-    load_external_distance_calibration,
     observation_in_roi,
     parse_target_sequence,
     resolve_target_alias,
     roi_box_pixels,
-    scale_box_width_for_distance,
     stable_median_observation,
 )
 
@@ -36,26 +33,6 @@ def test_default_config_is_loaded_from_the_canonical_yaml():
 def test_default_grasp_uses_same_five_stable_samples_as_tag_workflow():
     assert DEFAULT_CONFIG["frames_required"] == 5
     assert DEFAULT_CONFIG["max_axis_distance_disagreement_mm"] == 0.0
-
-
-def test_building_teach_config_maps_all_four_building_classes():
-    path = Path(DEFAULT_CONFIG_PATH).with_name("building_delivery_teach.yaml")
-    with path.open(encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-
-    assert config["frames_required"] == 5
-    assert config["teach_assist_distance_mm"] == pytest.approx(40.0)
-    assert config["teach_assist_base_z_mm"] == pytest.approx(120.0)
-    assert config["grasp_roi_ratio"] == [0.17, 0.0, 0.54, 1.0]
-    assert {
-        target: (entry["target_id"], entry["class_id"])
-        for target, entry in config["target_classes"].items()
-    } == {
-        "power": (1, 1),
-        "fire": (2, 2),
-        "gas": (3, 3),
-        "support": (4, 0),
-    }
 
 
 def test_numeric_target_ids_map_to_existing_block_targets():
@@ -293,41 +270,6 @@ def test_deproject_pixel_to_camera_mm_uses_rgb_intrinsics():
     )
 
     assert point == pytest.approx((5.0, 6.0, 300.0))
-
-
-def test_building_distance_model_loads_by_id_and_scales_640_box_to_320(tmp_path):
-    path = tmp_path / "building.json"
-    path.write_text(json.dumps({
-        "version": 3,
-        "frame_width": 320,
-        "targets": {
-            "2": {
-                "class_name": "Fire Building",
-                "min_distance_mm": 350.0,
-                "max_distance_mm": 600.0,
-                "width": {"a": 20000.0, "b": 50.0},
-            },
-        },
-    }), encoding="utf-8")
-    config = load_external_distance_calibration({
-        "distance_calibration_file": str(path),
-        "target_classes": {
-            "fire": {
-                "target_id": 2,
-                "class_name": "Fire Building",
-            },
-        },
-    })
-
-    width_px = scale_box_width_for_distance(
-        100.0, 640, config["distance_model_frame_width"])
-    distance = estimate_distance_from_box_mm(
-        "calibrated", width_px, 200.0, 600.0, 600.0,
-        1.0, 1.0, "fire", config["distance_models"])
-
-    assert width_px == pytest.approx(50.0)
-    assert distance == pytest.approx(450.0)
-    assert config["distance_ranges_mm"]["fire"] == [350.0, 600.0]
 
 
 def test_decode_yolov5_output_uses_objectness_times_class_probability():

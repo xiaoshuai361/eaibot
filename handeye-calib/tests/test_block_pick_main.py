@@ -171,40 +171,6 @@ def test_build_child_command_forwards_taught_block_actions():
     assert "--overwrite" in teach_command
 
 
-def test_building_contact_teach_forwards_delivery_and_block_presets():
-    parsed = args(
-        "--teach-building-contact-release",
-        "--preset-file", "/tmp/block_presets.json",
-        "--delivery-file", "/tmp/delivery_presets.json",
-        "--overwrite",
-    )
-
-    main.validate_runtime_args(parsed, {"distance_method": "calibrated"})
-    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
-
-    assert "--teach-building-contact-release" in command
-    assert command[command.index("--preset-file") + 1] == \
-        "/tmp/block_presets.json"
-    assert command[command.index("--delivery-file") + 1] == \
-        "/tmp/delivery_presets.json"
-    assert "--overwrite" in command
-
-
-def test_building_teach_assist_constrains_position_only():
-    source = Path(main.__file__).with_name(
-        "mirobot_pick_test.py").read_text(encoding="utf-8")
-    execute_start = source.index("def execute_pose")
-    execute_source = source[
-        execute_start:source.index("\ndef ", execute_start + 1)]
-    start = source.index("def teach_building_contact_release")
-    function_source = source[start:source.index("\ndef ", start + 1)]
-
-    assert "arm.set_position_target" in execute_source
-    assert "position_only=True" in function_source
-    assert 'config["teach_assist_base_z_mm"]' in function_source
-    assert 'pickup_model["orientation_xyzw_base"]' not in function_source
-
-
 def test_chassis_sequence_is_targetless_and_ignores_legacy_wait_option():
     parsed = main.parse_args([
         "--run-chassis-sequence",
@@ -315,12 +281,10 @@ def test_interactive_teaching_has_no_fixed_child_timeout():
         "--teach-block-place",
         "--teach-block-idle",
         "--teach-block-carry",
-        "--teach-building-contact-release",
     ):
         argv = [option]
         if option in ("--teach-block-pick-place", "--teach-block-pregrasp",
-                      "--teach-block-place",
-                      "--teach-building-contact-release"):
+                      "--teach-block-place"):
             argv = ["--target", "1", option]
         parsed = main.parse_args(argv)
         assert main.child_wait_timeout(parsed) is None

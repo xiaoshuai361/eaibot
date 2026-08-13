@@ -82,6 +82,7 @@ def test_parse_args_defaults_to_three_point_delivery_workflow():
     assert args.delivery_file.endswith("/config/delivery_presets.json")
     assert args.cargo_pick_file is None
     assert args.tag_preset_file.endswith("/config/tag_pick_place_presets.json")
+    assert args.camera_frame == "camera_rgb_optical_frame"
     assert args.velocity_scale == pytest.approx(0.2)
     assert args.acceleration_scale == pytest.approx(0.2)
 
@@ -246,6 +247,64 @@ def test_cargo_pick_teach_writes_only_the_shared_cargo_file(tmp_path):
     assert shared["cargo_pick_joint_values_by_id"]["3"] == pytest.approx(
         [1, 2, 3, 4, 5, 6])
     assert "3" not in unchanged_motion["cargo_pick_joint_values_by_id"]
+
+
+def test_camera_safe_axis_is_opposite_camera_forward():
+    camera_safe_axis_in_base, = load_symbols("camera_safe_axis_in_base")
+    calls = []
+
+    class Listener:
+        def waitForTransform(self, base, camera, stamp, timeout):
+            calls.append((base, camera))
+
+        def lookupTransform(self, base, camera, stamp):
+            return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
+
+    camera_safe_axis_in_base.__globals__.update({
+        "rospy": SimpleNamespace(
+            Time=lambda value: value, Duration=lambda value: value),
+        "tf": SimpleNamespace(
+            TransformListener=Listener,
+            transformations=SimpleNamespace(quaternion_matrix=lambda value: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ])),
+    })
+
+    axis = camera_safe_axis_in_base("base", "camera", 5.0)
+
+    assert calls == [("base", "camera")]
+    assert axis == pytest.approx([0.0, 0.0, -1.0])
+
+
+def test_contact_release_teach_saves_one_manual_pose_per_id(tmp_path):
+    teach_contact_release, load_delivery_preset = load_symbols(
+        "teach_contact_release", "load_delivery_preset")
+    prompts = []
+    path = tmp_path / "untagged_delivery.json"
+    arm = SimpleNamespace(
+        get_current_joint_values=lambda: [1, 2, 3, 4, 5, 6])
+    teach_contact_release.__globals__.update({
+        "camera_safe_axis_in_base": lambda *items: [-1.0, 0.0, 0.0],
+        "prompt_enter": lambda message: prompts.append(message),
+        "rospy": SimpleNamespace(
+            sleep=lambda seconds: None, loginfo=lambda *items: None),
+    })
+    args = SimpleNamespace(
+        delivery_file=str(path), sequence=[2], overwrite=False,
+        teach_settle_seconds=0.8, base_frame="base",
+        camera_frame="camera", tf_timeout=5.0)
+
+    teach_contact_release(args, arm)
+    saved = load_delivery_preset(str(path))
+
+    assert len(prompts) == 1
+    assert saved["contact_delivery_targets_by_id"]["2"] == {
+        "precontact_joint_values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
+    }
 
 
 def test_run_delivery_orders_home_pump_three_points_and_shared_idle(tmp_path):

@@ -18,6 +18,7 @@ if sys.version_info[0] != 2:
 
 import moveit_commander
 import rospy
+import tf
 
 import mirobot_pick_test_tag as arm_api
 
@@ -90,7 +91,7 @@ def parse_args(argv):
     parser.add_argument(
         '--mode',
         choices=['teach_cargo_pick', 'teach_transit', 'teach_release',
-                 'run_delivery'],
+                 'teach_contact_release', 'run_delivery'],
         required=True)
     parser.add_argument('--sequence', default=DEFAULT_SEQUENCE)
     parser.add_argument('--delivery-file', default=DEFAULT_DELIVERY_FILE)
@@ -103,6 +104,8 @@ def parse_args(argv):
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--group', default='manipulator')
     parser.add_argument('--base-frame', default='base')
+    parser.add_argument('--camera-frame', default='camera_rgb_optical_frame')
+    parser.add_argument('--tf-timeout', type=float, default=5.0)
     parser.add_argument('--planning-time', type=float, default=2.0)
     parser.add_argument('--disable-replanning', action='store_true')
     parser.add_argument('--velocity-scale', type=float, default=0.2)
@@ -134,6 +137,7 @@ def parse_args(argv):
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     positive(args.planning_time, '--planning-time')
+    positive(args.tf_timeout, '--tf-timeout')
     positive(args.velocity_scale, '--velocity-scale')
     positive(args.acceleration_scale, '--acceleration-scale')
     nonnegative(args.teach_settle_seconds, '--teach-settle-seconds')
@@ -300,6 +304,19 @@ def record_current_joints(arm, settle_seconds):
         list(arm.get_current_joint_values()), '当前关节角')
 
 
+def camera_safe_axis_in_base(base_frame, camera_frame, timeout_seconds):
+    listener = tf.TransformListener()
+    listener.waitForTransform(
+        base_frame, camera_frame, rospy.Time(0),
+        rospy.Duration(timeout_seconds))
+    _translation, quaternion = listener.lookupTransform(
+        base_frame, camera_frame, rospy.Time(0))
+    rotation = tf.transformations.quaternion_matrix(quaternion)
+    return normalize_axis(
+        [-rotation[0][2], -rotation[1][2], -rotation[2][2]],
+        '相机后退方向')
+
+
 def home_joint_state_is_ready(values, tolerance_rad=HOME_JOINT_TOLERANCE_RAD):
     try:
         joints = validate_joint_values(list(values), '回零关节状态')
@@ -418,6 +435,32 @@ def teach_delivery_point(args, arm):
         rospy.loginfo('ID%d %s已保存：%s', item_id, label,
                       cargo_points[key])
     rospy.loginfo('共享载物仓抓取点配置已保存：%s', cargo_pick_file)
+
+
+def teach_contact_release(args, arm):
+    preset = load_delivery_preset(args.delivery_file, allow_missing=True)
+    targets = preset['contact_delivery_targets_by_id']
+    safe_axis = camera_safe_axis_in_base(
+        args.base_frame, args.camera_frame, args.tf_timeout)
+    for index, item_id in enumerate(args.sequence, 1):
+        key = str(item_id)
+        if key in targets and not args.overwrite:
+            raise RuntimeError(
+                'ID%d 已有接触投递点，重采时请加 --overwrite。' % item_id)
+        prompt_enter(
+            '示教 ID%d（%d/%d）：预投递点 P\n'
+            '请把车辆放在450mm参考距离，再在RViz中将吸盘移动到'
+            '靠近、正对但不接触对应楼面的姿态。' %
+            (item_id, index, len(args.sequence)))
+        targets[key] = {
+            'precontact_joint_values': record_current_joints(
+                arm, args.teach_settle_seconds),
+            'approach_axis_xyz_base': list(safe_axis),
+        }
+        save_delivery_preset(args.delivery_file, preset)
+        rospy.loginfo(
+            'ID%d 预投递点P已保存：joints=%s safe_axis=%s',
+            item_id, targets[key]['precontact_joint_values'], safe_axis)
 
 
 def build_delivery_actions(item, idle_joint_values):
@@ -571,6 +614,8 @@ def main():
             not args.disable_replanning)
         if args.mode in TEACH_POINTS:
             teach_delivery_point(args, arm)
+        elif args.mode == 'teach_contact_release':
+            teach_contact_release(args, arm)
         else:
             pump_proxy = None if args.dry_run else arm_api.get_pump_proxy()
             run_delivery(args, arm, pump_proxy)

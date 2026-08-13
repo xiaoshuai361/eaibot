@@ -2,7 +2,6 @@
 from __future__ import absolute_import, division, print_function
 
 import io
-import json
 import os
 
 import numpy as np
@@ -373,21 +372,6 @@ def deproject_pixel_to_camera_mm(u, v, z_mm, fx_px, fy_px, cx_px, cy_px):
     return ((u - cx_px) * z_mm / fx_px, (v - cy_px) * z_mm / fy_px, z_mm)
 
 
-def scale_box_width_for_distance(width_px, image_width,
-                                 distance_model_frame_width=None):
-    width_px = finite_scalar(width_px, "width_px")
-    image_width = finite_scalar(image_width, "image_width")
-    if width_px <= 0.0 or image_width <= 0.0:
-        raise LocalizationError("box/image width must be positive")
-    if distance_model_frame_width is None:
-        return width_px
-    model_width = finite_scalar(
-        distance_model_frame_width, "distance_model_frame_width")
-    if model_width <= 0.0:
-        raise LocalizationError("distance_model_frame_width must be positive")
-    return width_px * model_width / image_width
-
-
 def merge_config(base, override):
     result = {}
     for key, value in base.items():
@@ -409,54 +393,7 @@ def load_config(path=None):
     config = merge_config(DEFAULT_CONFIG, {})
     if path:
         config = merge_config(config, _read_yaml_mapping(path))
-    return load_external_distance_calibration(normalize_config(config))
-
-
-def load_external_distance_calibration(config):
-    path = config.get("distance_calibration_file")
-    if not path:
-        return config
-    try:
-        with io.open(path, "r", encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except (IOError, OSError, ValueError) as exc:
-        raise LocalizationError(
-            "could not read distance_calibration_file: %s" % exc)
-    if payload.get("version") != 3:
-        raise LocalizationError(
-            "distance_calibration_file version 3 is required")
-    frame_width = int(payload.get("frame_width", 0))
-    if frame_width <= 0 or not isinstance(payload.get("targets"), dict):
-        raise LocalizationError("distance calibration dimensions/targets are invalid")
-    models = {}
-    ranges = {}
-    for target, metadata in config["target_classes"].items():
-        entry = payload["targets"].get(str(int(metadata["target_id"])))
-        if not isinstance(entry, dict):
-            raise LocalizationError(
-                "distance calibration is missing target %s" % target)
-        if str(entry.get("class_name")) != str(metadata["class_name"]):
-            raise LocalizationError(
-                "distance calibration class mismatch for target %s" % target)
-        width_model = entry.get("width")
-        if not isinstance(width_model, dict):
-            raise LocalizationError(
-                "distance calibration is missing width model for %s" % target)
-        a_value = finite_scalar(width_model.get("a"), "%s width.a" % target)
-        b_value = finite_scalar(width_model.get("b"), "%s width.b" % target)
-        minimum = finite_scalar(
-            entry.get("min_distance_mm"), "%s min_distance_mm" % target)
-        maximum = finite_scalar(
-            entry.get("max_distance_mm"), "%s max_distance_mm" % target)
-        if a_value <= 0.0 or minimum <= 0.0 or maximum <= minimum:
-            raise LocalizationError(
-                "distance calibration values are invalid for %s" % target)
-        models[target] = {"width": {"a": a_value, "b": b_value}}
-        ranges[target] = [minimum, maximum]
-    config["distance_models"] = models
-    config["distance_model_frame_width"] = frame_width
-    config["distance_ranges_mm"] = ranges
-    return config
+    return normalize_config(config)
 
 
 def normalize_config(config):

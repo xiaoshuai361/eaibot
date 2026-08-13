@@ -408,12 +408,12 @@ python3 -m zcy_last.building_delivery_calibrate \
 
 ### 9.3 示教四类机械臂预投递点 P
 
-楼宇距离标定完成后，示教复用无 Tag 抓取的完整定位链路：Astra 矫正 RGB、
-`CameraInfo`、四类楼宇各自的框宽距离模型以及已经发布的手眼 TF。车辆应停在
-约 `450mm` 的参考工作距离并正对楼面；程序会根据当前检测结果计算真实距离，
-不是把 `450mm` 写死成机械臂目标。
+楼宇距离标定完成后，把车辆正对楼面停在 `450mm` 参考距离。示教时不再让程序
+根据 YOLO 自动规划辅助点，只手动保存一个靠近楼面但不接触的预投递点 P。
+正式投递时才用 `/dev/video2` 的楼宇框宽估距，并按“实测距离减 450mm”沿楼面
+前后方向修正 P。P 的高度和吸盘姿态不由检测框改变。
 
-先关闭距离标定、`zcy_last.main` 及其他机械臂动作程序。然后分别启动以下终端。
+先关闭距离标定、`zcy_last.main` 及其他机械臂动作程序，然后启动以下终端。
 
 终端1，启动 Astra：
 
@@ -443,48 +443,25 @@ roslaunch easy_handeye publish.launch \
   tracking_base_frame:=camera_link
 ```
 
-终端4，持续显示楼宇检测框。该预览订阅 Astra 的 ROS 图像话题，可以和示教
-进程同时工作：
-
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-conda activate ww
-cd /home/eaibot/handeye-calib/src
-
-python3 block_pick_main.py \
-  --live-preview \
-  --preview-hz 1.0 \
-  --confidence 0.5 \
-  --model /home/eaibot/handeye-calib/src/model/yolov5/building_new_yolov5n_320_best.onnx \
-  --config /home/eaibot/handeye-calib/src/config/building_delivery_teach.yaml
-```
-
-| ID | 楼宇类别 |
+|  ID | 楼宇类别     |
 | --: | ------------ |
-| 1 | 电力故障楼宇 |
-| 2 | 火灾楼宇 |
-| 3 | 有毒气体楼宇 |
-| 4 | 坍塌楼宇 |
+|   1 | 电力故障楼宇 |
+|   2 | 火灾楼宇     |
+|   3 | 有毒气体楼宇 |
+|   4 | 坍塌楼宇     |
 
-终端5，每类单独示教。下面以火灾楼宇 ID2 为例；将 `--target` 改为 `1~4`
-分别执行四次：
+终端4，每类单独示教。下面以电力故障楼宇 ID1 为例；将 `--sequence` 改为
+`1~4`，分别执行四次：
 
 ```bash
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
-conda activate ww
 cd /home/eaibot/handeye-calib/src
 
-python3 block_pick_main.py \
-  --target 2 \
-  --teach-building-contact-release \
-  --confidence 0.5 \
-  --model /home/eaibot/handeye-calib/src/model/yolov5/building_new_yolov5n_320_best.onnx \
-  --config /home/eaibot/handeye-calib/src/config/building_delivery_teach.yaml \
-  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode teach_contact_release \
+  --sequence 1 \
   --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
   --overwrite
 ```
@@ -492,19 +469,14 @@ python3 block_pick_main.py \
 单类实际流程如下：
 
 ```text
-1. 自动移动到无 Tag idle，先让开摄像头视野
-2. 连续取得5帧稳定楼宇检测
-3. 将640宽图像中的楼宇框宽换算到标定时的320宽坐标
-4. 用该类框宽距离模型求Z，再用CameraInfo和手眼TF计算横向及前后位置
-5. 不使用可能裁切的框纵向中心，将Link6辅助高度固定为base下120mm
-6. 只约束位置，自动移动到楼面前约40mm的辅助点
-7. 在RViz中从该点微调到靠近、正对但不接触楼面的P和吸盘姿态，按Enter保存
+1. 程序读取手眼 TF，记录相机正前方对应的机械臂前探方向
+2. 程序不自动移动机械臂
+3. 在 RViz 中把吸盘移动到靠近、正对但不接触楼面的 P
+4. 回到示教终端按 Enter，保存当前六关节角
 ```
 
-程序保存 P 的六关节角，并由手眼 TF 的相机正前方向自动生成安全退回方向；不再
-要求手动示教后方参考点。检测框左右边界必须完整，上下边被裁切允许继续。四类
-楼宇的 P 独立保存，因此四类都要各示教一次。已有该类数据时必须显式传
-`--overwrite` 才会替换。示教完成后可在预览窗口按 `q` 或 `Esc` 退出。
+四类楼宇的 P 独立保存，因此四类都要各示教一次。程序只保存一个 P，不再采集
+后方参考点，也不再创建自动辅助点。已有该类数据时必须加 `--overwrite` 才会替换。
 
 ### 9.4 单类空载验证接触投递动作
 
