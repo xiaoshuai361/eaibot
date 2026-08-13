@@ -291,7 +291,7 @@ A_PICK_PREPARE：停车，启动 Astra/机械臂/无Tag模型
 
 ## 9. 投递和权威数据
 
-有 Tag 街区保持原固定点投递。无 Tag 楼宇沿用现有 YOLO 中心区域停车：框中心进入画面中央 `65%` 区域就进入 `YOLO_STOP`，底盘不旋转，也不做距离闭环。停车后使用 `/dev/video2` 的 320×240 YOLO 框宽/高双模型估算真实毫米距离，并将相对 `450mm` 示教参考距离的差值交给机械臂沿前探轴修正 P。该流程不使用相机内参或手眼标定。两套库存继续共用 `delivery_presets.json` 中 ID 1~4 的 `cargo_pick_joint_values_by_id`，不得拆分仓内抓取点。中转点和 idle 按来源独立：
+有 Tag 街区保持原固定点投递。无 Tag 楼宇使用固定红框停车：框中心进入原始320×240画面的 `x=54~122`（归一化 `0.17~0.38`）就进入 `YOLO_STOP`，底盘不旋转，也不做距离闭环；标定与正式运行共用并显示该红框。停车后使用 `/dev/video2` 的楼宇框宽/高双模型估算真实毫米距离，并将相对 `450mm` 示教参考距离的差值交给机械臂沿前探轴修正 P。该流程不使用相机内参或手眼标定。两套库存继续共用 `delivery_presets.json` 中 ID 1~4 的 `cargo_pick_joint_values_by_id`，不得拆分仓内抓取点。中转点和 idle 按来源独立：
 
 ```text
 共用仓内抓取点：/home/eaibot/handeye-calib/config/delivery_presets.json
@@ -332,7 +332,7 @@ py -3.9 -m pytest -q \
   --deselect=handeye-calib/tests/test_block_pick_main.py::test_serve_requests_reports_business_error_without_crashing
 ```
 
-结果：`274 passed, 3 deselected`；本轮改动脚本通过 Python 3.9 `py_compile`；`git diff --check` 通过。排除项依赖 Linux/ROS 运行语义或测试中未转义的 Windows 路径，仍需在真机验证。
+结果：`275 passed, 3 deselected`；本轮改动脚本通过 Python 3.9 `py_compile`；`git diff --check` 通过。排除项依赖 Linux/ROS 运行语义或测试中未转义的 Windows 路径，仍需在真机验证。
 
 这只证明离线逻辑和接口回归通过，不代表：
 

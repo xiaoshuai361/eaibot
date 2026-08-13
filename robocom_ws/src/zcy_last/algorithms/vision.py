@@ -88,7 +88,14 @@ def safe_filename_text(text):
     return str(text).replace("/", "_").replace("\\", "_").replace(" ", "")
 
 
-def draw_yolo_boxes(frame, detections, center_band_ratio, draw_center_band=True):
+def detection_center_in_x_roi(detection, roi_x_ratio):
+    left_ratio, right_ratio = [float(value) for value in roi_x_ratio]
+    width = int(detection.frame_shape[1])
+    return left_ratio * width <= detection.center_x <= right_ratio * width
+
+
+def draw_yolo_boxes(frame, detections, center_band_ratio,
+                    draw_center_band=True, center_roi_x_ratio=None):
     output = frame.copy()
     height, width = output.shape[:2]
     if draw_center_band:
@@ -97,9 +104,17 @@ def draw_yolo_boxes(frame, detections, center_band_ratio, draw_center_band=True)
         right = int(round(width - left))
         cv2.line(output, (left, 0), (left, height - 1), (255, 255, 0), 1)
         cv2.line(output, (right, 0), (right, height - 1), (255, 255, 0), 1)
+    if center_roi_x_ratio is not None:
+        left_ratio, right_ratio = center_roi_x_ratio
+        left = int(round(width * float(left_ratio)))
+        right = int(round(width * float(right_ratio)))
+        cv2.rectangle(
+            output, (left, 0), (right, height - 1), (0, 0, 255), 2)
     for item in detections:
         x1, y1, x2, y2 = [int(round(value)) for value in item.box]
-        color = (0, 255, 0) if item.target and item.in_center else (0, 255, 255)
+        in_roi = detection_center_in_x_roi(item, center_roi_x_ratio) \
+            if center_roi_x_ratio is not None else item.in_center
+        color = (0, 255, 0) if item.target and in_roi else (0, 255, 255)
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
         label = "{} {:.2f}".format(item.class_name, item.confidence)
         cv2.putText(output, label, (x1, max(18, y1 - 6)),
@@ -380,7 +395,13 @@ class YoloTaskLedger(object):
             self._reset_people_stability()
             threshold = confidence if building_confidence is None \
                 else building_confidence
-            candidates = self._target_candidates(detections, threshold)
+            candidates = [
+                item for item in detections
+                if item.target
+                and detection_center_in_x_roi(
+                    item, YOLO_BUILDING_CENTER_ROI_X_RATIO)
+                and item.confidence >= float(threshold)
+            ]
             area = context.get("area")
             if self.building_results.get(area) is not None:
                 return None

@@ -18,13 +18,18 @@ from .algorithms.building_delivery import (
     save_building_calibration,
     select_locked_building_detection,
 )
-from .algorithms.vision import YoloObstacleDetector, draw_yolo_boxes
+from .algorithms.vision import (
+    YoloObstacleDetector,
+    detection_center_in_x_roi,
+    draw_yolo_boxes,
+)
 from .config import (
     BUILDING_DELIVERY_CALIBRATION_FILE,
     BUILDING_DELIVERY_REFERENCE_DISTANCE_MM,
     UNTAGGED_DELIVERY_ID_BY_BUILDING_CLASS,
     YOLO_BUILDING_CLASS_NAMES,
     YOLO_BUILDING_CONFIDENCE,
+    YOLO_BUILDING_CENTER_ROI_X_RATIO,
     YOLO_BUILDING_MODEL_PATH,
     YOLO_CAMERA_INDEX,
     YOLO_FRAME_HEIGHT,
@@ -145,18 +150,23 @@ def collect_distance(capture, detector, class_name, confidence,
         selected = select_locked_building_detection(
             detections, class_name, confidence)
         if selected is not None:
-            try:
-                geometry = building_box_geometry(selected, frame.shape)
-            except RuntimeError as exc:
-                print("\r等待完整楼宇框：%s" % exc, end="")
+            if not detection_center_in_x_roi(
+                    selected, YOLO_BUILDING_CENTER_ROI_X_RATIO):
+                print("\r等待楼宇框中心进入红框...", end="")
             else:
-                measurements.append((geometry["width_px"],
-                                     geometry["height_px"]))
-                print("\r%dmm 有效样本 %d/%d" % (
-                    distance_mm, len(measurements), frame_count), end="")
+                try:
+                    geometry = building_box_geometry(selected, frame.shape)
+                except RuntimeError as exc:
+                    print("\r等待完整楼宇框：%s" % exc, end="")
+                else:
+                    measurements.append((geometry["width_px"],
+                                         geometry["height_px"]))
+                    print("\r%dmm 有效样本 %d/%d" % (
+                        distance_mm, len(measurements), frame_count), end="")
         if not no_window:
             shown = draw_yolo_boxes(
-                frame, detections, 1.0, draw_center_band=False)
+                frame, detections, 1.0, draw_center_band=False,
+                center_roi_x_ratio=YOLO_BUILDING_CENTER_ROI_X_RATIO)
             cv2.imshow("building_delivery_distance_calibration", shown)
             if cv2.waitKey(1) & 0xFF in (27, ord("q")):
                 raise KeyboardInterrupt()

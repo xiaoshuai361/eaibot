@@ -1222,6 +1222,8 @@ class LaneFollower(object):
         boxed = draw_yolo_boxes(
             frame, event_detections, self.yolo_center_band_ratio,
             draw_center_band=False,
+            center_roi_x_ratio=(YOLO_BUILDING_CENTER_ROI_X_RATIO
+                                if event.kind == "building" else None),
         )
         self.task_ledger.save_index += 1
         result = event.display_name
@@ -1669,6 +1671,11 @@ class LaneFollower(object):
         frame = draw_yolo_boxes(
             frame, detections,
             getattr(self, "yolo_center_band_ratio", YOLO_CENTER_BAND_RATIO),
+            draw_center_band=(
+                getattr(self, "yolo_active_profile", None) != "building"),
+            center_roi_x_ratio=(YOLO_BUILDING_CENTER_ROI_X_RATIO
+                                if getattr(self, "yolo_active_profile", None)
+                                == "building" else None),
         )
         status = "YOLO frame_interval={} detections={}".format(
             getattr(self, "yolo_frame_interval", YOLO_FRAME_INTERVAL),

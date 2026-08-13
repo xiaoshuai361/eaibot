@@ -42,7 +42,10 @@ from zcy_last.algorithms.building_delivery import (  # noqa: E402
 from zcy_last.algorithms.vision import (  # noqa: E402
     YoloDetection,
     YoloObstacleDetector,
+    YoloTaskLedger,
+    draw_yolo_boxes,
 )
+from zcy_last.config import YOLO_BUILDING_CENTER_ROI_X_RATIO  # noqa: E402
 def detection(class_name="Fire Building", box=(135, 105, 185, 135),
               confidence=0.9):
     return YoloDetection(
@@ -80,6 +83,26 @@ def test_letterbox_decode_restores_box_to_original_320x240_coordinates():
 
     assert decoded[0].box == pytest.approx((110, 80, 210, 160))
     assert decoded[0].frame_shape[:2] == (240, 320)
+
+
+def test_building_roi_is_drawn_red_and_controls_building_stop_event():
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    shown = draw_yolo_boxes(
+        frame, [], 0.65, draw_center_band=False,
+        center_roi_x_ratio=YOLO_BUILDING_CENTER_ROI_X_RATIO)
+    assert shown[120, 54].tolist() == [0, 0, 255]
+    assert shown[120, 122].tolist() == [0, 0, 255]
+
+    inside_red = detection(box=(50, 100, 90, 140))
+    outside_red = detection(box=(140, 100, 180, 140))
+    ledger = YoloTaskLedger()
+    context = {"kind": "building", "area": "楼宇A"}
+
+    assert inside_red.in_center is False
+    assert ledger.select_event(
+        context, [inside_red], 0.5, building_confidence=0.5) is not None
+    assert ledger.select_event(
+        context, [outside_red], 0.5, building_confidence=0.5) is None
 
 
 def test_real_distance_fit_uses_width_and_height_models():
