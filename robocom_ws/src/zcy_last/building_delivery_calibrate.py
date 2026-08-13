@@ -85,6 +85,7 @@ def parse_args(argv=None):
     parser.add_argument("--confidence", type=float,
                         default=YOLO_BUILDING_CONFIDENCE)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--preview-only", action="store_true")
     parser.add_argument("--no-window", action="store_true")
     args = parser.parse_args(argv)
     if args.frames <= 0:
@@ -93,6 +94,8 @@ def parse_args(argv=None):
         parser.error("--reference-distance-mm must be positive")
     if not 0.0 < args.confidence <= 1.0:
         parser.error("--confidence must be in (0, 1]")
+    if args.preview_only and args.no_window:
+        parser.error("--preview-only 不能和 --no-window 同时使用")
     return args
 
 
@@ -193,10 +196,32 @@ def collect_distance(capture, detector, class_name, confidence,
     return measurements
 
 
+def run_preview(capture, detector):
+    print("楼宇示教预览已启动：绿框为YOLO检测，红框为正式停车中心区。")
+    print("在预览窗口按 q 或 Esc 退出；本模式不采集、不修改标定文件。")
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            time.sleep(0.02)
+            continue
+        if frame.shape[:2] != (YOLO_FRAME_HEIGHT, YOLO_FRAME_WIDTH):
+            raise RuntimeError("摄像头实际分辨率为%dx%d，要求%d×%d" % (
+                frame.shape[1], frame.shape[0],
+                YOLO_FRAME_WIDTH, YOLO_FRAME_HEIGHT))
+        detections = detector.detect(frame)
+        shown = draw_yolo_boxes(
+            frame, detections, 1.0, draw_center_band=False,
+            center_roi_x_ratio=YOLO_BUILDING_CENTER_ROI_X_RATIO)
+        cv2.imshow("building_delivery_teach_preview", shown)
+        if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+            return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
     targets = sorted(ID_TO_BUILDING_CLASS)
-    os.makedirs(args.sample_dir, exist_ok=True)
+    if not args.preview_only:
+        os.makedirs(args.sample_dir, exist_ok=True)
     detector = YoloObstacleDetector(
         args.model, confidence=args.confidence,
         image_size=YOLO_IMAGE_SIZE, nms_threshold=YOLO_NMS_THRESHOLD,
@@ -208,6 +233,8 @@ def main(argv=None):
         raise RuntimeError("无法打开楼宇摄像头：%d" % args.camera_index)
     configure_capture(capture)
     try:
+        if args.preview_only:
+            return run_preview(capture, detector)
         for distance_index, distance_mm in enumerate(args.distances, 1):
             print("\n=== 距离 %d/%d：%dmm，依次采集四类楼宇 ===" % (
                 distance_index, len(args.distances), distance_mm))

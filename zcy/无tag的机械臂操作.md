@@ -344,13 +344,6 @@ mv /home/eaibot/handeye-calib/config/building_delivery_calibration.json \
 
 楼宇与物资 ID 对应关系：
 
-|  ID | 楼宇类别     |
-| --: | ------------ |
-|   1 | 电力故障楼宇 |
-|   2 | 火灾楼宇     |
-|   3 | 有毒气体楼宇 |
-|   4 | 坍塌楼宇     |
-
 原理与第 5 节无 Tag 物块的纯 RGB 距离标定相同。针对每类楼宇，在多个已知真实
 距离采集 YOLO 框，只用左右边界的宽度拟合：
 
@@ -415,14 +408,37 @@ python3 -m zcy_last.building_delivery_calibrate \
 
 ### 9.3 示教四类机械臂预投递点 P
 
-保持终端 2 的 MoveIt 和 RViz 运行。该示教不需要 Astra、手眼 TF 或楼宇 YOLO。
+保持 MoveIt 和 RViz 运行。该示教不需要 Astra 或手眼 TF，但必须同时打开
+楼宇 YOLO 预览，确认当前楼宇能被检测，且绿框中心在正式停车红框内。
 示教某个 ID 时，必须用卷尺把 `/dev/video2` 镜头平面放在该楼面正前方
-`450mm`，这要与距离标定命令的 `--reference-distance-mm 450` 一致。先让机械臂处于
-idle，在 RViz 中确认 P 后方 `30mm` 可达、从 P 向前最多 `65mm` 不会碰到楼宇
+`450mm`，这要与距离标定命令的 `--reference-distance-mm 450` 一致。每个 ID 开始时，
+程序都会先提示确认路径，再自动移动到无 Tag 抓取 preset 中的 idle，
+避免上一个示教姿态遮挡摄像头。在 RViz 中确认 P 后方 `30mm` 可达、从 P 向前最多 `65mm` 不会碰到楼宇
 以外结构，也没有明显关节极限。程序支持一次连续示教多个 ID，但现场推荐按 ID
 分开，避免移动底盘后把类别和 P 对应错。
 
+先在独立终端打开纯预览。该模式只读取 `/dev/video2`，不采集、不修改 CSV 或 JSON：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/robocom_ws/devel/setup.bash
+conda activate ww
+cd /home/eaibot/robocom_ws/src
+
+python3 -m zcy_last.building_delivery_calibrate --preview-only
+```
+
+预览保持运行，再在另一终端执行下面的机械臂示教。示教完成后，在预览
+窗口按 `q` 或 `Esc` 退出。此时不能同时运行 `zcy_last.main`、楼宇距离标定或其他
+占用 `/dev/video2` 的程序。
+
 一次连续示教四类的可选命令：
+| ID | 楼宇类别 |
+| --: | ------------ |
+| 1 | 电力故障楼宇 |
+| 2 | 火灾楼宇 |
+| 3 | 有毒气体楼宇 |
+| 4 | 坍塌楼宇 |
 
 ```bash
 source /opt/ros/melodic/setup.bash
@@ -433,6 +449,7 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
   --mode teach_contact_release \
   --sequence 1,2,3,4 \
   --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
   --overwrite
 ```
 
@@ -446,10 +463,11 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
   --mode teach_contact_release \
   --sequence 2 \
   --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
+  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
   --overwrite
 ```
 
-每类固定两步：
+每类先自动到 idle，然后固定两步：
 
 ```text
 步骤1：在 RViz 中移动到远离墙面的后方参考点
