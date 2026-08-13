@@ -67,8 +67,6 @@ def parse_distances(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="采集楼宇真实距离与YOLO框，拟合单目距离模型")
-    parser.add_argument("--target", type=int,
-                        choices=sorted(ID_TO_BUILDING_CLASS), required=True)
     parser.add_argument("--distances", type=parse_distances,
                         default=list(DEFAULT_DISTANCES))
     parser.add_argument("--frames", type=int, default=10)
@@ -123,9 +121,9 @@ def configure_capture(capture):
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
-def prompt_distance(class_name, distance_mm, frames, index, total):
-    print("\n[%d/%d] 楼宇=%s，真实镜头距离=%dmm" % (
-        index, total, class_name, distance_mm))
+def prompt_building(display_name, distance_mm, frames, index, total):
+    print("[%d/%d] 楼宇=%s，真实镜头距离=%dmm" % (
+        index, total, display_name, distance_mm))
     print("车身和摄像机保持正对楼面，准确测量镜头平面到楼面的垂直距离。")
     print("按 Enter 采集%d帧；s跳过；q退出并保留已采CSV。" % frames)
     return input("> ").strip().lower()
@@ -168,8 +166,7 @@ def collect_distance(capture, detector, class_name, confidence,
 
 def main(argv=None):
     args = parse_args(argv)
-    class_name = ID_TO_BUILDING_CLASS[args.target]
-    display_name = BUILDING_NAME_BY_ID[args.target]
+    targets = sorted(ID_TO_BUILDING_CLASS)
     os.makedirs(args.sample_dir, exist_ok=True)
     detector = YoloObstacleDetector(
         args.model, confidence=args.confidence,
@@ -182,49 +179,62 @@ def main(argv=None):
         raise RuntimeError("无法打开楼宇摄像头：%d" % args.camera_index)
     configure_capture(capture)
     try:
-        for index, distance_mm in enumerate(args.distances, 1):
-            path = sample_path(args.sample_dir, args.target, distance_mm)
-            if os.path.isfile(path) and not args.overwrite:
-                print("跳过已有样本：%s" % path)
-                continue
-            choice = prompt_distance(
-                display_name, distance_mm, args.frames,
-                index, len(args.distances))
-            if choice in ("q", "quit", "exit"):
-                print("采集已停止；再次运行会继续缺失距离。")
-                return 0
-            if choice in ("s", "skip"):
-                continue
-            measurements = collect_distance(
-                capture, detector, class_name, args.confidence,
-                distance_mm, args.frames, args.no_window)
-            save_samples(path, distance_mm, measurements)
+        for distance_index, distance_mm in enumerate(args.distances, 1):
+            print("\n=== 距离 %d/%d：%dmm，依次采集四类楼宇 ===" % (
+                distance_index, len(args.distances), distance_mm))
+            for target_index, target in enumerate(targets, 1):
+                path = sample_path(args.sample_dir, target, distance_mm)
+                if os.path.isfile(path) and not args.overwrite:
+                    print("[%d/%d] 跳过已有%s样本：%s" % (
+                        target_index, len(targets),
+                        BUILDING_NAME_BY_ID[target], path))
+                    continue
+                choice = prompt_building(
+                    BUILDING_NAME_BY_ID[target], distance_mm, args.frames,
+                    target_index, len(targets))
+                if choice in ("q", "quit", "exit"):
+                    print("采集已停止；再次运行会继续缺失距离。")
+                    return 0
+                if choice in ("s", "skip"):
+                    continue
+                measurements = collect_distance(
+                    capture, detector, ID_TO_BUILDING_CLASS[target],
+                    args.confidence, distance_mm, args.frames,
+                    args.no_window)
+                save_samples(path, distance_mm, measurements)
     finally:
         capture.release()
         detector.close()
         if not args.no_window:
             cv2.destroyAllWindows()
 
-    samples = []
-    for distance_mm in args.distances:
-        path = sample_path(args.sample_dir, args.target, distance_mm)
-        if os.path.isfile(path):
-            samples.extend(load_samples(path))
-    entry = build_distance_calibration_entry(
-        args.target, class_name, samples,
-        YOLO_FRAME_WIDTH, YOLO_FRAME_HEIGHT,
-        args.model, args.reference_distance_mm)
+    entries = {}
+    for target in targets:
+        samples = []
+        for distance_mm in args.distances:
+            path = sample_path(args.sample_dir, target, distance_mm)
+            if os.path.isfile(path):
+                samples.extend(load_samples(path))
+        entries[target] = build_distance_calibration_entry(
+            target, ID_TO_BUILDING_CLASS[target], samples,
+            YOLO_FRAME_WIDTH, YOLO_FRAME_HEIGHT,
+            args.model, args.reference_distance_mm)
     existing = load_building_calibration(
         args.output, YOLO_FRAME_WIDTH, YOLO_FRAME_HEIGHT,
         args.model, allow_missing=True)
     payload = existing or empty_building_calibration(
         YOLO_FRAME_WIDTH, YOLO_FRAME_HEIGHT, args.model)
-    payload["targets"][str(args.target)] = entry
+    for target, entry in entries.items():
+        payload["targets"][str(target)] = entry
     save_building_calibration(args.output, payload)
-    print("ID%d多距离模型已原子保存：%s" % (args.target, args.output))
-    print("width RMSE=%.1fmm，height RMSE=%.1fmm，距离点=%d，帧=%d" % (
-        entry["width"]["rmse_mm"], entry["height"]["rmse_mm"],
-        entry["distance_point_count"], entry["sample_count"]))
+    print("四类楼宇多距离模型已原子保存：%s" % args.output)
+    for target, entry in entries.items():
+        print("ID%d %s：width RMSE=%.1fmm，height RMSE=%.1fmm，"
+              "距离点=%d，帧=%d" % (
+                  target, BUILDING_NAME_BY_ID[target],
+                  entry["width"]["rmse_mm"],
+                  entry["height"]["rmse_mm"],
+                  entry["distance_point_count"], entry["sample_count"]))
     return 0
 
 
