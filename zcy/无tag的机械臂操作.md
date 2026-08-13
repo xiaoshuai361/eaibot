@@ -444,7 +444,7 @@ roslaunch easy_handeye publish.launch \
 ```
 
 终端4，持续显示楼宇检测框。该预览订阅 Astra 的 ROS 图像话题，可以和示教
-进程同时工作；不要再运行 `building_delivery_calibrate --preview-only`：
+进程同时工作：
 
 ```bash
 source /opt/ros/melodic/setup.bash

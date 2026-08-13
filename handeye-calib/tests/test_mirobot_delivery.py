@@ -186,36 +186,6 @@ def test_contact_delivery_reads_independent_pose_and_axis_for_each_id():
     assert "delivery_joint_values" not in items["1"]
 
 
-def test_contact_release_teach_saves_p_joints_and_safe_side_direction(tmp_path):
-    teach_contact_release, load_delivery_preset = load_symbols(
-        "teach_contact_release", "load_delivery_preset")
-    path = tmp_path / "untagged_delivery.json"
-    poses = iter([
-        SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(
-            x=0.20, y=0.10, z=0.30))),
-        SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(
-            x=0.17, y=0.10, z=0.30))),
-    ])
-    arm = SimpleNamespace(
-        get_current_pose=lambda: next(poses),
-        get_current_joint_values=lambda: [1, 2, 3, 4, 5, 6])
-    teach_contact_release.__globals__.update({
-        "prompt_enter": lambda message: None,
-        "rospy": SimpleNamespace(sleep=lambda seconds: None,
-                                 loginfo=lambda *items: None),
-    })
-    args = SimpleNamespace(
-        delivery_file=str(path), sequence=[2], overwrite=False,
-        teach_settle_seconds=0.0)
-
-    teach_contact_release(args, arm)
-    target = load_delivery_preset(str(path))[
-        "contact_delivery_targets_by_id"]["2"]
-
-    assert target["precontact_joint_values"] == [1, 2, 3, 4, 5, 6]
-    assert target["approach_axis_xyz_base"] == pytest.approx([1, 0, 0])
-
-
 def test_three_delivery_points_are_taught_by_separate_modes(tmp_path):
     teach_delivery_point, load_delivery_preset = load_symbols(
         "teach_delivery_point", "load_delivery_preset")

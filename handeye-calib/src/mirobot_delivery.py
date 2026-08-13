@@ -90,7 +90,7 @@ def parse_args(argv):
     parser.add_argument(
         '--mode',
         choices=['teach_cargo_pick', 'teach_transit', 'teach_release',
-                 'teach_contact_release', 'run_delivery'],
+                 'run_delivery'],
         required=True)
     parser.add_argument('--sequence', default=DEFAULT_SEQUENCE)
     parser.add_argument('--delivery-file', default=DEFAULT_DELIVERY_FILE)
@@ -420,53 +420,6 @@ def teach_delivery_point(args, arm):
     rospy.loginfo('共享载物仓抓取点配置已保存：%s', cargo_pick_file)
 
 
-def _pose_position(pose_stamped):
-    position = pose_stamped.pose.position
-    values = [float(position.x), float(position.y), float(position.z)]
-    if any(math.isnan(value) or math.isinf(value) for value in values):
-        raise RuntimeError('当前 Link6 位姿包含非法位置数值。')
-    return values
-
-
-def teach_contact_release(args, arm):
-    preset = load_delivery_preset(args.delivery_file, allow_missing=True)
-    targets = preset['contact_delivery_targets_by_id']
-    for index, item_id in enumerate(args.sequence, 1):
-        key = str(item_id)
-        if key in targets and not args.overwrite:
-            raise RuntimeError(
-                'ID%d 已有接触投递点，重采时请加 --overwrite。' % item_id)
-        prompt_enter(
-            '示教 ID%d（%d/%d）步骤 1/2：墙面后方参考点\n'
-            '请把吸盘保持最终投递姿态，移动到比预投递点 P 更远离墙面的安全位置。'
-            % (item_id, index, len(args.sequence)))
-        rospy.sleep(args.teach_settle_seconds)
-        rear_position = _pose_position(arm.get_current_pose())
-
-        prompt_enter(
-            '示教 ID%d（%d/%d）步骤 2/2：预投递点 P\n'
-            '请沿正前方靠近对应楼面，但不要接触墙面。'
-            % (item_id, index, len(args.sequence)))
-        rospy.sleep(args.teach_settle_seconds)
-        precontact_joints = validate_joint_values(
-            list(arm.get_current_joint_values()),
-            'ID%d 当前关节角' % item_id)
-        precontact_position = _pose_position(arm.get_current_pose())
-        safe_axis = normalize_axis([
-            rear_position[axis] - precontact_position[axis]
-            for axis in range(3)
-        ], 'ID%d P到后方参考点方向' % item_id)
-        targets[key] = {
-            'precontact_joint_values': precontact_joints,
-            'approach_axis_xyz_base': safe_axis,
-        }
-        save_delivery_preset(args.delivery_file, preset)
-        rospy.loginfo(
-            'ID%d 独立接触投递点已原子保存：joints=%s safe_axis=%s',
-            item_id, precontact_joints, safe_axis)
-    rospy.loginfo('接触投递示教已保存：%s', args.delivery_file)
-
-
 def build_delivery_actions(item, idle_joint_values):
     return [
         ('home', None),
@@ -618,8 +571,6 @@ def main():
             not args.disable_replanning)
         if args.mode in TEACH_POINTS:
             teach_delivery_point(args, arm)
-        elif args.mode == 'teach_contact_release':
-            teach_contact_release(args, arm)
         else:
             pump_proxy = None if args.dry_run else arm_api.get_pump_proxy()
             run_delivery(args, arm, pump_proxy)
