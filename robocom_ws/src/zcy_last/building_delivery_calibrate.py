@@ -45,6 +45,12 @@ DEFAULT_SAMPLE_DIR = (
 ID_TO_BUILDING_CLASS = dict(
     (item_id, class_name)
     for class_name, item_id in UNTAGGED_DELIVERY_ID_BY_BUILDING_CLASS.items())
+BUILDING_NAME_BY_ID = {
+    1: "电力故障楼宇",
+    2: "火灾楼宇",
+    3: "有毒气体楼宇",
+    4: "坍塌楼宇",
+}
 
 
 def parse_distances(value):
@@ -163,6 +169,7 @@ def collect_distance(capture, detector, class_name, confidence,
 def main(argv=None):
     args = parse_args(argv)
     class_name = ID_TO_BUILDING_CLASS[args.target]
+    display_name = BUILDING_NAME_BY_ID[args.target]
     os.makedirs(args.sample_dir, exist_ok=True)
     detector = YoloObstacleDetector(
         args.model, confidence=args.confidence,
@@ -181,7 +188,7 @@ def main(argv=None):
                 print("跳过已有样本：%s" % path)
                 continue
             choice = prompt_distance(
-                class_name, distance_mm, args.frames,
+                display_name, distance_mm, args.frames,
                 index, len(args.distances))
             if choice in ("q", "quit", "exit"):
                 print("采集已停止；再次运行会继续缺失距离。")
