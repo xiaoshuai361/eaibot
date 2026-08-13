@@ -282,13 +282,10 @@ def require_delivery_items(preset, sequence, cargo_pick_preset=None,
     return result
 
 
-def prompt_enter(message, manual_move=True):
+def prompt_enter(message):
     print('')
     print(message)
-    if manual_move:
-        print('在 RViz Plan/Execute 到位后按 Enter；输入 q 再回车退出。')
-    else:
-        print('确认自动移动路径安全后按 Enter；输入 q 再回车退出。')
+    print('在 RViz Plan/Execute 到位后按 Enter；输入 q 再回车退出。')
     try:
         answer = raw_input().strip().lower()
     except EOFError:
@@ -434,20 +431,11 @@ def _pose_position(pose_stamped):
 def teach_contact_release(args, arm):
     preset = load_delivery_preset(args.delivery_file, allow_missing=True)
     targets = preset['contact_delivery_targets_by_id']
-    idle_joint_values = load_idle_joint_values(args.tag_preset_file)
     for index, item_id in enumerate(args.sequence, 1):
         key = str(item_id)
         if key in targets and not args.overwrite:
             raise RuntimeError(
                 'ID%d 已有接触投递点，重采时请加 --overwrite。' % item_id)
-        prompt_enter(
-            '示教 ID%d（%d/%d）开始前，机械臂将先自动移动到 idle，'
-            '避免遮挡楼宇摄像头。'
-            % (item_id, index, len(args.sequence)),
-            manual_move=False)
-        arm_api.execute_joint_values(
-            arm, idle_joint_values,
-            'idle_before_contact_teach_%d' % item_id)
         prompt_enter(
             '示教 ID%d（%d/%d）步骤 1/2：墙面后方参考点\n'
             '请把吸盘保持最终投递姿态，移动到比预投递点 P 更远离墙面的安全位置。'

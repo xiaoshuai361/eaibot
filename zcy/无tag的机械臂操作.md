@@ -408,31 +408,59 @@ python3 -m zcy_last.building_delivery_calibrate \
 
 ### 9.3 示教四类机械臂预投递点 P
 
-保持 MoveIt 和 RViz 运行。该示教不需要 Astra 或手眼 TF，但必须同时打开
-楼宇 YOLO 预览，确认当前楼宇能被检测，且绿框中心在正式停车红框内。
-示教某个 ID 时，必须用卷尺把 `/dev/video2` 镜头平面放在该楼面正前方
-`450mm`，这要与距离标定命令的 `--reference-distance-mm 450` 一致。每个 ID 开始时，
-程序都会先提示确认路径，再自动移动到无 Tag 抓取 preset 中的 idle，
-避免上一个示教姿态遮挡摄像头。在 RViz 中确认 P 后方 `30mm` 可达、从 P 向前最多 `65mm` 不会碰到楼宇
-以外结构，也没有明显关节极限。程序支持一次连续示教多个 ID，但现场推荐按 ID
-分开，避免移动底盘后把类别和 P 对应错。
+楼宇距离标定完成后，示教复用无 Tag 抓取的完整定位链路：Astra 矫正 RGB、
+`CameraInfo`、四类楼宇各自的框宽距离模型以及已经发布的手眼 TF。车辆应停在
+约 `450mm` 的参考工作距离并正对楼面；程序会根据当前检测结果计算真实距离，
+不是把 `450mm` 写死成机械臂目标。
 
-先在独立终端打开纯预览。该模式只读取 `/dev/video2`，不采集、不修改 CSV 或 JSON：
+先关闭距离标定、`zcy_last.main` 及其他机械臂动作程序。然后分别启动以下终端。
+
+终端1，启动 Astra：
 
 ```bash
 source /opt/ros/melodic/setup.bash
-source /home/eaibot/robocom_ws/devel/setup.bash
-conda activate ww
-cd /home/eaibot/robocom_ws/src
-
-python3 -m zcy_last.building_delivery_calibrate --preview-only
+source /home/eaibot/mirobot_ws/devel/setup.bash
+roslaunch astra_camera astrapro.launch
 ```
 
-预览保持运行，再在另一终端执行下面的机械臂示教。示教完成后，在预览
-窗口按 `q` 或 `Esc` 退出。此时不能同时运行 `zcy_last.main`、楼宇距离标定或其他
-占用 `/dev/video2` 的程序。
+终端2，启动 MoveIt 和 RViz：
 
-一次连续示教四类的可选命令：
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+roslaunch mirobot_moveit_config mirobot.launch start_rviz:=true
+```
+
+终端3，发布已有手眼标定 TF：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+roslaunch easy_handeye publish.launch \
+  eye_on_hand:=false \
+  tracking_base_frame:=camera_link
+```
+
+终端4，持续显示楼宇检测框。该预览订阅 Astra 的 ROS 图像话题，可以和示教
+进程同时工作；不要再运行 `building_delivery_calibrate --preview-only`：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/handeye-calib/src
+
+python3 block_pick_main.py \
+  --live-preview \
+  --preview-hz 1.0 \
+  --confidence 0.5 \
+  --model /home/eaibot/handeye-calib/src/model/yolov5/building_new_yolov5n_320_best.onnx \
+  --config /home/eaibot/handeye-calib/src/config/building_delivery_teach.yaml
+```
+
 | ID | 楼宇类别 |
 | --: | ------------ |
 | 1 | 电力故障楼宇 |
@@ -440,43 +468,42 @@ python3 -m zcy_last.building_delivery_calibrate --preview-only
 | 3 | 有毒气体楼宇 |
 | 4 | 坍塌楼宇 |
 
-```bash
-source /opt/ros/melodic/setup.bash
-source /home/eaibot/mirobot_ws/devel/setup.bash
-source /home/eaibot/handeye-calib/devel/setup.bash
-
-python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
-  --mode teach_contact_release \
-  --sequence 1,2,3,4 \
-  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
-  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
-  --overwrite
-```
-
-只重采一类，例如火灾楼宇 ID2：
+终端5，每类单独示教。下面以火灾楼宇 ID2 为例；将 `--target` 改为 `1~4`
+分别执行四次：
 
 ```bash
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
-python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
-  --mode teach_contact_release \
-  --sequence 2 \
+conda activate ww
+cd /home/eaibot/handeye-calib/src
+
+python3 block_pick_main.py \
+  --target 2 \
+  --teach-building-contact-release \
+  --confidence 0.5 \
+  --model /home/eaibot/handeye-calib/src/model/yolov5/building_new_yolov5n_320_best.onnx \
+  --config /home/eaibot/handeye-calib/src/config/building_delivery_teach.yaml \
+  --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
   --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
-  --tag-preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
   --overwrite
 ```
 
-每类先自动到 idle，然后固定两步：
+单类实际流程如下：
 
 ```text
-步骤1：在 RViz 中移动到远离墙面的后方参考点
-步骤2：保持相同吸盘朝向，沿正前方移动到近墙但不接触的预投递点 P
+1. 自动移动到无 Tag idle，先让开摄像头视野
+2. 连续取得5帧稳定楼宇检测
+3. 将640宽图像中的楼宇框宽换算到标定时的320宽坐标
+4. 用该类框宽距离模型求Z，再用CameraInfo和手眼TF求楼面点的base坐标
+5. 自动移动到楼面前约85mm的较远安全点
+6. 在RViz中从该点微调到靠近、正对但不接触楼面的P，按Enter保存
 ```
 
-后方参考点与 P 不要求正好相差 `30mm`，它只用来计算“远离墙面”的安全方向；
-两点必须尽量共线，且吸盘姿态保持一致。程序保存 P 的六关节角，并根据
-“P → 后方参考点”生成单位方向。单类两步都成功后才会原子替换该类旧数据。
+程序保存 P 的六关节角，并由手眼 TF 的相机正前方向自动生成安全退回方向；不再
+要求手动示教后方参考点。检测框左右边界必须完整，上下边被裁切允许继续。四类
+楼宇的 P 独立保存，因此四类都要各示教一次。已有该类数据时必须显式传
+`--overwrite` 才会替换。示教完成后可在预览窗口按 `q` 或 `Esc` 退出。
 
 ### 9.4 单类空载验证接触投递动作
 

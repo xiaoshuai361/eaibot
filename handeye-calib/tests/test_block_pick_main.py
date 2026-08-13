@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -170,6 +171,25 @@ def test_build_child_command_forwards_taught_block_actions():
     assert "--overwrite" in teach_command
 
 
+def test_building_contact_teach_forwards_delivery_and_block_presets():
+    parsed = args(
+        "--teach-building-contact-release",
+        "--preset-file", "/tmp/block_presets.json",
+        "--delivery-file", "/tmp/delivery_presets.json",
+        "--overwrite",
+    )
+
+    main.validate_runtime_args(parsed, {"distance_method": "calibrated"})
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+
+    assert "--teach-building-contact-release" in command
+    assert command[command.index("--preset-file") + 1] == \
+        "/tmp/block_presets.json"
+    assert command[command.index("--delivery-file") + 1] == \
+        "/tmp/delivery_presets.json"
+    assert "--overwrite" in command
+
+
 def test_chassis_sequence_is_targetless_and_ignores_legacy_wait_option():
     parsed = main.parse_args([
         "--run-chassis-sequence",
@@ -280,10 +300,12 @@ def test_interactive_teaching_has_no_fixed_child_timeout():
         "--teach-block-place",
         "--teach-block-idle",
         "--teach-block-carry",
+        "--teach-building-contact-release",
     ):
         argv = [option]
         if option in ("--teach-block-pick-place", "--teach-block-pregrasp",
-                      "--teach-block-place"):
+                      "--teach-block-place",
+                      "--teach-building-contact-release"):
             argv = ["--target", "1", option]
         parsed = main.parse_args(argv)
         assert main.child_wait_timeout(parsed) is None
@@ -296,9 +318,9 @@ def test_interactive_teaching_has_no_fixed_child_timeout():
 def test_serve_requests_returns_selected_detection(tmp_path):
     image = tmp_path / "frame.png"
     image.write_bytes(b"not-real-image")
-    requests = io.StringIO(
-        '{"id":1,"target":"fire","image_path":"%s"}\n' % str(image)
-    )
+    requests = io.StringIO(json.dumps({
+        "id": 1, "target": "fire", "image_path": str(image),
+    }) + "\n")
     responses = io.StringIO()
 
     class Detector:
@@ -327,7 +349,9 @@ def test_serve_requests_returns_selected_detection(tmp_path):
 def test_serve_requests_returns_all_usable_detections_when_target_is_omitted(tmp_path):
     image = tmp_path / "frame.png"
     image.write_bytes(b"not-real-image")
-    requests = io.StringIO('{"id":1,"image_path":"%s"}\n' % str(image))
+    requests = io.StringIO(json.dumps({
+        "id": 1, "image_path": str(image),
+    }) + "\n")
     responses = io.StringIO()
 
     class Detector:
@@ -352,9 +376,9 @@ def test_serve_requests_returns_all_usable_detections_when_target_is_omitted(tmp
 def test_serve_requests_reports_business_error_without_crashing(tmp_path):
     image = tmp_path / "frame.png"
     image.write_bytes(b"not-real-image")
-    requests = io.StringIO(
-        '{"id":1,"target":"fire","image_path":"%s"}\n' % str(image)
-    )
+    requests = io.StringIO(json.dumps({
+        "id": 1, "target": "fire", "image_path": str(image),
+    }) + "\n")
     responses = io.StringIO()
 
     class Detector:

@@ -47,6 +47,7 @@ from block_mono_vision import (
     load_config,
     observation_in_roi,
     parse_target_sequence,
+    scale_box_width_for_distance,
     stable_median_observation,
 )
 
@@ -62,6 +63,9 @@ BLOCK_PRESET_VERSION = 2
 MOTION_SETTLE_SECONDS = DEFAULT_CONFIG["motion_settle_seconds"]
 DEFAULT_BLOCK_PRESET_FILE = (
     "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json"
+)
+DEFAULT_DELIVERY_FILE = (
+    "/home/eaibot/handeye-calib/config/untagged_delivery_presets.json"
 )
 MOTION_LOCK_PATH = "/tmp/mirobot_arm_motion.lock"
 CONTACT_PROBE_ENABLE_SERVICE = "/mirobot_contact_probe_enable"
@@ -114,6 +118,7 @@ def action_uses_moveit(args):
         "teach_block_place",
         "teach_block_idle",
         "teach_block_carry",
+        "teach_building_contact_release",
         "stop_at_taught_pre_grasp",
         "run_taught_block",
         "run_chassis_sequence",
@@ -193,6 +198,7 @@ def parse_args(argv):
     parser.add_argument("--teach-block-place", action="store_true")
     parser.add_argument("--teach-block-idle", action="store_true")
     parser.add_argument("--teach-block-carry", action="store_true")
+    parser.add_argument("--teach-building-contact-release", action="store_true")
     parser.add_argument("--preview-taught-block", action="store_true")
     parser.add_argument("--stop-at-taught-pre-grasp", action="store_true")
     parser.add_argument("--run-taught-block", action="store_true")
@@ -208,6 +214,7 @@ def parse_args(argv):
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
+    parser.add_argument("--delivery-file", default=DEFAULT_DELIVERY_FILE)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--place-approach-gap", type=float, default=0.02)
     parser.add_argument("--known-z-mm", type=float)
@@ -689,6 +696,8 @@ def get_action(args):
         ("teach_block_place", args.teach_block_place),
         ("teach_block_idle", args.teach_block_idle),
         ("teach_block_carry", args.teach_block_carry),
+        ("teach_building_contact_release",
+         args.teach_building_contact_release),
         ("preview_taught_block", args.preview_taught_block),
         ("stop_at_taught_pre_grasp", args.stop_at_taught_pre_grasp),
         ("run_taught_block", args.run_taught_block),
@@ -986,6 +995,16 @@ def collect_observations(args, config, detector):
                 continue
             observation = detection_to_observation(detection)
             observation["stamp_ns"] = capture["stamp_ns"]
+            margin = config.get("horizontal_box_margin_px")
+            if margin is not None:
+                frame_width = int(capture["rgb"].shape[1])
+                left, _top, right, _bottom = observation["box"]
+                margin = finite_scalar(
+                    margin, "horizontal_box_margin_px")
+                if left <= margin or right >= frame_width - 1 - margin:
+                    rospy.logwarn(
+                        "Rejected YOLO detection: horizontal box edge is cropped")
+                    continue
             inside, reason = observation_in_roi(
                 observation, capture["rgb"].shape,
                 config.get(
@@ -1557,9 +1576,12 @@ def build_localization_from_observations(target, observations, capture, args, co
         config["width_cv_max"],
     )
     fx, fy, cx, cy = camera_info_intrinsics(capture["camera_info"])
+    distance_width_px = scale_box_width_for_distance(
+        stable["w"], int(capture["rgb"].shape[1]),
+        config.get("distance_model_frame_width"))
     z_mm = estimate_distance_from_box_mm(
         config["distance_method"],
-        stable["w"],
+        distance_width_px,
         stable["h"],
         fx,
         fy,
@@ -1570,6 +1592,15 @@ def build_localization_from_observations(target, observations, capture, args, co
         config.get("fixed_z_mm"),
         config["max_axis_distance_disagreement_mm"],
     )
+    distance_range = (config.get("distance_ranges_mm") or {}).get(target)
+    if distance_range is not None:
+        minimum, maximum = [
+            finite_scalar(value, "%s distance range" % target)
+            for value in distance_range]
+        if not minimum <= z_mm <= maximum:
+            raise RuntimeError(
+                "%s estimated distance %.1fmm is outside %.1f~%.1fmm" %
+                (target, z_mm, minimum, maximum))
     camera_xyz = deproject_pixel_to_camera_mm(
         stable["u"], stable["v"], z_mm, fx, fy, cx, cy)
     camera_frame = getattr(capture["header"], "frame_id", "") or config["camera_frame"]
@@ -2194,18 +2225,94 @@ def do_run_taught_block_mono(args, config, localization, action):
         raise
 
 
+def teach_building_contact_release(args, config, detector):
+    import mirobot_delivery as delivery_api
+
+    target = args.block_target
+    item_id = target_number(config, target)
+    delivery_preset = delivery_api.load_delivery_preset(
+        args.delivery_file, allow_missing=True)
+    targets = delivery_preset["contact_delivery_targets_by_id"]
+    key = str(item_id)
+    if key in targets and not args.overwrite:
+        raise RuntimeError(
+            "ID%d already has a building contact point; use --overwrite."
+            % item_id)
+
+    block_preset = load_block_preset(args.preset_file)
+    idle_joint_values = require_joint_values(
+        block_preset, "idle_joint_values")
+    arm = build_move_group(config, args.group)
+    prompt_enter(
+        u"示教 ID%d=%s：确认路径安全，按 Enter 先自动移动到"
+        u"无 Tag idle，避免机械臂遮挡楼宇摄像头。" %
+        (item_id, safe_log_text(target)))
+    execute_joint_values(
+        arm, idle_joint_values,
+        "building_%d_teach_idle" % item_id)
+
+    localization = compute_block_localization(args, config, detector)
+    current_orientation = copy.deepcopy(
+        arm.get_current_pose().pose.orientation)
+    assist_pose = build_teach_assist_pose(
+        localization, current_orientation, config)
+    assist_distance_mm = finite_scalar(
+        config["teach_assist_distance_mm"], "teach_assist_distance_mm")
+    rospy.loginfo(pose_to_text(
+        "building_%d_teach_assist_front" % item_id, assist_pose))
+    prompt_enter(
+        u"已完成楼宇稳定检测、纯RGB估距和手眼TF定位。\n"
+        u"确认路径安全，按 Enter 自动移动到检测楼面前约 %.0fmm。" %
+        assist_distance_mm)
+    try:
+        execute_pose(
+            arm, assist_pose,
+            "building_%d_teach_assist_front" % item_id)
+    except RuntimeError as exc:
+        rospy.logwarn(
+            "Building teach-assist move failed: %s. Continue with RViz.",
+            ascii_log_text(exc))
+    prompt_enter(
+        u"请从当前较远安全点开始，在 RViz 中 Plan/Execute 微调到"
+        u"靠近、正对但不接触楼面的预投递点 P；到位后按 Enter 保存。")
+    rospy.sleep(MOTION_SETTLE_SECONDS)
+    precontact_pose = arm.get_current_pose()
+    validate_pose_workspace(
+        precontact_pose, config,
+        "building_%d_taught_precontact" % item_id)
+    pickup_model = create_block_pickup_model(
+        precontact_pose, localization["camera_forward_base"])
+    targets[key] = {
+        "precontact_joint_values": delivery_api.validate_joint_values(
+            list(arm.get_current_joint_values()),
+            "ID%d current joint values" % item_id),
+        "approach_axis_xyz_base":
+            pickup_model["approach_axis_xyz_base"],
+    }
+    delivery_api.save_delivery_preset(args.delivery_file, delivery_preset)
+    rospy.loginfo(
+        "ID%d building contact point saved: joints=%s safe_axis=%s",
+        item_id, targets[key]["precontact_joint_values"],
+        targets[key]["approach_axis_xyz_base"])
+
+
 def do_block_mono(args, config):
     action = get_action(args)
     if action == "calib_record" and args.known_z_mm is None:
         raise RuntimeError("--calib-record requires --known-z-mm.")
     if action in ("teach_block_pick_place", "teach_block_pregrasp",
                   "teach_block_place",
+                  "teach_building_contact_release",
                   "preview_taught_block", "stop_at_taught_pre_grasp",
                   "run_taught_block"):
         require_taught_target(args, action)
 
     request_stream, response_stream = open_detector_streams(args)
     try:
+        if action == "teach_building_contact_release":
+            detector = DetectorClient(request_stream, response_stream)
+            teach_building_contact_release(args, config, detector)
+            return
         if action == "live_preview":
             detector = DetectorClient(request_stream, response_stream)
             run_live_preview(args, config, detector)

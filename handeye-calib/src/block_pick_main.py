@@ -33,6 +33,9 @@ DEFAULT_ARM_SCRIPT = "/home/eaibot/handeye-calib/src/mirobot_pick_test.py"
 DEFAULT_BLOCK_PRESET_FILE = (
     "/home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json"
 )
+DEFAULT_DELIVERY_FILE = (
+    "/home/eaibot/handeye-calib/config/untagged_delivery_presets.json"
+)
 DEFAULT_PYTHON2 = "/usr/bin/python2"
 NORMAL_CHILD_TIMEOUT = 180.0
 STOP_CHILD_TIMEOUT = 3.0
@@ -94,6 +97,7 @@ def parse_args(argv=None):
     action.add_argument("--teach-block-place", action="store_true")
     action.add_argument("--teach-block-idle", action="store_true")
     action.add_argument("--teach-block-carry", action="store_true")
+    action.add_argument("--teach-building-contact-release", action="store_true")
     action.add_argument("--preview-taught-block", action="store_true")
     action.add_argument("--stop-at-taught-pre-grasp", action="store_true")
     action.add_argument("--run-taught-block", action="store_true")
@@ -117,6 +121,7 @@ def parse_args(argv=None):
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
+    parser.add_argument("--delivery-file", default=DEFAULT_DELIVERY_FILE)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--known-z-mm", type=float)
     parser.add_argument("--frames", type=int)
@@ -155,6 +160,8 @@ def selected_action(args):
         ("teach_block_place", bool(args.teach_block_place)),
         ("teach_block_idle", bool(args.teach_block_idle)),
         ("teach_block_carry", bool(args.teach_block_carry)),
+        ("teach_building_contact_release",
+         bool(args.teach_building_contact_release)),
         ("preview_taught_block", bool(args.preview_taught_block)),
         ("stop_at_taught_pre_grasp", bool(args.stop_at_taught_pre_grasp)),
         ("run_taught_block", bool(args.run_taught_block)),
@@ -178,6 +185,7 @@ def child_wait_timeout(args):
         "teach_block_place",
         "teach_block_idle",
         "teach_block_carry",
+        "teach_building_contact_release",
     ):
         return None
     return args.arm_timeout
@@ -234,6 +242,7 @@ def validate_runtime_args(args, config):
         "teach_block_pick_place",
         "teach_block_pregrasp",
         "teach_block_place",
+        "teach_building_contact_release",
         "preview_taught_block",
         "stop_at_taught_pre_grasp",
         "run_taught_block",
@@ -409,6 +418,8 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--teach-block-idle")
     if args.teach_block_carry:
         command.append("--teach-block-carry")
+    if args.teach_building_contact_release:
+        command.append("--teach-building-contact-release")
     if args.preview_taught_block:
         command.append("--preview-taught-block")
     if args.stop_at_taught_pre_grasp:
@@ -431,6 +442,8 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--skip-startup-home")
     if args.preset_file:
         command += ["--preset-file", args.preset_file]
+    if args.delivery_file:
+        command += ["--delivery-file", args.delivery_file]
     if args.overwrite:
         command.append("--overwrite")
     if args.known_z_mm is not None:

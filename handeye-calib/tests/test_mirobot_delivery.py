@@ -190,9 +190,6 @@ def test_contact_release_teach_saves_p_joints_and_safe_side_direction(tmp_path):
     teach_contact_release, load_delivery_preset = load_symbols(
         "teach_contact_release", "load_delivery_preset")
     path = tmp_path / "untagged_delivery.json"
-    tag_path = tmp_path / "tag.json"
-    write_tag_preset(tag_path)
-    moves = []
     poses = iter([
         SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(
             x=0.20, y=0.10, z=0.30))),
@@ -203,16 +200,13 @@ def test_contact_release_teach_saves_p_joints_and_safe_side_direction(tmp_path):
         get_current_pose=lambda: next(poses),
         get_current_joint_values=lambda: [1, 2, 3, 4, 5, 6])
     teach_contact_release.__globals__.update({
-        "prompt_enter": lambda *args, **kwargs: None,
-        "arm_api": SimpleNamespace(
-            execute_joint_values=lambda arm, joints, label: moves.append(
-                (list(joints), label))),
+        "prompt_enter": lambda message: None,
         "rospy": SimpleNamespace(sleep=lambda seconds: None,
                                  loginfo=lambda *items: None),
     })
     args = SimpleNamespace(
         delivery_file=str(path), sequence=[2], overwrite=False,
-        teach_settle_seconds=0.0, tag_preset_file=str(tag_path))
+        teach_settle_seconds=0.0)
 
     teach_contact_release(args, arm)
     target = load_delivery_preset(str(path))[
@@ -220,8 +214,6 @@ def test_contact_release_teach_saves_p_joints_and_safe_side_direction(tmp_path):
 
     assert target["precontact_joint_values"] == [1, 2, 3, 4, 5, 6]
     assert target["approach_axis_xyz_base"] == pytest.approx([1, 0, 0])
-    assert moves == [([0, 1, 2, 3, 4, 5],
-                      "idle_before_contact_teach_2")]
 
 
 def test_three_delivery_points_are_taught_by_separate_modes(tmp_path):
