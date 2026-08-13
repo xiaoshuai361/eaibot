@@ -313,7 +313,7 @@ python3 block_pick_main.py \
 第 6 节抓取后放入载物仓的示教不是一回事。楼宇投递需要完成两类数据：
 
 ```text
-楼宇视觉停车标定：building_delivery_calibration.json
+楼宇视觉距离标定：building_delivery_calibration.json
 四类机械臂投递点P：untagged_delivery_presets.json
 ```
 
@@ -330,7 +330,18 @@ cp /home/eaibot/handeye-calib/config/building_delivery_calibration.json \
 第二个文件首次标定时可能还不存在，此时跳过第二条备份命令。Windows 仓库中的
 文件不能覆盖真机生成的 JSON。
 
-### 9.2 标定四类楼宇的停车画面
+如果该 JSON 是之前单点框尺度方案生成的 `"version": 1`，备份后还要把原文件
+移开，才能创建新的多距离版本；若已经是 `"version": 2` 则不要移开，否则会丢失
+已完成的其他类别：
+
+```bash
+grep '"version"' /home/eaibot/handeye-calib/config/building_delivery_calibration.json
+# 只有显示 version 1 时执行：
+mv /home/eaibot/handeye-calib/config/building_delivery_calibration.json \
+  /home/eaibot/handeye-calib/config/building_delivery_calibration_single_point.json
+```
+
+### 9.2 标定四类楼宇的真实距离
 
 楼宇与物资 ID 对应关系：
 
@@ -341,11 +352,26 @@ cp /home/eaibot/handeye-calib/config/building_delivery_calibration.json \
 | 3 | 有毒气体楼宇 |
 | 4 | 坍塌楼宇 |
 
-先关闭比赛主程序以及其他占用 `/dev/video2` 的程序。第一次确定停车位置时，先让
-机械臂处于 idle，人工低速移动底盘，使车身正对楼面且楼宇框完整可见；再在 RViz
-中试走一次“安全点、P、前探方向”，确认 P 后方 `30mm` 可达、从 P 向前最多
-`65mm` 不会碰到楼宇以外的结构，也没有明显关节极限。确认后让机械臂回 idle，
-车辆保持不动，再运行对应 ID 的视觉标定：
+原理与第 5 节无 Tag 物块的纯 RGB 距离标定相同。针对每类楼宇，在多个已知真实
+距离采集 YOLO 框，分别拟合：
+
+```text
+Z_width  = a_width  / 框宽像素 + b_width
+Z_height = a_height / 框高像素 + b_height
+运行时距离 = 两项估计的中位数
+```
+
+机械臂 P 的示教参考距离为 `450mm`，标定范围向前、向后各扩大 `200mm`。默认采集点为：
+
+```text
+250、300、350、400、410、420、430、440、450、460、470、480、490、500、550、600、650mm
+```
+
+`400~500mm` 每 `10mm` 加密，每类、每个距离采集 `10` 帧，共 `170` 帧/类。
+真实距离是 `/dev/video2` RGB 镜头平面到楼宇正面的垂直距离。每次测量时车辆和
+摄像机保持正对楼面，楼宇 YOLO 框必须完整，不能碰到画面边缘。
+
+先关闭比赛主程序以及其他占用 `/dev/video2` 的程序，然后按 ID 分别运行：
 
 ```bash
 source /opt/ros/melodic/setup.bash
@@ -353,31 +379,38 @@ source /home/eaibot/robocom_ws/devel/setup.bash
 conda activate ww
 cd /home/eaibot/robocom_ws/src
 
-python3 -m zcy_last.building_delivery_calibrate --target 1
+python3 -m zcy_last.building_delivery_calibrate \
+  --target 1 \
+  --distances 250,300,350,400,410,420,430,440,450,460,470,480,490,500,550,600,650 \
+  --frames 10 \
+  --reference-distance-mm 450
 ```
 
-程序会从 `/dev/video2` 的原始 `320×240` 画面采集该楼宇的 30 个有效框，完成后
-保存框中心中位数、框尺度中位数及 MAD。依次把车辆移动到另外三类楼宇的正确
-位置，并把命令中的 `--target` 改成 `2、3、4`。必须分别执行四次，不能在车辆
-不动时连续标定四类。
+程序会逐个提示真实距离。用卷尺把镜头平面移动到提示距离，确认后按 Enter；
+当前距离已经采过时会自动跳过，所以中断后可用同一命令续采。某个近距离下楼宇
+框已经被画面裁切时输入 `s` 跳过，不能拿裁切框拟合距离。依次把 `--target` 改成
+`2、3、4`，四类必须分别完成。
 
 每次命令只原子更新当前 ID，不会覆盖另外三类。重复运行同一个 ID 会更新该类
-旧值。默认输出：
+旧值；只有全部计划采集结束并成功拟合后才更新 JSON。原始 CSV 和最终模型分别为：
 
 ```text
+/home/eaibot/handeye-calib/config/building_delivery_distance_samples_building_new_320x240/
 /home/eaibot/handeye-calib/config/building_delivery_calibration.json
 ```
 
 如果实际画面不是 `320×240`、检测不到指定类别或模型文件发生变化，程序会拒绝
-保存；不要手工修改 JSON 绕过检查。
+保存。旧的单点框尺度 `version: 1` 文件不能继续使用，必须备份后重新完成四类
+多距离标定；不要手工修改 JSON 绕过检查。
 
 ### 9.3 示教四类机械臂预投递点 P
 
 保持终端 2 的 MoveIt 和 RViz 运行。该示教不需要 Astra、手眼 TF 或楼宇 YOLO。
-示教某个 ID 时，车辆必须仍停在该类刚才采集视觉标定的同一位置。最稳妥的现场
-顺序是“停好 ID1 -> 标定 ID1 楼宇框 -> 不动底盘示教 ID1 的 P -> 再去 ID2”。
-程序支持一次连续示教多个 ID，但现场推荐按 ID 分开，避免移动底盘后把类别和 P
-对应错。
+示教某个 ID 时，必须用卷尺把 `/dev/video2` 镜头平面放在该楼面正前方
+`450mm`，这要与距离标定命令的 `--reference-distance-mm 450` 一致。先让机械臂处于
+idle，在 RViz 中确认 P 后方 `30mm` 可达、从 P 向前最多 `65mm` 不会碰到楼宇
+以外结构，也没有明显关节极限。程序支持一次连续示教多个 ID，但现场推荐按 ID
+分开，避免移动底盘后把类别和 P 对应错。
 
 一次连续示教四类的可选命令：
 
@@ -448,7 +481,7 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
 
 ## 10. 正式循迹自动投递
 
-完成四类楼宇停车标定和四类 P 示教后，正式任务使用：
+完成四类楼宇距离标定和四类 P 示教后，正式任务使用：
 
 ```bash
 cd /home/eaibot/robocom_ws/src
@@ -457,7 +490,11 @@ python3 -m zcy_last.main \
   --untagged-pick --untagged-pick-count 4 --untagged-delivery
 ```
 
-识别到库存对应楼宇后，程序先进入 `BUILDING_DELIVERY_ALIGN`。它只跟踪锁定类别，
-先校正中心，再以 `0.012m/s` 接近；框尺度达到标定值的 `95%`、中心误差不超过
-画宽 `5%` 且连续满足 3 个新鲜帧后停车并启动机械臂。锁定类别丢失、框尺度超过
-标定值 `110%` 或对准超过 25 秒都会立即停车、放弃该 ID、恢复循迹且不重试。
+底盘继续按原循迹前进，不做楼宇单独旋转或距离闭环。楼宇 YOLO 框中心进入现有
+画面中央 `65%` 区域时，原 `YOLO_STOP` 逻辑立即停车。停车框的宽、高模型只用于
+估算镜头到楼面的真实距离，不参与停车判断。
+
+机械臂以 `450mm` 时示教的 P 为基准，按“停车估距 - 450mm”沿已示教前探轴修正
+P。例如停车估距为 `550mm`，P 沿墙面方向前移 `100mm`；随后仍执行“P 后方
+30mm -> 5mm步长到P -> 2mm步长最多前探65mm”。框裁切、宽高估距相差超过
+`60mm` 或估距超出已采集的 `250~650mm` 时不启动机械臂，该 ID 记为投递失败。

@@ -154,4 +154,4 @@ def test_controller_owns_contact_signal_on_the_shared_pump_serial():
     assert "readContactTriggered(&triggered)" in source
     assert "for (size_t index = 1; index < point_count; ++index)" in source
     assert "waitForFirmwareTarget(" in source
-    assert "Contact probe stopped at the current 2 mm waypoint." in source
+    assert "Contact probe stopped at the current guarded waypoint." in source

@@ -291,7 +291,7 @@ A_PICK_PREPARE：停车，启动 Astra/机械臂/无Tag模型
 
 ## 9. 投递和权威数据
 
-有 Tag 街区保持原固定点投递。无 Tag 楼宇现使用 `/dev/video2` 的 320×240 YOLO 框完成底盘对准，再执行四类独立的机械臂接触投递；不使用相机内参或手眼标定。两套库存继续共用 `delivery_presets.json` 中 ID 1~4 的 `cargo_pick_joint_values_by_id`，不得拆分仓内抓取点。中转点和 idle 按来源独立：
+有 Tag 街区保持原固定点投递。无 Tag 楼宇沿用现有 YOLO 中心区域停车：框中心进入画面中央 `65%` 区域就进入 `YOLO_STOP`，底盘不旋转，也不做距离闭环。停车后使用 `/dev/video2` 的 320×240 YOLO 框宽/高双模型估算真实毫米距离，并将相对 `450mm` 示教参考距离的差值交给机械臂沿前探轴修正 P。该流程不使用相机内参或手眼标定。两套库存继续共用 `delivery_presets.json` 中 ID 1~4 的 `cargo_pick_joint_values_by_id`，不得拆分仓内抓取点。中转点和 idle 按来源独立：
 
 ```text
 共用仓内抓取点：/home/eaibot/handeye-calib/config/delivery_presets.json
@@ -310,6 +310,7 @@ A_PICK_PREPARE：停车，启动 Astra/机械臂/无Tag模型
 /home/eaibot/handeye-calib/config/delivery_presets.json
 /home/eaibot/handeye-calib/config/untagged_delivery_presets.json
 /home/eaibot/handeye-calib/config/building_delivery_calibration.json
+/home/eaibot/handeye-calib/config/building_delivery_distance_samples_building_new_320x240/
 /home/eaibot/handeye-calib/config/astra_rgb_640x480.yaml
 手眼标定结果
 ```
@@ -331,7 +332,7 @@ py -3.9 -m pytest -q \
   --deselect=handeye-calib/tests/test_block_pick_main.py::test_serve_requests_reports_business_error_without_crashing
 ```
 
-结果：`277 passed, 3 deselected`；本轮改动脚本通过 Python 3.9 `py_compile`；`git diff --check` 通过。排除项依赖 Linux/ROS 运行语义或测试中未转义的 Windows 路径，仍需在真机验证。
+结果：`274 passed, 3 deselected`；本轮改动脚本通过 Python 3.9 `py_compile`；`git diff --check` 通过。排除项依赖 Linux/ROS 运行语义或测试中未转义的 Windows 路径，仍需在真机验证。
 
 这只证明离线逻辑和接口回归通过，不代表：
 
@@ -371,4 +372,4 @@ A 点搜索阶段底盘冲突         -> ready/trigger/release 与 /cmd_vel 所�
 
 ## 13. 一句话交接
 
-当前系统已形成“抓取视觉粗对准 + 两套抓取共用预抓语义 + 无Tag楼宇框停车 + 四类独立磁吸P + 限位真实接触 + 30mm直退 + JSON真实库存 + 总调度严格资源交接”的完整离线实现；下一位 AI 的重点是保护用户未提交工作和真机权威数据，完成分层真机验收，而不是重新设计抓取算法。
+当前系统已形成“抓取视觉粗对准 + 两套抓取共用预抓语义 + 楼宇中心区域停车 + 无Tag楼宇多距离估距修正P + 四类独立磁吸P + 限位真实接触 + 30mm直退 + JSON真实库存 + 总调度严格资源交接”的完整离线实现；下一位 AI 的重点是保护用户未提交工作和真机权威数据，完成分层真机验收，而不是重新设计抓取算法。

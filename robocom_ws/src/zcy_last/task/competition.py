@@ -12,10 +12,9 @@ import rospy
 from geometry_msgs.msg import Twist
 
 from ..algorithms.building_delivery import (
-    compute_building_alignment_command,
+    estimate_building_distance_mm,
     load_building_calibration,
     require_building_target,
-    select_locked_building_detection,
 )
 from ..algorithms.vision import *  # noqa: F401,F403
 from ..config import *  # noqa: F401,F403
@@ -248,10 +247,6 @@ class LaneFollower(object):
         self.yolo_stop_reported = False
         self.yolo_stop_report_seq = 0
         self.building_delivery_calibration = None
-        self.building_delivery_event = None
-        self.building_delivery_entry = None
-        self.building_delivery_stable_hits = 0
-        self.building_delivery_last_fresh_time = 0.0
         self.yolo_segment_key = None
         self.yolo_segment_start_seq = 0
         self.yolo_accept_after = 0.0
@@ -941,19 +936,45 @@ class LaneFollower(object):
                 label, item_id,
             )
             return False
+        distance_offset_m = 0.0
         if source == "untagged":
-            return self._begin_building_delivery_alignment(event, item_id)
+            try:
+                entry = require_building_target(
+                    self.building_delivery_calibration,
+                    item_id, event.class_name)
+                _center_ratio, distance_mm = estimate_building_distance_mm(
+                    event.detection, entry, event.detection.frame_shape,
+                    BUILDING_DELIVERY_MAX_AXIS_DISAGREEMENT_MM)
+                reference_mm = float(entry["reference_distance_mm"])
+                distance_offset_m = (distance_mm - reference_mm) * 0.001
+                rospy.loginfo(
+                    "line_cy_task 无 Tag ID%d 停车估距 %.1fmm，"
+                    "示教参考 %.1fmm，机械臂P修正 %+.1fmm",
+                    item_id, distance_mm, reference_mm,
+                    distance_offset_m * 1000.0,
+                )
+            except Exception as exc:
+                failed_ids.add(item_id)
+                rospy.logwarn(
+                    "line_cy_task 无 Tag ID%d 楼宇估距失败：%s；不重试",
+                    item_id, exc,
+                )
+                return False
         return self._launch_delivery_process(event, source, label, item_id,
-                                             failed_ids)
+                                             failed_ids, distance_offset_m)
 
     def _launch_delivery_process(self, event, source, label, item_id,
-                                 failed_ids):
+                                 failed_ids, distance_offset_m=0.0):
         try:
             self.publish(0, 0, force=True)
             self.velocity_owner = "grasp"
             self.active_delivery_source = source
             self.active_delivery_id = item_id
-            self.grasp_coordinator.start_delivery(source, [item_id])
+            if source == "untagged":
+                self.grasp_coordinator.start_delivery(
+                    source, [item_id], distance_offset_m)
+            else:
+                self.grasp_coordinator.start_delivery(source, [item_id])
             self._set_state("DELIVERING")
             rospy.loginfo(
                 "line_cy_task %s识别到%s，开始投递%s ID%d",
@@ -971,107 +992,6 @@ class LaneFollower(object):
                 label, item_id, exc,
             )
             return False
-
-    def _begin_building_delivery_alignment(self, event, item_id):
-        try:
-            if self.building_delivery_calibration is None:
-                raise RuntimeError("未加载楼宇投递视觉标定")
-            entry = require_building_target(
-                self.building_delivery_calibration,
-                item_id,
-                event.class_name,
-            )
-        except Exception as exc:
-            self.untagged_delivery_failed_ids.add(item_id)
-            rospy.logwarn(
-                "line_cy_task 无 Tag ID%d 无法开始楼宇对准：%s；不重试",
-                item_id, exc,
-            )
-            return False
-        self.publish(0, 0, force=True)
-        self.velocity_owner = "line"
-        self.building_delivery_event = event
-        self.building_delivery_entry = entry
-        self.building_delivery_stable_hits = 0
-        self.building_delivery_last_fresh_time = rospy.get_time()
-        self._set_state("BUILDING_DELIVERY_ALIGN")
-        rospy.loginfo(
-            "line_cy_task 锁定%s，开始无 Tag ID%d 楼宇视觉对准",
-            event.display_name, item_id,
-        )
-        return True
-
-    def _fail_building_delivery_alignment(self, reason):
-        event = self.building_delivery_event
-        item_id = self._delivery_id_for_event(event)
-        self.publish(0, 0, force=True)
-        self.velocity_owner = "line"
-        if item_id is not None:
-            self.untagged_delivery_failed_ids.add(item_id)
-        self.building_delivery_event = None
-        self.building_delivery_entry = None
-        self.building_delivery_stable_hits = 0
-        rospy.logwarn(
-            "line_cy_task 无 Tag ID%s 楼宇对准失败：%s；不重试并继续循迹",
-            item_id if item_id is not None else "?", reason,
-        )
-        self._set_state("FOLLOW")
-
-    def _handle_building_delivery_align(self, now):
-        if self.state != "BUILDING_DELIVERY_ALIGN":
-            return False
-        if float(now) - self.state_started >= \
-                BUILDING_DELIVERY_ALIGN_TIMEOUT:
-            self._fail_building_delivery_alignment("超过25秒")
-            return True
-        sampled, detections = self._poll_yolo_detections()
-        if not sampled:
-            if float(now) - self.building_delivery_last_fresh_time > \
-                    BUILDING_DELIVERY_MAX_DETECTION_AGE:
-                self._fail_building_delivery_alignment("YOLO推理帧超时")
-            return True
-        self.building_delivery_last_fresh_time = float(now)
-        event = self.building_delivery_event
-        detection = select_locked_building_detection(
-            detections, event.class_name, self.yolo_building_confidence)
-        if detection is None:
-            self._fail_building_delivery_alignment(
-                "新鲜推理帧丢失锁定类别%s" % event.class_name)
-            return True
-        command = compute_building_alignment_command(
-            detection,
-            self.building_delivery_entry,
-            detection.frame_shape,
-            BUILDING_DELIVERY_DRIVE_SPEED,
-            BUILDING_DELIVERY_CENTER_TOLERANCE_RATIO,
-            BUILDING_DELIVERY_STOP_SCALE_FACTOR,
-            BUILDING_DELIVERY_OVERCLOSE_SCALE_FACTOR,
-            BUILDING_DELIVERY_ANGULAR_GAIN,
-            BUILDING_DELIVERY_MAX_ANGULAR,
-        )
-        if command.status == "overclose":
-            self._fail_building_delivery_alignment("楼宇框超过标定尺度110%")
-            return True
-        if command.status == "ready":
-            self.publish(0, 0, force=True)
-            self.building_delivery_stable_hits += 1
-            if self.building_delivery_stable_hits < \
-                    BUILDING_DELIVERY_STABLE_FRAMES:
-                return True
-            item_id = self._delivery_id_for_event(event)
-            self.building_delivery_event = None
-            self.building_delivery_entry = None
-            self.building_delivery_stable_hits = 0
-            started = self._launch_delivery_process(
-                event, "untagged", "无 Tag", item_id,
-                self.untagged_delivery_failed_ids,
-            )
-            if not started:
-                self._set_state("FOLLOW")
-            return True
-        self.building_delivery_stable_hits = 0
-        self.publish(command.linear_x, command.angular_z)
-        return True
 
     def _finish_delivery(self, success, error=None):
         source = self.active_delivery_source
@@ -1182,7 +1102,7 @@ class LaneFollower(object):
                 self.state_started + EXIT_ENTRY_IGNORE_TIME
             )
         if state == "FOLLOW" and previous_state in (
-                "YOLO_STOP", "BUILDING_DELIVERY_ALIGN", "DELIVERING"):
+                "YOLO_STOP", "DELIVERING"):
             ignore_time = max(0.0, float(getattr(
                 self, "yolo_event_ignore_time", YOLO_EVENT_IGNORE_TIME
             )))
@@ -1197,7 +1117,6 @@ class LaneFollower(object):
                 self.state_started + EXIT_ENTRY_IGNORE_TIME
             )
         if state in ("FOLLOW", "MANEUVER", "FINAL_EXIT", "YOLO_STOP",
-                     "BUILDING_DELIVERY_ALIGN",
                      "TRAFFIC_WAIT", "PICK_RECOVER", "DELIVERING",
                      "A_PICK_SEARCH"):
             self.crosswalk.unlock_bar()
@@ -1408,11 +1327,10 @@ class LaneFollower(object):
         if not self.yolo_enabled:
             return False
         if getattr(self, "state", None) not in (
-                "FOLLOW", "YOLO_STOP", "BUILDING_DELIVERY_ALIGN"):
+                "FOLLOW", "YOLO_STOP"):
             return False
         return (
-            getattr(self, "state", None) in (
-                "YOLO_STOP", "BUILDING_DELIVERY_ALIGN")
+            getattr(self, "state", None) == "YOLO_STOP"
             or self._current_yolo_context().get("kind") != "off"
         )
 
@@ -1552,9 +1470,6 @@ class LaneFollower(object):
 
         elif self.state == "YOLO_STOP":
             self._handle_yolo_stop(now)
-
-        elif self.state == "BUILDING_DELIVERY_ALIGN":
-            self._handle_building_delivery_align(now)
 
         elif self.state == "APPROACH":
             bridge_binary = mask_crosswalk(binary, cross, include_loose=True)
@@ -1883,10 +1798,6 @@ class LaneFollower(object):
                 ok, frame = self.camera.read(1.0)
                 if ok:
                     self.process(frame)
-                elif self.state == "BUILDING_DELIVERY_ALIGN":
-                    # 楼宇对准由独立 YOLO 相机驱动；即使巡线相机临时无帧，
-                    # 仍要执行丢帧超时并保证底盘及时停车。
-                    self._handle_building_delivery_align(rospy.get_time())
                 else:
                     self.publish(0, 0)
                 rate.sleep()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""Pure helpers for repeatable YOLO-guided building delivery alignment."""
+"""YOLO building-box calibration for mechanical-arm delivery distance."""
 
 import json
 import math
@@ -9,19 +9,12 @@ import os
 import numpy as np
 
 
-CALIBRATION_VERSION = 1
-
-
-class BuildingAlignmentCommand(object):
-    def __init__(self, status, linear_x, angular_z):
-        self.status = str(status)
-        self.linear_x = float(linear_x)
-        self.angular_z = float(angular_z)
+CALIBRATION_VERSION = 2
 
 
 def _finite(value, label):
     number = float(value)
-    if math.isnan(number) or math.isinf(number):
+    if not math.isfinite(number):
         raise RuntimeError("%s must be finite" % label)
     return number
 
@@ -33,52 +26,75 @@ def _positive_int(value, label):
     return number
 
 
-def building_box_measurement(detection, frame_shape):
+def building_box_geometry(detection, frame_shape, edge_margin_px=1.0):
     height, width = [int(value) for value in frame_shape[:2]]
     if width <= 0 or height <= 0:
         raise RuntimeError("building frame dimensions must be positive")
     x1, y1, x2, y2 = [float(value) for value in detection.box]
+    margin = max(0.0, float(edge_margin_px))
+    if x1 <= margin or y1 <= margin \
+            or x2 >= width - 1 - margin or y2 >= height - 1 - margin:
+        raise RuntimeError("楼宇检测框接触画面边缘，不能用于距离估计")
     box_width = x2 - x1
     box_height = y2 - y1
     if box_width <= 0.0 or box_height <= 0.0:
         raise RuntimeError("building detection box must have positive area")
-    center_x_ratio = ((x1 + x2) * 0.5) / float(width)
-    scale_ratio = math.sqrt(
-        (box_width / float(width)) * (box_height / float(height)))
-    return center_x_ratio, scale_ratio
+    return {
+        "center_x_ratio": ((x1 + x2) * 0.5) / float(width),
+        "width_px": box_width,
+        "height_px": box_height,
+    }
 
 
-def _median_and_mad(values, label):
-    data = np.asarray([_finite(value, label) for value in values],
-                      dtype=np.float64)
-    if data.size == 0:
-        raise RuntimeError("%s has no samples" % label)
-    median = float(np.median(data))
-    mad = float(np.median(np.abs(data - median)))
-    return median, mad
+def _aggregate_by_distance(samples):
+    groups = {}
+    for distance_mm, width_px, height_px in samples:
+        values = tuple(_finite(value, "distance sample") for value in (
+            distance_mm, width_px, height_px))
+        if any(value <= 0.0 for value in values):
+            raise RuntimeError("building distance samples must be positive")
+        groups.setdefault(round(values[0], 3), []).append(values)
+    return [tuple(np.median(groups[key], axis=0).tolist())
+            for key in sorted(groups)]
 
 
-def build_calibration_entry(item_id, class_name, measurements,
-                            frame_width, frame_height, model_name):
-    if not measurements:
-        raise RuntimeError("building calibration needs at least one sample")
-    centers = [item[0] for item in measurements]
-    scales = [item[1] for item in measurements]
-    center_median, center_mad = _median_and_mad(
-        centers, "center_x_ratio")
-    scale_median, scale_mad = _median_and_mad(scales, "scale_ratio")
-    if not 0.0 <= center_median <= 1.0:
-        raise RuntimeError("building center calibration is outside the frame")
-    if not 0.0 < scale_median <= 1.0:
-        raise RuntimeError("building scale calibration is invalid")
+def _fit_axis(samples, index):
+    distances = np.asarray([item[0] for item in samples], dtype=np.float64)
+    pixels = np.asarray([item[index] for item in samples], dtype=np.float64)
+    design = np.column_stack((1.0 / pixels, np.ones_like(pixels)))
+    coefficients, _residuals, _rank, _singular = np.linalg.lstsq(
+        design, distances, rcond=None)
+    predicted = design.dot(coefficients)
+    errors = predicted - distances
+    if coefficients[0] <= 0.0:
+        raise RuntimeError("楼宇框尺寸与真实距离不满足反比例关系")
+    return {
+        "a": float(coefficients[0]),
+        "b": float(coefficients[1]),
+        "rmse_mm": float(np.sqrt(np.mean(errors ** 2))),
+        "max_error_mm": float(np.max(np.abs(errors))),
+    }
+
+
+def build_distance_calibration_entry(
+        item_id, class_name, samples, frame_width, frame_height,
+        model_name, reference_distance_mm):
+    if len(samples) < 6:
+        raise RuntimeError("楼宇距离标定至少需要6帧有效样本")
+    aggregated = _aggregate_by_distance(samples)
+    if len(aggregated) < 3:
+        raise RuntimeError("楼宇距离标定至少需要3个不同真实距离")
     return {
         "item_id": int(item_id),
         "class_name": str(class_name),
-        "center_x_ratio": center_median,
-        "center_x_mad": center_mad,
-        "scale_ratio": scale_median,
-        "scale_mad": scale_mad,
-        "sample_count": len(measurements),
+        "reference_distance_mm": _finite(
+            reference_distance_mm, "reference_distance_mm"),
+        "min_distance_mm": float(aggregated[0][0]),
+        "max_distance_mm": float(aggregated[-1][0]),
+        "width": _fit_axis(aggregated, 1),
+        "height": _fit_axis(aggregated, 2),
+        "sample_count": len(samples),
+        "distance_point_count": len(aggregated),
         "frame_width": _positive_int(frame_width, "frame_width"),
         "frame_height": _positive_int(frame_height, "frame_height"),
         "model_name": os.path.basename(str(model_name)),
@@ -108,8 +124,9 @@ def load_building_calibration(path, expected_width=None,
     except (IOError, OSError, ValueError) as exc:
         raise RuntimeError("无法读取楼宇投递标定：%s" % exc)
     if payload.get("version") != CALIBRATION_VERSION:
-        raise RuntimeError("不支持的楼宇投递标定版本：%r" %
-                           payload.get("version"))
+        raise RuntimeError(
+            "楼宇标定不是多距离版本，请备份并重新标定四类：version=%r"
+            % payload.get("version"))
     width = _positive_int(payload.get("frame_width"), "frame_width")
     height = _positive_int(payload.get("frame_height"), "frame_height")
     if expected_width is not None and width != int(expected_width):
@@ -132,77 +149,74 @@ def save_building_calibration(path, payload):
     directory = os.path.dirname(os.path.abspath(path))
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
-    tmp_path = path + ".tmp"
+    temporary = path + ".tmp"
     try:
-        with open(tmp_path, "w") as handle:
+        with open(temporary, "w") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
-        if hasattr(os, "replace"):
-            os.replace(tmp_path, path)
-        else:
-            os.rename(tmp_path, path)
+        os.replace(temporary, path)
     except Exception:
         try:
-            os.unlink(tmp_path)
+            os.unlink(temporary)
         except OSError:
             pass
         raise
 
 
 def require_building_target(calibration, item_id, class_name=None):
-    targets = calibration.get("targets", {})
-    entry = targets.get(str(int(item_id)))
+    entry = calibration.get("targets", {}).get(str(int(item_id)))
     if not isinstance(entry, dict):
-        raise RuntimeError("楼宇投递缺少ID%d视觉标定" % int(item_id))
+        raise RuntimeError("楼宇投递缺少ID%d距离标定" % int(item_id))
     if int(entry.get("item_id", -1)) != int(item_id):
         raise RuntimeError("楼宇投递ID%d标定内容不一致" % int(item_id))
     if class_name is not None and str(entry.get("class_name")) != str(class_name):
         raise RuntimeError("楼宇投递ID%d类别不一致：%s != %s" % (
             int(item_id), entry.get("class_name"), class_name))
-    for key in ("center_x_ratio", "scale_ratio"):
-        entry[key] = _finite(entry.get(key), key)
-    if not 0.0 <= entry["center_x_ratio"] <= 1.0:
-        raise RuntimeError("楼宇投递ID%d中心标定无效" % int(item_id))
-    if not 0.0 < entry["scale_ratio"] <= 1.0:
-        raise RuntimeError("楼宇投递ID%d尺度标定无效" % int(item_id))
+    reference = _finite(
+        entry.get("reference_distance_mm"), "reference_distance_mm")
+    minimum = _finite(entry.get("min_distance_mm"), "min_distance_mm")
+    maximum = _finite(entry.get("max_distance_mm"), "max_distance_mm")
+    if reference <= 0.0 or minimum <= 0.0 or maximum <= minimum:
+        raise RuntimeError("楼宇投递距离范围无效")
+    if not minimum <= reference <= maximum:
+        raise RuntimeError("楼宇投递示教参考距离不在标定范围内")
+    for axis in ("width", "height"):
+        model = entry.get(axis)
+        if not isinstance(model, dict) \
+                or _finite(model.get("a"), axis + ".a") <= 0.0:
+            raise RuntimeError("楼宇投递ID%d缺少%s距离模型" %
+                               (int(item_id), axis))
+        _finite(model.get("b"), axis + ".b")
     return entry
 
 
 def select_locked_building_detection(detections, class_name, confidence):
-    candidates = [
-        item for item in detections
-        if item.class_name == str(class_name)
-        and float(item.confidence) >= float(confidence)
-    ]
+    candidates = [item for item in detections
+                  if item.class_name == str(class_name)
+                  and float(item.confidence) >= float(confidence)]
     return max(candidates, key=lambda item: item.confidence) \
         if candidates else None
 
 
-def compute_building_alignment_command(
-        detection, calibration_entry, frame_shape, drive_speed,
-        center_tolerance_ratio, stop_scale_factor, overclose_scale_factor,
-        angular_gain, max_angular):
-    center_ratio, scale_ratio = building_box_measurement(
-        detection, frame_shape)
-    target_center = _finite(
-        calibration_entry["center_x_ratio"], "center_x_ratio")
-    target_scale = _finite(
-        calibration_entry["scale_ratio"], "scale_ratio")
-    center_error = center_ratio - target_center
-    tolerance = abs(_finite(
-        center_tolerance_ratio, "center_tolerance_ratio"))
-    stop_scale = target_scale * _finite(
-        stop_scale_factor, "stop_scale_factor")
-    overclose_scale = target_scale * _finite(
-        overclose_scale_factor, "overclose_scale_factor")
-    angular = max(-abs(float(max_angular)), min(
-        abs(float(max_angular)), -float(angular_gain) * center_error))
-    if scale_ratio > overclose_scale:
-        status, linear, angular = "overclose", 0.0, 0.0
-    elif abs(center_error) > tolerance:
-        status, linear = "centering", 0.0
-    elif scale_ratio >= stop_scale:
-        status, linear, angular = "ready", 0.0, 0.0
-    else:
-        status, linear = "approaching", abs(float(drive_speed))
-    return BuildingAlignmentCommand(status, linear, angular)
+def estimate_building_distance_mm(detection, calibration_entry, frame_shape,
+                                  max_axis_disagreement_mm):
+    geometry = building_box_geometry(detection, frame_shape)
+    estimates = []
+    for axis, pixel_key in (("width", "width_px"),
+                            ("height", "height_px")):
+        model = calibration_entry[axis]
+        estimates.append(
+            float(model["a"]) / geometry[pixel_key] + float(model["b"]))
+    disagreement = abs(estimates[0] - estimates[1])
+    if disagreement > float(max_axis_disagreement_mm):
+        raise RuntimeError(
+            "楼宇框宽高估距相差%.1fmm，超过%.1fmm" %
+            (disagreement, float(max_axis_disagreement_mm)))
+    distance_mm = float(np.median(estimates))
+    minimum = float(calibration_entry["min_distance_mm"])
+    maximum = float(calibration_entry["max_distance_mm"])
+    if not minimum <= distance_mm <= maximum:
+        raise RuntimeError(
+            "楼宇估距%.1fmm超出标定范围%.1f~%.1fmm" %
+            (distance_mm, minimum, maximum))
+    return geometry["center_x_ratio"], distance_mm

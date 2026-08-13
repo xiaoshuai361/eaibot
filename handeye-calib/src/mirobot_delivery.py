@@ -122,6 +122,10 @@ def parse_args(argv):
                         default=CONTACT_PROBE_STEP_METERS)
     parser.add_argument('--contact-probe-max-travel', type=float,
                         default=CONTACT_PROBE_MAX_TRAVEL_METERS)
+    parser.add_argument(
+        '--contact-distance-offset', type=float, default=0.0,
+        help=('停车后楼宇估距相对450mm示教距离的偏差（米）；'
+              '正数表示楼面更远，P沿前探方向前移。'))
     parser.add_argument('--startup-home-service',
                         default=arm_api.DEFAULT_STARTUP_HOME_SERVICE)
     parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
@@ -141,6 +145,9 @@ def parse_args(argv):
     positive(args.contact_probe_step, '--contact-probe-step')
     positive(args.contact_probe_max_travel,
              '--contact-probe-max-travel')
+    if math.isnan(args.contact_distance_offset) or \
+            math.isinf(args.contact_distance_offset):
+        raise RuntimeError('--contact-distance-offset 必须为有限数值。')
     if args.force_release_on_contact_miss and not args.contact_release:
         raise RuntimeError(
             '--force-release-on-contact-miss 必须和 --contact-release 一起使用。')
@@ -542,6 +549,12 @@ def run_delivery(args, arm, pump_proxy):
                     'approach_axis_xyz_base':
                         entry['approach_axis_xyz_base'],
                 }
+                precontact_pose = arm_api.build_contact_probe_pose(
+                    precontact_pose, pickup_model,
+                    args.contact_distance_offset, args.base_frame)
+                rospy.loginfo(
+                    'ID%d 按楼宇估距沿前探轴修正 P：%+.1fmm。',
+                    item_id, args.contact_distance_offset * 1000.0)
                 staging_pose = arm_api.build_backoff_pose(
                     precontact_pose, pickup_model,
                     args.contact_staging_gap, args.base_frame)

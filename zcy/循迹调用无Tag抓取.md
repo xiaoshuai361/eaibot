@@ -173,7 +173,7 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
   --contact-probe-max-travel 0.065
 ```
 
-机械臂启动前，状态机先用 `/dev/video2` 的原始 320×240 楼宇框复现该类标定停车位置。连续3个新鲜帧满足中心误差不超过5%、尺度达到标定值95%才进入投递；丢框、尺度超过110%或25秒超时立即停车并放弃。仓内抓取点共用 `delivery_presets.json`；无 Tag 中转点和四类独立 P 从 `untagged_delivery_presets.json` 读取。到 P 后方30mm开启限位，5mm步长到P，再以2mm步长最多前探65mm；释放后直退30mm再回 idle。
+楼宇框中心进入现有画面中央 `65%` 区域时，状态机直接按原 `YOLO_STOP` 停车；底盘不旋转，也不根据楼宇距离二次前进或后退。停车后使用 `/dev/video2` 原始 320×240 楼宇框的宽、高双模型估算真实毫米距离，并将“估距 - 450mm示教参考距离”传给机械臂。机械臂沿该类已示教的前探轴修正 P；仓内抓取点共用 `delivery_presets.json`，无 Tag 中转点和四类独立 P 从 `untagged_delivery_presets.json` 读取。到修正后 P 的后方30mm开启限位，5mm步长到P，再以2mm步长最多前探65mm；释放后直退30mm再回 idle。
 
 走满65mm未触发时按已确认策略强制关泵并返回成功，库存会被消费；限位服务、串口或轨迹执行报错不会走强制释放，泵保持开启并返回投递失败。
 

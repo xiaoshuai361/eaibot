@@ -407,6 +407,7 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
     write_tag_preset(tag_path)
     events = []
     contact_options = []
+    distance_offsets = []
 
     def run_contact(*items, **kwargs):
         contact_options.append(kwargs)
@@ -421,6 +422,8 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
             ("joint", label)),
         execute_cartesian_pose=lambda arm, pose, label, **kwargs: events.append(
             ("cartesian", label)),
+        build_contact_probe_pose=lambda pose, model, distance, base: (
+            distance_offsets.append(distance) or pose),
         build_backoff_pose=lambda pose, model, gap, base: "staging",
         run_contact_approach=run_contact,
     )
@@ -442,6 +445,7 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
         contact_release=True, force_release_on_contact_miss=True,
         contact_staging_gap=0.030, contact_staging_step=0.005,
         contact_probe_step=0.002, contact_probe_max_travel=0.065,
+        contact_distance_offset=0.1,
         base_frame="base", pump_on_settle_seconds=0.0,
         pump_off_settle_seconds=0.7)
 
@@ -459,3 +463,4 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
         "probe_step_m": pytest.approx(0.002),
         "max_travel_m": pytest.approx(0.065),
     }]
+    assert distance_offsets == [pytest.approx(0.1)]

@@ -79,7 +79,8 @@ class GraspCoordinator(object):
             command.append("--show-debug-window")
         return command
 
-    def _delivery_command(self, source, item_ids):
+    def _delivery_command(self, source, item_ids,
+                          contact_distance_offset_m=0.0):
         sequence = ",".join(str(int(item_id)) for item_id in item_ids)
         if source == "tag":
             delivery_file = TAG_DELIVERY_PRESET_FILE
@@ -105,6 +106,8 @@ class GraspCoordinator(object):
                 "--contact-staging-step", "0.005",
                 "--contact-probe-step", "0.002",
                 "--contact-probe-max-travel", "0.065",
+                "--contact-distance-offset",
+                str(float(contact_distance_offset_m)),
             ])
         return command
 
@@ -181,9 +184,10 @@ class GraspCoordinator(object):
                 command = self._untagged_command(
                     payload, search_before_pick=(kind == "untagged_search"))
             elif kind == "delivery":
-                source, item_ids = payload
+                source, item_ids, contact_distance_offset_m = payload
                 result_items = [int(item_id) for item_id in item_ids]
-                command = self._delivery_command(source, result_items)
+                command = self._delivery_command(
+                    source, result_items, contact_distance_offset_m)
             else:
                 raise ValueError("未知抓取类型：%s" % kind)
             job_name = "delivery" if kind == "delivery" else \
@@ -243,7 +247,8 @@ class GraspCoordinator(object):
         with open(self.untagged_search_release_file, "w") as handle:
             handle.write("release\n")
 
-    def start_delivery(self, source, item_ids):
+    def start_delivery(self, source, item_ids,
+                       contact_distance_offset_m=0.0):
         source = str(source)
         if source not in ("tag", "untagged"):
             raise ValueError("投递来源必须是 tag 或 untagged")
@@ -260,7 +265,9 @@ class GraspCoordinator(object):
             self.result_items = []
             self.error = None
             self.thread = threading.Thread(
-                target=self._run, args=(self.kind, (source, item_ids)))
+                target=self._run,
+                args=(self.kind, (
+                    source, item_ids, float(contact_distance_offset_m))))
             self.thread.daemon = True
             self.thread.start()
 

@@ -78,8 +78,9 @@ class FakeCoordinator(object):
     def start(self, kind, count):
         self.calls.append((kind, count))
 
-    def start_delivery(self, source, item_ids):
-        self.calls.append(("delivery", source, list(item_ids)))
+    def start_delivery(self, source, item_ids, distance_offset_m=0.0):
+        self.calls.append((
+            "delivery", source, list(item_ids), float(distance_offset_m)))
 
     def start_untagged_search(self, count):
         self.calls.append(("untagged_search", count))
@@ -240,7 +241,7 @@ def test_untagged_delivery_uses_its_own_motion_presets():
     supervisor = FakeSupervisor()
     coordinator = GraspCoordinator(supervisor, python3="/env/python3")
 
-    coordinator.start_delivery("untagged", [2])
+    coordinator.start_delivery("untagged", [2], 0.1)
     result, error = _wait_result(coordinator)
 
     assert result is True
@@ -258,6 +259,8 @@ def test_untagged_delivery_uses_its_own_motion_presets():
     assert "--force-release-on-contact-miss" in supervisor.command
     assert supervisor.command[
         supervisor.command.index("--contact-staging-gap") + 1] == "0.030"
+    assert supervisor.command[
+        supervisor.command.index("--contact-distance-offset") + 1] == "0.1"
 
 
 def test_both_delivery_sources_share_tag_cargo_pick_points():
@@ -640,7 +643,8 @@ def test_street_event_delivers_only_matching_tag_inventory():
     assert follower._start_delivery_for_event(event) is True
     assert follower.active_delivery_id == 3
     assert follower.velocity_owner == "grasp"
-    assert follower.grasp_coordinator.calls == [("delivery", "tag", [3])]
+    assert follower.grasp_coordinator.calls == [
+        ("delivery", "tag", [3], 0.0)]
     assert follower.states == ["DELIVERING"]
 
 
@@ -661,8 +665,11 @@ def test_building_event_delivers_only_matching_untagged_inventory():
             "4": {
                 "item_id": 4,
                 "class_name": "Collapsed Building",
-                "center_x_ratio": 0.5,
-                "scale_ratio": 0.2,
+                "reference_distance_mm": 450.0,
+                "min_distance_mm": 250.0,
+                "max_distance_mm": 650.0,
+                "width": {"a": 20000.0, "b": 50.0},
+                "height": {"a": 12000.0, "b": 50.0},
             },
         },
     }
@@ -671,14 +678,18 @@ def test_building_event_delivers_only_matching_untagged_inventory():
     follower._set_state = follower.states.append
     event = types.SimpleNamespace(
         kind="building", area="楼宇A", class_name="Collapsed Building",
-        display_name="坍塌楼宇")
+        display_name="坍塌楼宇",
+        detection=types.SimpleNamespace(
+            box=(140.0, 108.0, 180.0, 132.0),
+            frame_shape=(240, 320, 3)))
 
     assert follower._start_delivery_for_event(event) is True
-    assert follower.active_delivery_source is None
-    assert follower.active_delivery_id is None
-    assert follower.grasp_coordinator.calls == []
-    assert follower.building_delivery_event is event
-    assert follower.states == ["BUILDING_DELIVERY_ALIGN"]
+    assert follower.active_delivery_source == "untagged"
+    assert follower.active_delivery_id == 4
+    call = follower.grasp_coordinator.calls[0]
+    assert call[:3] == ("delivery", "untagged", [4])
+    assert abs(call[3] - 0.1) < 1e-9
+    assert follower.states == ["DELIVERING"]
 
 
 def test_delivery_failure_warns_and_resumes_follow_without_retry():

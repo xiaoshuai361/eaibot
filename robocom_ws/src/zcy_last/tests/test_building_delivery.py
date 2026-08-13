@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 
+import json
 import sys
 import types
 
@@ -32,9 +33,9 @@ geometry_msgs_msg.Twist = _Twist
 geometry_msgs.msg = geometry_msgs_msg
 
 from zcy_last.algorithms.building_delivery import (  # noqa: E402
-    build_calibration_entry,
-    compute_building_alignment_command,
+    build_distance_calibration_entry,
     empty_building_calibration,
+    estimate_building_distance_mm,
     load_building_calibration,
     save_building_calibration,
 )
@@ -42,13 +43,28 @@ from zcy_last.algorithms.vision import (  # noqa: E402
     YoloDetection,
     YoloObstacleDetector,
 )
-from zcy_last.task.competition import LaneFollower  # noqa: E402
-
-
-def detection(class_name="Fire Building", box=(128, 96, 192, 144),
+def detection(class_name="Fire Building", box=(135, 105, 185, 135),
               confidence=0.9):
     return YoloDetection(
         0, class_name, confidence, box, (240, 320, 3), 0.5)
+
+
+def distance_samples(a_width=20000.0, a_height=12000.0, b=50.0):
+    samples = []
+    for distance_mm in (250, 350, 450, 550, 650):
+        for delta in (-0.2, 0.2):
+            samples.append((
+                distance_mm,
+                a_width / (distance_mm - b) + delta,
+                a_height / (distance_mm - b) + delta,
+            ))
+    return samples
+
+
+def calibration_entry(item_id=2, class_name="Fire Building"):
+    return build_distance_calibration_entry(
+        item_id, class_name, distance_samples(),
+        320, 240, "building.onnx", 450.0)
 
 
 def test_letterbox_decode_restores_box_to_original_320x240_coordinates():
@@ -58,7 +74,6 @@ def test_letterbox_decode_restores_box_to_original_320x240_coordinates():
     detector.confidence = 0.5
     detector.nms_threshold = 0.45
     detector.center_band_ratio = 0.5
-    # Original box=(110,80,210,160). 320x240 letterbox adds 40px top/bottom.
     output = np.asarray([[160, 160, 100, 80, 1.0, 0.9]], dtype=np.float32)
 
     decoded = detector._decode(output, (240, 320, 3), 1.0, 0, 40)
@@ -67,141 +82,65 @@ def test_letterbox_decode_restores_box_to_original_320x240_coordinates():
     assert decoded[0].frame_shape[:2] == (240, 320)
 
 
-def test_four_calibrations_are_independent_and_use_median_mad(tmp_path):
+def test_real_distance_fit_uses_width_and_height_models():
+    entry = calibration_entry()
+
+    center, distance_mm = estimate_building_distance_mm(
+        detection(), entry, (240, 320, 3), 60.0)
+
+    assert center == pytest.approx(0.5)
+    assert distance_mm == pytest.approx(450.0, abs=2.0)
+    assert entry["distance_point_count"] == 5
+    assert entry["sample_count"] == 10
+    assert entry["reference_distance_mm"] == 450.0
+    assert entry["min_distance_mm"] == 250.0
+    assert entry["max_distance_mm"] == 650.0
+    assert entry["width"]["rmse_mm"] < 2.0
+    assert entry["height"]["rmse_mm"] < 2.0
+
+
+def test_four_distance_calibrations_are_independent_and_validate_format(tmp_path):
     path = tmp_path / "building.json"
     payload = empty_building_calibration(320, 240, "building.onnx")
-    samples = [(0.48, 0.20), (0.50, 0.22), (0.90, 0.80)]
-    entry = build_calibration_entry(
-        1, "Electrical Fault Building", samples,
-        320, 240, "building.onnx")
-    payload["targets"]["1"] = entry
-    payload["targets"]["2"] = build_calibration_entry(
-        2, "Fire Building", [(0.4, 0.1)] * 3,
-        320, 240, "building.onnx")
+    payload["targets"]["1"] = build_distance_calibration_entry(
+        1, "Electrical Fault Building", distance_samples(),
+        320, 240, "building.onnx", 450.0)
+    payload["targets"]["2"] = build_distance_calibration_entry(
+        2, "Fire Building", distance_samples(24000.0, 15000.0),
+        320, 240, "building.onnx", 450.0)
     save_building_calibration(str(path), payload)
 
     loaded = load_building_calibration(
         str(path), 320, 240, "building.onnx")
 
-    assert loaded["targets"]["1"]["center_x_ratio"] == pytest.approx(0.50)
-    assert loaded["targets"]["1"]["center_x_mad"] == pytest.approx(0.02)
-    assert loaded["targets"]["1"]["scale_ratio"] == pytest.approx(0.22)
-    assert loaded["targets"]["2"]["scale_ratio"] == pytest.approx(0.10)
+    assert loaded["targets"]["1"]["width"]["a"] != \
+        loaded["targets"]["2"]["width"]["a"]
     with pytest.raises(RuntimeError, match="宽度"):
         load_building_calibration(str(path), 640, 240, "building.onnx")
 
-
-def test_alignment_centers_approaches_stops_and_rejects_overclose():
-    entry = {"center_x_ratio": 0.5, "scale_ratio": 0.2}
-    centered_far = detection(box=(144, 108, 176, 132))
-    off_center = detection(box=(250, 108, 282, 132))
-    ready = detection(box=(128, 96, 192, 144))
-    overclose = detection(box=(112, 84, 208, 156))
-
-    kwargs = dict(
-        calibration_entry=entry, frame_shape=(240, 320, 3),
-        drive_speed=0.012, center_tolerance_ratio=0.05,
-        stop_scale_factor=0.95, overclose_scale_factor=1.10,
-        angular_gain=1.0, max_angular=0.12)
-    assert compute_building_alignment_command(
-        centered_far, **kwargs).status == "approaching"
-    centering = compute_building_alignment_command(off_center, **kwargs)
-    assert centering.status == "centering"
-    assert centering.linear_x == 0.0
-    assert compute_building_alignment_command(ready, **kwargs).status == "ready"
-    assert compute_building_alignment_command(
-        overclose, **kwargs).status == "overclose"
+    old_path = tmp_path / "old.json"
+    old_path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="多距离版本"):
+        load_building_calibration(str(old_path))
 
 
-class _Coordinator(object):
-    def __init__(self):
-        self.calls = []
-
-    def start_delivery(self, source, ids):
-        self.calls.append((source, list(ids)))
-
-
-def make_align_follower(samples):
-    follower = LaneFollower.__new__(LaneFollower)
-    follower.state = "BUILDING_DELIVERY_ALIGN"
-    follower.state_started = 0.0
-    follower.velocity_owner = "line"
-    follower.yolo_building_confidence = 0.5
-    follower.building_delivery_event = types.SimpleNamespace(
-        kind="building", area="楼宇B", class_name="Fire Building",
-        display_name="火灾楼宇")
-    follower.building_delivery_entry = {
-        "item_id": 2, "class_name": "Fire Building",
-        "center_x_ratio": 0.5, "scale_ratio": 0.2,
-    }
-    follower.building_delivery_stable_hits = 0
-    follower.building_delivery_last_fresh_time = 10.0
-    follower.untagged_delivery_failed_ids = set()
-    follower.untagged_inventory = [2]
-    follower.active_delivery_source = None
-    follower.active_delivery_id = None
-    follower.grasp_coordinator = _Coordinator()
-    follower.commands = []
-    follower.publish = lambda linear, angular, force=False: \
-        follower.commands.append((linear, angular, force)) or True
-    sample_iter = iter(samples)
-    follower._poll_yolo_detections = lambda: next(sample_iter)
-
-    def set_state(state):
-        follower.state = state
-
-    follower._set_state = set_state
-    return follower
+def test_cropped_box_and_width_height_disagreement_are_rejected():
+    entry = calibration_entry()
+    with pytest.raises(RuntimeError, match="画面边缘"):
+        estimate_building_distance_mm(
+            detection(box=(0, 100, 100, 140)), entry,
+            (240, 320, 3), 60.0)
+    bad = dict(entry)
+    bad["height"] = {"a": 50000.0, "b": 50.0}
+    with pytest.raises(RuntimeError, match="宽高估距"):
+        estimate_building_distance_mm(
+            detection(), bad, (240, 320, 3), 60.0)
 
 
-def test_three_stable_fresh_frames_are_required_before_arm_delivery():
-    target = detection()
-    follower = make_align_follower([(True, [target])] * 3)
+def test_distance_outside_sampled_range_is_rejected():
+    entry = calibration_entry()
+    too_far = detection(box=(145.6, 111.3, 174.4, 128.7))  # about 750mm
 
-    for now in (10.1, 10.2):
-        follower._handle_building_delivery_align(now)
-        assert follower.grasp_coordinator.calls == []
-    follower._handle_building_delivery_align(10.3)
-
-    assert follower.grasp_coordinator.calls == [("untagged", [2])]
-    assert follower.state == "DELIVERING"
-    assert follower.velocity_owner == "grasp"
-
-
-@pytest.mark.parametrize("samples,now", [
-    ([(True, [])], 10.1),
-    ([(False, [])], 10.6),
-])
-def test_lost_or_stale_building_stops_and_never_starts_arm(samples, now):
-    follower = make_align_follower(samples)
-
-    follower._handle_building_delivery_align(now)
-
-    assert follower.commands[-1] == (0, 0, True)
-    assert follower.grasp_coordinator.calls == []
-    assert follower.untagged_delivery_failed_ids == {2}
-    assert follower.state == "FOLLOW"
-
-
-def test_alignment_timeout_stops_without_reading_or_starting_arm():
-    follower = make_align_follower([])
-    follower._poll_yolo_detections = lambda: pytest.fail(
-        "timeout must stop before polling")
-
-    follower._handle_building_delivery_align(25.0)
-
-    assert follower.commands[-1] == (0, 0, True)
-    assert follower.grasp_coordinator.calls == []
-    assert follower.state == "FOLLOW"
-
-
-def test_overclose_frame_stops_and_never_starts_arm():
-    too_large = detection(box=(112, 84, 208, 156))
-    follower = make_align_follower([(True, [too_large])])
-
-    follower._handle_building_delivery_align(10.1)
-
-    assert follower.commands[-1] == (0, 0, True)
-    assert follower.grasp_coordinator.calls == []
-    assert follower.untagged_delivery_failed_ids == {2}
-    assert follower.state == "FOLLOW"
+    with pytest.raises(RuntimeError, match="超出标定范围"):
+        estimate_building_distance_mm(
+            too_far, entry, (240, 320, 3), 60.0)
