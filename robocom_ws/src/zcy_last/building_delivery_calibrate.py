@@ -5,6 +5,7 @@
 import argparse
 import csv
 import os
+import select
 import sys
 import time
 
@@ -40,7 +41,7 @@ from .config import (
 
 
 DEFAULT_DISTANCES = (
-    250, 300, 350,
+    350,
     400, 410, 420, 430, 440, 450, 460, 470, 480, 490, 500,
     550, 600, 650,
 )
@@ -74,7 +75,7 @@ def parse_args(argv=None):
         description="采集楼宇真实距离与YOLO框，拟合单目距离模型")
     parser.add_argument("--distances", type=parse_distances,
                         default=list(DEFAULT_DISTANCES))
-    parser.add_argument("--frames", type=int, default=10)
+    parser.add_argument("--frames", type=int, default=5)
     parser.add_argument("--reference-distance-mm", type=float,
                         default=BUILDING_DELIVERY_REFERENCE_DISTANCE_MM)
     parser.add_argument("--camera-index", type=int, default=YOLO_CAMERA_INDEX)
@@ -104,9 +105,9 @@ def save_samples(path, distance_mm, measurements):
     temporary = path + ".tmp"
     with open(temporary, "w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(("distance_mm", "width_px", "height_px"))
-        for width_px, height_px in measurements:
-            writer.writerow((distance_mm, width_px, height_px))
+        writer.writerow(("distance_mm", "width_px"))
+        for width_px in measurements:
+            writer.writerow((distance_mm, width_px))
     os.replace(temporary, path)
 
 
@@ -115,8 +116,7 @@ def load_samples(path):
     with open(path, "r", newline="") as stream:
         for row in csv.DictReader(stream):
             result.append((float(row["distance_mm"]),
-                           float(row["width_px"]),
-                           float(row["height_px"])))
+                           float(row["width_px"])))
     return result
 
 
@@ -126,17 +126,22 @@ def configure_capture(capture):
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
-def prompt_building(display_name, distance_mm, frames, index, total):
+def prompt_building(display_name, distance_mm, frames, index, total,
+                    no_window):
     print("[%d/%d] 楼宇=%s，真实镜头距离=%dmm" % (
         index, total, display_name, distance_mm))
     print("车身和摄像机保持正对楼面，准确测量镜头平面到楼面的垂直距离。")
-    print("按 Enter 采集%d帧；s跳过；q退出并保留已采CSV。" % frames)
+    if not no_window:
+        print("点击检测窗口后按 Enter 采集%d帧；s跳过；q退出。" % frames)
+        return ""
+    print("无窗口模式：按 Enter 采集%d帧；s跳过；q退出。" % frames)
     return input("> ").strip().lower()
 
 
 def collect_distance(capture, detector, class_name, confidence,
                      distance_mm, frame_count, no_window):
     measurements = []
+    collecting = bool(no_window)
     while len(measurements) < frame_count:
         ok, frame = capture.read()
         if not ok:
@@ -149,7 +154,7 @@ def collect_distance(capture, detector, class_name, confidence,
         detections = detector.detect(frame)
         selected = select_locked_building_detection(
             detections, class_name, confidence)
-        if selected is not None:
+        if selected is not None and collecting:
             if not detection_center_in_x_roi(
                     selected, YOLO_BUILDING_CENTER_ROI_X_RATIO):
                 print("\r等待楼宇框中心进入红框...", end="")
@@ -159,8 +164,7 @@ def collect_distance(capture, detector, class_name, confidence,
                 except RuntimeError as exc:
                     print("\r等待完整楼宇框：%s" % exc, end="")
                 else:
-                    measurements.append((geometry["width_px"],
-                                         geometry["height_px"]))
+                    measurements.append(geometry["width_px"])
                     print("\r%dmm 有效样本 %d/%d" % (
                         distance_mm, len(measurements), frame_count), end="")
         if not no_window:
@@ -168,7 +172,22 @@ def collect_distance(capture, detector, class_name, confidence,
                 frame, detections, 1.0, draw_center_band=False,
                 center_roi_x_ratio=YOLO_BUILDING_CENTER_ROI_X_RATIO)
             cv2.imshow("building_delivery_distance_calibration", shown)
-            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+            key = cv2.waitKey(1) & 0xFF
+            terminal_key = None
+            try:
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    terminal_key = sys.stdin.readline().strip().lower()
+            except (OSError, ValueError):
+                pass
+            if (key in (10, 13) or terminal_key == "") and not collecting:
+                collecting = True
+                print("开始记录%dmm的%d帧数据。" % (
+                    distance_mm, frame_count))
+            elif (key == ord("s") or terminal_key == "s") \
+                    and not collecting:
+                print("已跳过当前楼宇。")
+                return None
+            elif key in (27, ord("q")) or terminal_key == "q":
                 raise KeyboardInterrupt()
     print("")
     return measurements
@@ -201,7 +220,7 @@ def main(argv=None):
                     continue
                 choice = prompt_building(
                     BUILDING_NAME_BY_ID[target], distance_mm, args.frames,
-                    target_index, len(targets))
+                    target_index, len(targets), args.no_window)
                 if choice in ("q", "quit", "exit"):
                     print("采集已停止；再次运行会继续缺失距离。")
                     return 0
@@ -211,6 +230,8 @@ def main(argv=None):
                     capture, detector, ID_TO_BUILDING_CLASS[target],
                     args.confidence, distance_mm, args.frames,
                     args.no_window)
+                if measurements is None:
+                    continue
                 save_samples(path, distance_mm, measurements)
     finally:
         capture.release()
@@ -239,11 +260,9 @@ def main(argv=None):
     save_building_calibration(args.output, payload)
     print("四类楼宇多距离模型已原子保存：%s" % args.output)
     for target, entry in entries.items():
-        print("ID%d %s：width RMSE=%.1fmm，height RMSE=%.1fmm，"
-              "距离点=%d，帧=%d" % (
+        print("ID%d %s：框宽 RMSE=%.1fmm，距离点=%d，帧=%d" % (
                   target, BUILDING_NAME_BY_ID[target],
                   entry["width"]["rmse_mm"],
-                  entry["height"]["rmse_mm"],
                   entry["distance_point_count"], entry["sample_count"]))
     return 0
 

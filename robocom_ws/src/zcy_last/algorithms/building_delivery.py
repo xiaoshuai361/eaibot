@@ -9,7 +9,7 @@ import os
 import numpy as np
 
 
-CALIBRATION_VERSION = 2
+CALIBRATION_VERSION = 3
 
 
 def _finite(value, label):
@@ -32,9 +32,8 @@ def building_box_geometry(detection, frame_shape, edge_margin_px=1.0):
         raise RuntimeError("building frame dimensions must be positive")
     x1, y1, x2, y2 = [float(value) for value in detection.box]
     margin = max(0.0, float(edge_margin_px))
-    if x1 <= margin or y1 <= margin \
-            or x2 >= width - 1 - margin or y2 >= height - 1 - margin:
-        raise RuntimeError("楼宇检测框接触画面边缘，不能用于距离估计")
+    if x1 <= margin or x2 >= width - 1 - margin:
+        raise RuntimeError("楼宇检测框左右边界接触画面边缘，不能用于距离估计")
     box_width = x2 - x1
     box_height = y2 - y1
     if box_width <= 0.0 or box_height <= 0.0:
@@ -42,15 +41,14 @@ def building_box_geometry(detection, frame_shape, edge_margin_px=1.0):
     return {
         "center_x_ratio": ((x1 + x2) * 0.5) / float(width),
         "width_px": box_width,
-        "height_px": box_height,
     }
 
 
 def _aggregate_by_distance(samples):
     groups = {}
-    for distance_mm, width_px, height_px in samples:
+    for distance_mm, width_px in samples:
         values = tuple(_finite(value, "distance sample") for value in (
-            distance_mm, width_px, height_px))
+            distance_mm, width_px))
         if any(value <= 0.0 for value in values):
             raise RuntimeError("building distance samples must be positive")
         groups.setdefault(round(values[0], 3), []).append(values)
@@ -58,9 +56,9 @@ def _aggregate_by_distance(samples):
             for key in sorted(groups)]
 
 
-def _fit_axis(samples, index):
+def _fit_width(samples):
     distances = np.asarray([item[0] for item in samples], dtype=np.float64)
-    pixels = np.asarray([item[index] for item in samples], dtype=np.float64)
+    pixels = np.asarray([item[1] for item in samples], dtype=np.float64)
     design = np.column_stack((1.0 / pixels, np.ones_like(pixels)))
     coefficients, _residuals, _rank, _singular = np.linalg.lstsq(
         design, distances, rcond=None)
@@ -91,8 +89,7 @@ def build_distance_calibration_entry(
             reference_distance_mm, "reference_distance_mm"),
         "min_distance_mm": float(aggregated[0][0]),
         "max_distance_mm": float(aggregated[-1][0]),
-        "width": _fit_axis(aggregated, 1),
-        "height": _fit_axis(aggregated, 2),
+        "width": _fit_width(aggregated),
         "sample_count": len(samples),
         "distance_point_count": len(aggregated),
         "frame_width": _positive_int(frame_width, "frame_width"),
@@ -180,13 +177,11 @@ def require_building_target(calibration, item_id, class_name=None):
         raise RuntimeError("楼宇投递距离范围无效")
     if not minimum <= reference <= maximum:
         raise RuntimeError("楼宇投递示教参考距离不在标定范围内")
-    for axis in ("width", "height"):
-        model = entry.get(axis)
-        if not isinstance(model, dict) \
-                or _finite(model.get("a"), axis + ".a") <= 0.0:
-            raise RuntimeError("楼宇投递ID%d缺少%s距离模型" %
-                               (int(item_id), axis))
-        _finite(model.get("b"), axis + ".b")
+    model = entry.get("width")
+    if not isinstance(model, dict) \
+            or _finite(model.get("a"), "width.a") <= 0.0:
+        raise RuntimeError("楼宇投递ID%d缺少框宽距离模型" % int(item_id))
+    _finite(model.get("b"), "width.b")
     return entry
 
 
@@ -198,21 +193,11 @@ def select_locked_building_detection(detections, class_name, confidence):
         if candidates else None
 
 
-def estimate_building_distance_mm(detection, calibration_entry, frame_shape,
-                                  max_axis_disagreement_mm):
+def estimate_building_distance_mm(detection, calibration_entry, frame_shape):
     geometry = building_box_geometry(detection, frame_shape)
-    estimates = []
-    for axis, pixel_key in (("width", "width_px"),
-                            ("height", "height_px")):
-        model = calibration_entry[axis]
-        estimates.append(
-            float(model["a"]) / geometry[pixel_key] + float(model["b"]))
-    disagreement = abs(estimates[0] - estimates[1])
-    if disagreement > float(max_axis_disagreement_mm):
-        raise RuntimeError(
-            "楼宇框宽高估距相差%.1fmm，超过%.1fmm" %
-            (disagreement, float(max_axis_disagreement_mm)))
-    distance_mm = float(np.median(estimates))
+    model = calibration_entry["width"]
+    distance_mm = (
+        float(model["a"]) / geometry["width_px"] + float(model["b"]))
     minimum = float(calibration_entry["min_distance_mm"])
     maximum = float(calibration_entry["max_distance_mm"])
     if not minimum <= distance_mm <= maximum:

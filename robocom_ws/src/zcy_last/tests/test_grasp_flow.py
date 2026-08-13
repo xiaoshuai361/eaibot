@@ -666,10 +666,9 @@ def test_building_event_delivers_only_matching_untagged_inventory():
                 "item_id": 4,
                 "class_name": "Collapsed Building",
                 "reference_distance_mm": 450.0,
-                "min_distance_mm": 250.0,
+                "min_distance_mm": 350.0,
                 "max_distance_mm": 650.0,
                 "width": {"a": 20000.0, "b": 50.0},
-                "height": {"a": 12000.0, "b": 50.0},
             },
         },
     }

@@ -110,7 +110,7 @@ STARTUP
 
 实际开启 B 点抓取时，`B_PICKING` 成功后不进入普通 `PICK_RECOVER`：车辆已经越过首个入口横条，会直接进入 `TRAFFIC_WAIT`，确认绿灯后按 `TAG_PICK_FIRST_ENTRY_TIME` 直行、按 `TAG_PICK_FIRST_TURN_TIME` 执行第一次右转，再沿用 `MANEUVER -> EXIT_ALIGN` 识别出口并完成第 1 个路口计数。
 
-抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。A 点先在 `A_PICK_PREPARE` 停车加载 Astra、模型和抓取子进程；子进程进入检测循环后切换到 `A_PICK_SEARCH`，车辆以 `UNTAGGED_SEARCH_FORWARD_SPEED` 保持零角速度直行，不使用车道中心修正。无 Tag 目标在 Astra 画面右侧搜索区连续确认后，车辆先停车，再将底盘控制权交给抓取子进程低速对准左侧抓取 ROI。抓取成功后不进入 `PICK_RECOVER/FOLLOW`，而是等待绿灯，再按 `UNTAGGED_PICK_NEXT_ENTRY_TIME` 直行、按 `UNTAGGED_PICK_NEXT_TURN_TIME` 完成第 4 个路口左转，识别出口横条后恢复普通流程。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存。街区仍按固定点直接投递；楼宇框中心进入原始320×240画面的红框 `x=54~173` 就按原 `YOLO_STOP` 停车，不旋转，也不根据距离二次移动底盘。标定和正式运行显示并使用同一红框；停车框的宽、高双模型只估算真实毫米距离，机械臂据此沿前探轴修正以 `450mm` 为参考示教的 P，再执行原有限位接触投递。
+抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。A 点先在 `A_PICK_PREPARE` 停车加载 Astra、模型和抓取子进程；子进程进入检测循环后切换到 `A_PICK_SEARCH`，车辆以 `UNTAGGED_SEARCH_FORWARD_SPEED` 保持零角速度直行，不使用车道中心修正。无 Tag 目标在 Astra 画面右侧搜索区连续确认后，车辆先停车，再将底盘控制权交给抓取子进程低速对准左侧抓取 ROI。抓取成功后不进入 `PICK_RECOVER/FOLLOW`，而是等待绿灯，再按 `UNTAGGED_PICK_NEXT_ENTRY_TIME` 直行、按 `UNTAGGED_PICK_NEXT_TURN_TIME` 完成第 4 个路口左转，识别出口横条后恢复普通流程。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存。街区仍按固定点直接投递；楼宇框中心进入原始320×240画面的红框 `x=54~173` 就按原 `YOLO_STOP` 停车，不旋转，也不根据距离二次移动底盘。标定和正式运行显示并使用同一红框；只用停车框的左右宽度模型估算真实毫米距离，上下裁切不影响，机械臂据此沿前探轴修正以 `450mm` 为参考示教的 P，再执行原有限位接触投递。
 
 抓取、依赖进程或车道恢复失败会进入 `PICK_FAILED`。投递失败例外：终端输出警告、该 ID 不再自动重试，并继续循迹。
 

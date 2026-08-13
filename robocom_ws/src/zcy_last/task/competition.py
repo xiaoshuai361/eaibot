@@ -943,8 +943,7 @@ class LaneFollower(object):
                     self.building_delivery_calibration,
                     item_id, event.class_name)
                 _center_ratio, distance_mm = estimate_building_distance_mm(
-                    event.detection, entry, event.detection.frame_shape,
-                    BUILDING_DELIVERY_MAX_AXIS_DISAGREEMENT_MM)
+                    event.detection, entry, event.detection.frame_shape)
                 reference_mm = float(entry["reference_distance_mm"])
                 distance_offset_m = (distance_mm - reference_mm) * 0.001
                 rospy.loginfo(

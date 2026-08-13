@@ -52,14 +52,13 @@ def detection(class_name="Fire Building", box=(135, 105, 185, 135),
         0, class_name, confidence, box, (240, 320, 3), 0.5)
 
 
-def distance_samples(a_width=20000.0, a_height=12000.0, b=50.0):
+def distance_samples(a_width=20000.0, b=50.0):
     samples = []
-    for distance_mm in (250, 350, 450, 550, 650):
+    for distance_mm in (350, 400, 450, 550, 650):
         for delta in (-0.2, 0.2):
             samples.append((
                 distance_mm,
                 a_width / (distance_mm - b) + delta,
-                a_height / (distance_mm - b) + delta,
             ))
     return samples
 
@@ -105,21 +104,21 @@ def test_building_roi_is_drawn_red_and_controls_building_stop_event():
         context, [outside_red], 0.5, building_confidence=0.5) is None
 
 
-def test_real_distance_fit_uses_width_and_height_models():
+def test_real_distance_fit_uses_only_box_width():
     entry = calibration_entry()
 
     center, distance_mm = estimate_building_distance_mm(
-        detection(), entry, (240, 320, 3), 60.0)
+        detection(), entry, (240, 320, 3))
 
     assert center == pytest.approx(0.5)
     assert distance_mm == pytest.approx(450.0, abs=2.0)
     assert entry["distance_point_count"] == 5
     assert entry["sample_count"] == 10
     assert entry["reference_distance_mm"] == 450.0
-    assert entry["min_distance_mm"] == 250.0
+    assert entry["min_distance_mm"] == 350.0
     assert entry["max_distance_mm"] == 650.0
     assert entry["width"]["rmse_mm"] < 2.0
-    assert entry["height"]["rmse_mm"] < 2.0
+    assert "height" not in entry
 
 
 def test_four_distance_calibrations_are_independent_and_validate_format(tmp_path):
@@ -129,7 +128,7 @@ def test_four_distance_calibrations_are_independent_and_validate_format(tmp_path
         1, "Electrical Fault Building", distance_samples(),
         320, 240, "building.onnx", 450.0)
     payload["targets"]["2"] = build_distance_calibration_entry(
-        2, "Fire Building", distance_samples(24000.0, 15000.0),
+        2, "Fire Building", distance_samples(24000.0),
         320, 240, "building.onnx", 450.0)
     save_building_calibration(str(path), payload)
 
@@ -147,17 +146,20 @@ def test_four_distance_calibrations_are_independent_and_validate_format(tmp_path
         load_building_calibration(str(old_path))
 
 
-def test_cropped_box_and_width_height_disagreement_are_rejected():
+def test_top_bottom_crop_is_allowed_but_left_right_crop_is_rejected():
     entry = calibration_entry()
-    with pytest.raises(RuntimeError, match="画面边缘"):
+    _center, distance_mm = estimate_building_distance_mm(
+        detection(box=(135, 0, 185, 240)), entry, (240, 320, 3))
+    assert distance_mm == pytest.approx(450.0, abs=2.0)
+
+    with pytest.raises(RuntimeError, match="左右边界"):
         estimate_building_distance_mm(
             detection(box=(0, 100, 100, 140)), entry,
-            (240, 320, 3), 60.0)
-    bad = dict(entry)
-    bad["height"] = {"a": 50000.0, "b": 50.0}
-    with pytest.raises(RuntimeError, match="宽高估距"):
+            (240, 320, 3))
+    with pytest.raises(RuntimeError, match="左右边界"):
         estimate_building_distance_mm(
-            detection(), bad, (240, 320, 3), 60.0)
+            detection(box=(220, 100, 319, 140)), entry,
+            (240, 320, 3))
 
 
 def test_distance_outside_sampled_range_is_rejected():
@@ -166,4 +168,4 @@ def test_distance_outside_sampled_range_is_rejected():
 
     with pytest.raises(RuntimeError, match="超出标定范围"):
         estimate_building_distance_mm(
-            too_far, entry, (240, 320, 3), 60.0)
+            too_far, entry, (240, 320, 3))

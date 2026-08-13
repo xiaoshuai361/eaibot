@@ -298,7 +298,6 @@ YOLO_WINDOW_NAME = "line_cy_task_yolo" # 任务识别调试窗口。
 BUILDING_DELIVERY_CALIBRATION_FILE = \
     "/home/eaibot/handeye-calib/config/building_delivery_calibration.json"
 BUILDING_DELIVERY_REFERENCE_DISTANCE_MM = 450.0 # 示教P时镜头平面到楼面的参考距离。
-BUILDING_DELIVERY_MAX_AXIS_DISAGREEMENT_MM = 60.0 # 框宽/框高估距最大差异。
 
 # ===== 红绿灯等待 =====
 TRAFFIC_GREEN_STABLE_FRAMES = 2 # 连续绿灯确认帧数，防止单帧误放行。
