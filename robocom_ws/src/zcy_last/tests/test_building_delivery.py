@@ -54,7 +54,7 @@ def detection(class_name="Fire Building", box=(135, 105, 185, 135),
 
 def distance_samples(a_width=20000.0, b=50.0):
     samples = []
-    for distance_mm in (350, 400, 450, 550, 650):
+    for distance_mm in (350, 400, 450, 550, 600):
         for delta in (-0.2, 0.2):
             samples.append((
                 distance_mm,
@@ -116,7 +116,7 @@ def test_real_distance_fit_uses_only_box_width():
     assert entry["sample_count"] == 10
     assert entry["reference_distance_mm"] == 450.0
     assert entry["min_distance_mm"] == 350.0
-    assert entry["max_distance_mm"] == 650.0
+    assert entry["max_distance_mm"] == 600.0
     assert entry["width"]["rmse_mm"] < 2.0
     assert "height" not in entry
 

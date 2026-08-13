@@ -43,7 +43,7 @@ from .config import (
 DEFAULT_DISTANCES = (
     350,
     400, 410, 420, 430, 440, 450, 460, 470, 480, 490, 500,
-    550, 600, 650,
+    550, 600,
 )
 DEFAULT_SAMPLE_DIR = (
     "/home/eaibot/handeye-calib/config/"

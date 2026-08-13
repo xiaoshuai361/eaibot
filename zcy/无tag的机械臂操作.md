@@ -361,11 +361,11 @@ Z = a_width / (右边界x - 左边界x) + b_width
 机械臂 P 的示教参考距离为 `450mm`，默认标定范围从 `350mm` 开始：
 
 ```text
-350、400、410、420、430、440、450、460、470、480、490、500、550、600、650mm
+350、400、410、420、430、440、450、460、470、480、490、500、550、600mm
 ```
 
-`400~500mm` 每 `10mm` 加密，每类、每个距离采集 `5` 帧，共 `75` 帧/类、
-四类合计 `300` 帧。脚本按“距离优先”工作：每到一个距离，依次采集电力故障、
+`400~500mm` 每 `10mm` 加密，每类、每个距离采集 `5` 帧，共 `70` 帧/类、
+四类合计 `280` 帧。脚本按“距离优先”工作：每到一个距离，依次采集电力故障、
 火灾、有毒气体、坍塌四类楼宇，再进入下一个距离。整套标定只运行一次命令。
 真实距离是 `/dev/video2` RGB 镜头平面到楼宇正面的垂直距离。每次测量时车辆和
 摄像机保持正对楼面。YOLO 框左、右边界必须完整；上、下边界被画面
@@ -392,7 +392,7 @@ conda activate ww
 cd /home/eaibot/robocom_ws/src
 
 python3 -m zcy_last.building_delivery_calibrate \
-  --distances 350,400,410,420,430,440,450,460,470,480,490,500,550,600,650 \
+  --distances 350,400,410,420,430,440,450,460,470,480,490,500,550,600 \
   --frames 5 \
   --reference-distance-mm 450
 ```
@@ -439,6 +439,9 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
 只重采一类，例如火灾楼宇 ID2：
 
 ```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
 python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
   --mode teach_contact_release \
   --sequence 2 \
@@ -507,4 +510,4 @@ python3 -m zcy_last.main \
 机械臂以 `450mm` 时示教的 P 为基准，按“停车估距 - 450mm”沿已示教前探轴修正
 P。例如停车估距为 `550mm`，P 沿墙面方向前移 `100mm`；随后仍执行“P 后方
 30mm -> 5mm步长到P -> 2mm步长最多前探65mm”。左右边界被裁切，或框宽估距超出
-已采集的 `350~650mm` 时不启动机械臂，该 ID 记为投递失败。上下边界裁切不影响估距。
+已采集的 `350~600mm` 时不启动机械臂，该 ID 记为投递失败。上下边界裁切不影响估距。
