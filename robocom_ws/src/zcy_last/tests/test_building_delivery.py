@@ -91,10 +91,10 @@ def test_building_roi_is_drawn_red_and_controls_building_stop_event():
         frame, [], 0.65, draw_center_band=False,
         center_roi_x_ratio=YOLO_BUILDING_CENTER_ROI_X_RATIO)
     assert shown[120, 54].tolist() == [0, 0, 255]
-    assert shown[120, 122].tolist() == [0, 0, 255]
+    assert shown[120, 173].tolist() == [0, 0, 255]
 
     inside_red = detection(box=(50, 100, 90, 140))
-    outside_red = detection(box=(140, 100, 180, 140))
+    outside_red = detection(box=(200, 100, 240, 140))
     ledger = YoloTaskLedger()
     context = {"kind": "building", "area": "楼宇A"}
 

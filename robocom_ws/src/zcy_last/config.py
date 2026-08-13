@@ -208,7 +208,7 @@ YOLO_CONFIDENCE = 0.60       # 人群 YOLO 置信度阈值。
 YOLO_TRASH_CONFIDENCE = 0.65 # 垃圾桶 YOLO 置信度阈值。
 YOLO_BUILDING_CONFIDENCE = 0.65 # 楼宇 YOLO 置信度阈值。
 YOLO_CENTER_BAND_RATIO = 0.650 # 目标框中心位于画面中间此比例时才触发停车。
-YOLO_BUILDING_CENTER_ROI_X_RATIO = (0.17, 0.38) # 楼宇中心停车红框，320宽对应x=54~122。
+YOLO_BUILDING_CENTER_ROI_X_RATIO = (0.17, 0.54) # 楼宇中心停车红框，320宽对应x=54~173。
 YOLO_STOP_TIME = 1.0         # 模型触发后停车等待时间(s)。
 YOLO_EVENT_IGNORE_TIME = 4.0 # 每次任务识别后忽略新目标时间(s)。
 YOLO_IMAGE_SIZE = 320        # 模型训练和导出使用的输入尺寸。
