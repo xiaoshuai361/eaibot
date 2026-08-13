@@ -2242,6 +2242,13 @@ def teach_building_contact_release(args, config, detector):
     block_preset = load_block_preset(args.preset_file)
     idle_joint_values = require_joint_values(
         block_preset, "idle_joint_values")
+    block_entry = block_preset.get("targets", {}).get(target)
+    if not isinstance(block_entry, dict):
+        raise RuntimeError(
+            "No taught no-Tag pickup model for target %s." % target)
+    pickup_model = require_block_pickup_model(block_entry, target)
+    pickup_orientation = normalize_quaternion(
+        pickup_model["orientation_xyzw_base"])
     arm = build_move_group(config, args.group)
     prompt_enter(
         u"示教 ID%d=%s：确认路径安全，按 Enter 先自动移动到"
@@ -2252,10 +2259,14 @@ def teach_building_contact_release(args, config, detector):
         "building_%d_teach_idle" % item_id)
 
     localization = compute_block_localization(args, config, detector)
-    current_orientation = copy.deepcopy(
-        arm.get_current_pose().pose.orientation)
+    assist_orientation = PoseStamped().pose.orientation
+    (assist_orientation.x, assist_orientation.y,
+     assist_orientation.z, assist_orientation.w) = pickup_orientation
     assist_pose = build_teach_assist_pose(
-        localization, current_orientation, config)
+        localization, assist_orientation, config)
+    validate_pose_workspace(
+        assist_pose, config,
+        "building_%d_teach_assist_front" % item_id)
     assist_distance_mm = finite_scalar(
         config["teach_assist_distance_mm"], "teach_assist_distance_mm")
     rospy.loginfo(pose_to_text(
