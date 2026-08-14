@@ -291,16 +291,16 @@ A_PICK_PREPARE：停车，启动 Astra/机械臂/无Tag模型
 
 ## 9. 投递和权威数据
 
-有 Tag 街区保持原固定点投递。无 Tag 楼宇使用固定红框停车：框中心进入原始320×240画面的 `x=54~173`（归一化 `0.17~0.54`）就进入 `YOLO_STOP`，底盘不旋转，也不做距离闭环；标定与正式运行共用并显示该红框。停车后只使用 `/dev/video2` 楼宇框的左右宽度模型估算真实毫米距离，上下裁切允许，左右边界必须完整；并将相对 `450mm` 示教参考距离的差值交给机械臂沿前探轴修正 P。该流程不使用相机内参或手眼标定。两套库存继续共用 `delivery_presets.json` 中 ID 1~4 的仓内抓取点和共享中转点，不得拆分；idle 按来源独立：
+有 Tag 街区保持原固定点投递。无 Tag 楼宇使用固定红框停车：框中心进入原始320×240画面的 `x=54~173`（归一化 `0.17~0.54`）就进入 `YOLO_STOP`，底盘不旋转，也不做距离闭环；标定与正式运行共用并显示该红框。停车后只使用 `/dev/video2` 楼宇框的左右宽度模型估算真实毫米距离，上下裁切允许，左右边界必须完整；并将相对 `450mm` 示教参考距离的差值交给机械臂沿前探轴修正 P。该流程不使用相机内参或手眼标定。两套库存只共用 `delivery_presets.json` 中 ID 1~4 的仓内抓取点；中转点、释放点和 idle 按来源独立：
 
 ```text
-共用仓内抓取点/中转点：/home/eaibot/handeye-calib/config/delivery_presets.json
-有 Tag 固定释放点：/home/eaibot/handeye-calib/config/delivery_presets.json
-无 Tag 楼宇共享P（ID1）：/home/eaibot/handeye-calib/config/untagged_delivery_presets.json
+共用仓内抓取点：/home/eaibot/handeye-calib/config/delivery_presets.json
+有 Tag 中转/固定释放点：/home/eaibot/handeye-calib/config/delivery_presets.json
+无 Tag 楼宇中转/共享P（ID1）：/home/eaibot/handeye-calib/config/untagged_delivery_presets.json
 楼宇视觉标定：/home/eaibot/handeye-calib/config/building_delivery_calibration.json
 ```
 
-无 Tag 投递顺序：楼宇同类框锁定并对准 -> 启动回零 -> 仓内抓取点上方约 5cm -> 仓内抓取点 -> 开泵 -> 直线上升约 5cm -> 共享中转点 -> 共享 P 后方30mm -> 开限位 -> 5mm步长到P -> 2mm步长前探最多65mm -> 关泵等待0.7秒 -> 直退30mm -> idle。走满65mm未触发仍按用户决定强制释放并记成功；限位服务、串口或轨迹错误必须保持泵开启并返回失败。正式循迹投递直接使用任务摄像头的楼宇框宽估距，以“实测距离减450mm”沿相机前后方向修正P；框中心只负责进入红框后停车。四类楼宇共用在450mm参考距离下示教的ID1 power楼宇P和前探方向，只需示教一次；不再自动移动idle或辅助点，也不使用楼宇框计算示教高度和姿态。
+无 Tag 投递顺序：楼宇同类框锁定并对准 -> 启动回零 -> 仓内抓取点上方约 5cm -> 仓内抓取点 -> 开泵 -> 直线上升约 5cm -> 楼宇专用中转点 -> 共享 P 后方30mm -> 开限位 -> 5mm步长到P -> 2mm步长前探最多65mm -> 关泵等待0.7秒 -> 直退30mm -> idle。走满65mm未触发仍按用户决定强制释放并记成功；限位服务、串口或轨迹错误必须保持泵开启并返回失败。正式循迹投递直接使用任务摄像头的楼宇框宽估距，以“实测距离减450mm”沿相机前后方向修正P；框中心只负责进入红框后停车。四类楼宇共用在450mm参考距离下示教的ID1 power楼宇P和前探方向，只需示教一次；不再自动移动idle或辅助点，也不使用楼宇框计算示教高度和姿态。
 
 绝不能覆盖以下真机采集数据：
 

@@ -143,10 +143,11 @@ python3 block_pick_main.py \
   --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
 ```
 
-无 Tag 入仓放置点与有 Tag 分开；投递时的仓内抓取点和中转点则共用
-`delivery_presets.json`。
+无 Tag 入仓放置点与有 Tag 分开。投递时只有四个仓内抓取点共用
+`delivery_presets.json`；楼宇投递中转点和共享 P 单独保存在
+`untagged_delivery_presets.json`。
 
-### 示教共享中转点
+### 示教楼宇投递中转点
 
 启动 MoveIt/RViz 后运行：
 
@@ -158,13 +159,13 @@ cd /home/eaibot/handeye-calib/src
 
 python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
   --mode teach_transit \
-  --delivery-file /home/eaibot/handeye-calib/config/delivery_presets.json \
+  --delivery-file /home/eaibot/handeye-calib/config/untagged_delivery_presets.json \
   --overwrite
 ```
 
 按提示在 RViz 中把机械臂移动到安全的携物中转姿态，再回终端按 Enter；当前
-6个关节角会保存为 `transit_joint_values`。该点由有 Tag
-和无 Tag 投递共用，必须确保四个仓内抓取点、固定投递点和楼宇共享 P 都能安全到达。
+6个关节角会保存为 `transit_joint_values`。该点只供无 Tag 楼宇投递使用，必须
+确保四个仓内抓取点和楼宇共享 P 都能安全到达，不会修改有 Tag 中转点。
 
 ## 5. 验证和连续抓取
 

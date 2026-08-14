@@ -157,18 +157,18 @@ def test_delivery_preset_roundtrip_and_validation(tmp_path):
         require_delivery_items(loaded, [4])
 
 
-def test_delivery_items_share_cargo_pick_and_transit_points():
+def test_delivery_items_can_share_cargo_pick_points_across_motion_presets():
     require_delivery_items, = load_symbols("require_delivery_items")
     tag_delivery = make_delivery_preset(seed=0.1, item_ids=(2,))
     untagged_delivery = make_delivery_preset(seed=100.0, item_ids=(2,))
 
     items = require_delivery_items(
-        untagged_delivery, [2], shared_motion_preset=tag_delivery)
+        untagged_delivery, [2], cargo_pick_preset=tag_delivery)
 
     assert items["2"]["cargo_pick_joint_values"] == pytest.approx(
         tag_delivery["cargo_pick_joint_values_by_id"]["2"])
     assert items["2"]["transit_joint_values"] == pytest.approx(
-        tag_delivery["transit_joint_values"])
+        untagged_delivery["transit_joint_values"])
     assert items["2"]["delivery_joint_values"] == pytest.approx(
         untagged_delivery["delivery_joint_values"])
 

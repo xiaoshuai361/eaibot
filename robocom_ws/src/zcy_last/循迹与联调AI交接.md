@@ -152,9 +152,9 @@ python3 -m zcy_last.main \
 /home/eaibot/handeye-calib/config/untagged_delivery_presets.json
 ```
 
-两种投递共用 `delivery_presets.json` 的 `cargo_pick_joint_values_by_id`
-和 `transit_joint_values`；无 Tag 楼宇共享 P 读取
-`untagged_delivery_presets.json` 中的 ID1。
+两种投递只共用 `delivery_presets.json` 的 `cargo_pick_joint_values_by_id`；
+无 Tag 楼宇专用中转点和共享 P 读取 `untagged_delivery_presets.json`，
+其中共享 P 保存在 ID1。
 
 这些 JSON、相机内参和手眼标定结果属于真机数据。除非用户明确要求重新示教或标定，否则禁止覆盖。
 
