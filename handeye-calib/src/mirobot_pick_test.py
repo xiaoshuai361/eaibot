@@ -47,6 +47,7 @@ from block_mono_vision import (
     load_config,
     observation_in_roi,
     parse_target_sequence,
+    resolve_target_alias,
     stable_median_observation,
 )
 
@@ -181,7 +182,7 @@ def parse_args(argv):
     parser.add_argument("--pump-seconds", type=float, default=2.0)
     parser.add_argument("--wrist-forward-joint5", type=float, default=WRIST_FORWARD_JOINT5)
 
-    parser.add_argument("--block-target", choices=sorted(DEFAULT_CONFIG["target_classes"]))
+    parser.add_argument("--block-target")
     parser.add_argument("--detector-request-fd", type=int)
     parser.add_argument("--detector-response-fd", type=int)
     parser.add_argument("--supervisor-pid", type=int)
@@ -208,6 +209,7 @@ def parse_args(argv):
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
+    parser.add_argument("--motion-preset-file")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--place-approach-gap", type=float, default=0.05)
     parser.add_argument("--known-z-mm", type=float)
@@ -404,18 +406,57 @@ def require_block_pregrasp_offset(entry, target):
     return finite_vector3(offset, "pregrasp_offset_xyz_base")
 
 
-def require_block_target_entry(preset, target):
+def require_block_grasp_entry(preset, target):
     entry = preset.get("targets", {}).get(target)
     if not isinstance(entry, dict):
         raise RuntimeError(
             "Preset has no independently taught data for target %s." % target)
     pickup_model = require_block_pickup_model(entry, target)
     pregrasp_offset = require_block_pregrasp_offset(entry, target)
+    return entry, pickup_model, pregrasp_offset
+
+
+def require_block_target_entry(preset, target):
+    entry, pickup_model, pregrasp_offset = require_block_grasp_entry(
+        preset, target)
     if "place_ee_in_base" not in entry:
         raise RuntimeError(
             "Target %s has no independent no-Tag place pose. Re-teach its "
             "tagless pick/place." % target)
     return entry, pickup_model, pregrasp_offset
+
+
+def motion_target_for_visual_target(config, target):
+    mapping = config.get("motion_target_by_id")
+    if mapping is None:
+        return target
+    if not isinstance(mapping, dict):
+        raise RuntimeError("motion_target_by_id must be a mapping.")
+    metadata = config.get("target_classes", {}).get(target)
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Missing target metadata for %s." % target)
+    try:
+        target_id = int(metadata.get("target_id"))
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("target_id for %s must be an integer." % target)
+    motion_target = mapping.get(str(target_id))
+    if motion_target is None:
+        motion_target = mapping.get(target_id)
+    if not isinstance(motion_target, STRING_TYPES) or not motion_target.strip():
+        raise RuntimeError(
+            "motion_target_by_id has no target for ID%d." % target_id)
+    return motion_target.strip()
+
+
+def require_block_motion_entry(preset, target):
+    entry = preset.get("targets", {}).get(target)
+    if not isinstance(entry, dict):
+        raise RuntimeError(
+            "Motion preset has no place data for target %s." % target)
+    if "place_ee_in_base" not in entry:
+        raise RuntimeError(
+            "Motion target %s has no place_ee_in_base." % target)
+    return entry
 
 
 def require_joint_values(preset, field):
@@ -533,6 +574,14 @@ def load_block_preset(path):
     if not isinstance(preset.get("targets"), dict):
         raise RuntimeError("Preset file must contain a targets object.")
     return preset
+
+
+def load_runtime_presets(preset_file, motion_preset_file=None):
+    visual_preset = load_block_preset(preset_file)
+    motion_path = motion_preset_file or preset_file
+    if os.path.abspath(motion_path) == os.path.abspath(preset_file):
+        return visual_preset, visual_preset
+    return visual_preset, load_block_preset(motion_path)
 
 
 def load_block_place_pose(entry, target, base_frame):
@@ -1158,13 +1207,19 @@ def require_chassis_sequence_config(config):
     return settings
 
 
-def validate_chassis_sequence_preset(path, targets, config):
-    preset = load_block_preset(path)
-    require_joint_values(preset, "carry_joint_values")
-    require_joint_values(preset, "idle_joint_values")
+def validate_chassis_sequence_preset(path, targets, config,
+                                     motion_preset_file=None):
+    preset, motion_preset = load_runtime_presets(
+        path, motion_preset_file)
+    require_joint_values(motion_preset, "carry_joint_values")
+    require_joint_values(motion_preset, "idle_joint_values")
     for target in targets:
-        entry, _, _ = require_block_target_entry(preset, target)
-        load_block_place_pose(entry, target, config["base_frame"])
+        require_block_grasp_entry(preset, target)
+        motion_target = motion_target_for_visual_target(config, target)
+        motion_entry = require_block_motion_entry(
+            motion_preset, motion_target)
+        load_block_place_pose(
+            motion_entry, motion_target, config["base_frame"])
     return preset
 
 
@@ -1442,7 +1497,9 @@ def run_block_chassis_sequence(args, config, detector):
     settings = require_chassis_sequence_config(config)
     targets = parse_target_sequence(args.sequence, config)
     if not args.align_only:
-        validate_chassis_sequence_preset(args.preset_file, targets, config)
+        validate_chassis_sequence_preset(
+            args.preset_file, targets, config,
+            getattr(args, "motion_preset_file", None))
     if args.search_before_chassis:
         wait_for_search_trigger(args, config, detector, targets)
     raw_publisher = rospy.Publisher(
@@ -2087,7 +2144,7 @@ def do_teach_block_joints(args, config, action):
 def do_run_taught_block_mono(args, config, localization, action):
     target = require_taught_target(args, action)
     preset = load_block_preset(args.preset_file)
-    entry, pickup_model, pregrasp_offset = require_block_target_entry(
+    _entry, pickup_model, pregrasp_offset = require_block_grasp_entry(
         preset, target)
     probe_settings = require_contact_probe_config(config)
     anchor_pose = block_anchor_pose_from_localization(localization, config)
@@ -2099,10 +2156,6 @@ def do_run_taught_block_mono(args, config, localization, action):
         config["approach_gap_mm"],
         localization["base_frame"],
     )
-    place_pose = load_block_place_pose(
-        entry, target, localization["base_frame"])
-    pre_place_pose = build_pre_place_pose(
-        place_pose, args.place_approach_gap, localization["base_frame"])
     probe_end_pose = build_contact_probe_end_pose(
         taught_pre_grasp_pose, pickup_model,
         probe_settings["max_travel_mm"], localization["base_frame"])
@@ -2116,8 +2169,6 @@ def do_run_taught_block_mono(args, config, localization, action):
         ("taught_block_pre_grasp", taught_pre_grasp_pose),
         ("taught_block_probe_end", probe_end_pose),
         ("taught_block_retreat", retreat_pose),
-        ("taught_block_pre_place", pre_place_pose),
-        ("taught_block_place", place_pose),
     ):
         validate_pose_workspace(pose, config, label)
 
@@ -2127,21 +2178,50 @@ def do_run_taught_block_mono(args, config, localization, action):
         "taught_block_pre_grasp", taught_pre_grasp_pose))
     rospy.loginfo(pose_to_text("taught_block_probe_end", probe_end_pose))
     rospy.loginfo(pose_to_text("taught_block_retreat", retreat_pose))
-    rospy.loginfo(pose_to_text("taught_block_pre_place", pre_place_pose))
-    rospy.loginfo(pose_to_text("taught_block_place", place_pose))
 
-    if action == "preview_taught_block":
-        rospy.logwarn("Preview only: no arm motion or pump command executed.")
-        return
-    arm = build_move_group(config, args.group)
     if action == "stop_at_taught_pre_grasp":
+        arm = build_move_group(config, args.group)
         execute_pose(arm, approach_staging_pose, "block_approach_staging")
         execute_cartesian_pose(
             arm, taught_pre_grasp_pose, "taught_block_pre_grasp")
         rospy.logwarn("Stopped at taught pre-grasp; pump was not enabled.")
         return
 
-    carry_joint_values = require_joint_values(preset, "carry_joint_values")
+    motion_path = getattr(args, "motion_preset_file", None)
+    separate_motion_preset = bool(
+        motion_path and
+        os.path.abspath(motion_path) != os.path.abspath(args.preset_file))
+    if separate_motion_preset:
+        motion_preset = load_block_preset(motion_path)
+    else:
+        motion_preset = preset
+    motion_target = motion_target_for_visual_target(config, target)
+    motion_entry = require_block_motion_entry(
+        motion_preset, motion_target)
+    place_pose = load_block_place_pose(
+        motion_entry, motion_target, localization["base_frame"])
+    pre_place_pose = build_pre_place_pose(
+        place_pose, args.place_approach_gap, localization["base_frame"])
+    validate_pose_workspace(
+        pre_place_pose, config, "taught_block_pre_place")
+    validate_pose_workspace(place_pose, config, "taught_block_place")
+    rospy.loginfo(
+        "Using motion target %s for visual target %s.",
+        ascii_log_text(motion_target), ascii_log_text(target))
+    rospy.loginfo(pose_to_text("taught_block_pre_place", pre_place_pose))
+    rospy.loginfo(pose_to_text("taught_block_place", place_pose))
+
+    if action == "preview_taught_block":
+        rospy.logwarn("Preview only: no arm motion or pump command executed.")
+        return
+
+    carry_joint_values = require_joint_values(
+        motion_preset, "carry_joint_values")
+    idle_joint_values = None
+    if separate_motion_preset or motion_preset.get("idle_joint_values"):
+        idle_joint_values = require_joint_values(
+            motion_preset, "idle_joint_values")
+    arm = build_move_group(config, args.group)
     pump_proxy = get_pump_proxy()
     contact_proxies = get_contact_proxies()
     holding_object = False
@@ -2158,9 +2238,9 @@ def do_run_taught_block_mono(args, config, localization, action):
             set_pump(pump_proxy, False)
             execute_cartesian_pose(
                 arm, retreat_pose, "block_contact_probe_miss_retreat")
-            if preset.get("idle_joint_values"):
+            if idle_joint_values is not None:
                 execute_joint_values(
-                    arm, preset["idle_joint_values"], "block_idle")
+                    arm, idle_joint_values, "block_idle")
             raise ContactProbeMiss(target)
         set_pump(pump_proxy, True)
         holding_object = True
@@ -2180,8 +2260,8 @@ def do_run_taught_block_mono(args, config, localization, action):
         execute_cartesian_pose(
             arm, pre_place_pose, "taught_block_place_retreat",
             retry_without_collisions=True, fallback_to_pose=True)
-        if preset.get("idle_joint_values"):
-            execute_joint_values(arm, preset["idle_joint_values"], "block_idle")
+        if idle_joint_values is not None:
+            execute_joint_values(arm, idle_joint_values, "block_idle")
     except Exception:
         if holding_object:
             try:
@@ -2255,6 +2335,9 @@ def main():
     args = parse_args(sys.argv)
     enable_parent_death_signal(args.supervisor_pid)
     config = load_config(args.config)
+    if args.block_target is not None:
+        args.block_target = resolve_target_alias(
+            args.block_target, config)
     if args.base_frame:
         config["base_frame"] = args.base_frame
     if args.velocity_scale is not None:

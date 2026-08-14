@@ -41,6 +41,12 @@ def test_target_accepts_numeric_aliases():
     assert parsed.target == "3"
 
 
+def test_target_name_is_validated_by_selected_config_not_default_parser():
+    parsed = main.parse_args(["--target", "id4", "--dry-run"])
+
+    assert parsed.target == "id4"
+
+
 def test_missing_config_file_is_copied_from_canonical_config(tmp_path):
     config_path = tmp_path / "config" / "block_mono_grasp.yaml"
 
@@ -157,6 +163,8 @@ def test_build_child_command_forwards_taught_block_actions():
         "--run-taught-block",
         "--preset-file",
         "/tmp/block_presets.json",
+        "--motion-preset-file",
+        "/tmp/no_tag_motion_presets.json",
     )
 
     teach_command = main.build_child_command(teach, request_fd=11, response_fd=12)
@@ -168,6 +176,8 @@ def test_build_child_command_forwards_taught_block_actions():
     assert "/tmp/block_presets.json" in teach_command
     assert "--preset-file" in run_command
     assert "/tmp/block_presets.json" in run_command
+    assert run_command[run_command.index("--motion-preset-file") + 1] == \
+        "/tmp/no_tag_motion_presets.json"
     assert "--overwrite" in teach_command
 
 
@@ -406,6 +416,27 @@ def test_parent_interrupt_always_stops_active_arm_child(monkeypatch):
         main.run_parent(parsed)
 
     assert child.terminated is True
+
+
+def test_model_schema_preflight_fails_before_arm_child_starts(monkeypatch):
+    parsed = args("--dry-run")
+    runtime_config = dict(main.DEFAULT_CONFIG)
+    runtime_config["distance_method"] = "calibrated"
+    runtime_config["validate_model_output_on_start"] = True
+
+    class Detector:
+        def validate_output_schema(self):
+            raise RuntimeError("model has the wrong class count")
+
+    monkeypatch.setattr(main, "ensure_config_file", lambda _path: False)
+    monkeypatch.setattr(main, "load_config", lambda _path: runtime_config)
+    monkeypatch.setattr(main, "OnnxYoloDetector", lambda *_items: Detector())
+    monkeypatch.setattr(
+        subprocess, "Popen",
+        lambda *_items, **_kwargs: pytest.fail("arm child must not start"))
+
+    with pytest.raises(RuntimeError, match="wrong class count"):
+        main.run_parent(parsed)
 
 
 def test_repeated_interrupt_during_cleanup_force_kills_child():

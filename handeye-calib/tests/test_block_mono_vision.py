@@ -10,6 +10,7 @@ from block_mono_vision import (
     DEFAULT_CONFIG,
     DEFAULT_CONFIG_PATH,
     LocalizationError,
+    OnnxYoloDetector,
     box_geometry,
     decode_yolov5_output,
     deproject_pixel_to_camera_mm,
@@ -17,12 +18,17 @@ from block_mono_vision import (
     estimate_distance_from_box_mm,
     estimate_distance_mm,
     is_detection_usable,
+    load_config,
     observation_in_roi,
     parse_target_sequence,
     resolve_target_alias,
     roi_box_pixels,
     stable_median_observation,
 )
+
+
+TAG_YOLO_CONFIG_PATH = (
+    Path(__file__).parents[1] / "src" / "config" / "tag_yolo_grasp.yaml")
 
 
 def test_default_config_is_loaded_from_the_canonical_yaml():
@@ -42,6 +48,37 @@ def test_numeric_target_ids_map_to_existing_block_targets():
     assert parse_target_sequence("4,2,1") == ["support", "fire", "power"]
     with pytest.raises(LocalizationError, match="duplicate"):
         parse_target_sequence("1,power")
+
+
+def test_tag_yolo_config_uses_native_id_classes_without_default_targets():
+    config = load_config(str(TAG_YOLO_CONFIG_PATH))
+
+    assert list(config["target_classes"]) == ["id1", "id2", "id3", "id4"]
+    assert [
+        config["target_classes"]["id%d" % target_id]["class_name"]
+        for target_id in range(1, 5)
+    ] == ["ID1", "ID2", "ID3", "ID4"]
+    assert [resolve_target_alias(str(target_id), config)
+            for target_id in range(1, 5)] == [
+                "id1", "id2", "id3", "id4"]
+    assert parse_target_sequence("4,2,1", config) == [
+        "id4", "id2", "id1"]
+    assert config["motion_target_by_id"] == {
+        "1": "power", "2": "fire", "3": "gas", "4": "support"}
+    assert "power" not in config["target_classes"]
+
+
+def test_detector_schema_preflight_runs_one_blank_input_frame():
+    detector = object.__new__(OnnxYoloDetector)
+    detector.input_size = 32
+    seen = []
+    detector.detect = lambda image: seen.append(image)
+
+    detector.validate_output_schema()
+
+    assert len(seen) == 1
+    assert seen[0].shape == (32, 32, 3)
+    assert seen[0].dtype == np.uint8
 
 
 def test_box_geometry_returns_center_size_and_aspect():

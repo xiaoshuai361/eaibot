@@ -1,0 +1,103 @@
+# 有 Tag 整块物资的独立纯 YOLO 抓取测试配置；尚未接入正式比赛总调度。
+model_path: /home/eaibot/handeye-calib/src/model/yolov5/tag_yolo_v8_yolov5n_640_best.onnx
+
+target_classes:
+  id1:
+    target_id: 1
+    class_id: 0
+    class_name: ID1
+  id2:
+    target_id: 2
+    class_id: 1
+    class_name: ID2
+  id3:
+    target_id: 3
+    class_id: 2
+    class_name: ID3
+  id4:
+    target_id: 4
+    class_id: 3
+    class_name: ID4
+
+# Tag-YOLO 只独立保存预抓点；入仓动作按数字 ID 复用无 Tag preset。
+motion_target_by_id:
+  "1": power
+  "2": fire
+  "3": gas
+  "4": support
+
+target_size_mm: 30.0
+target_height_mm: 30.0
+distance_method: calibrated
+
+input_size: 640
+confidence_min: 0.70
+nms_iou: 0.45
+validate_model_output_on_start: true
+frames_required: 5
+observation_timeout: 50.0
+image_max_age_seconds: 1.0
+box_width_min_px: 30.0
+box_aspect_ratio_min: 0.75
+box_aspect_ratio_max: 1.30
+center_std_max_px: 2.0
+width_cv_max: 0.03
+grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
+
+chassis_sequence:
+  order: left_to_right
+  cmd_vel_topic: /cmd_vel
+  drive_speed: 0.012
+  align_tolerance_px: 12.0
+  stable_frames: 4
+  chassis_settle_seconds: 0.8
+  max_align_seconds: 25.0
+  progress_reset_px: 3.0
+  control_hz: 5.0
+  command_max_age_seconds: 1.0
+  target_right_motion: forward
+  startup_home_service: /mirobot_startup_home
+  startup_home_wait_seconds: 8.0
+  startup_home_settle_seconds: 3.0
+
+rgb_topic: /camera/rgb/image_rect_color
+camera_info_topic: /camera/rgb/camera_info
+rgb_timeout: 5.0
+camera_frame: camera_rgb_optical_frame
+base_frame: base
+tf_timeout: 5.0
+
+# 初版按已确认方案直接复用无 Tag ID1~4 的纯 RGB 距离系数。
+distance_models:
+  id1:
+    width: { a: 14269.728509, b: 81.634499 }
+    height: { a: 11809.996856, b: 127.485117 }
+  id2:
+    width: { a: 14013.121021, b: 59.004395 }
+    height: { a: 12965.356254, b: 91.544317 }
+  id3:
+    width: { a: 13519.894585, b: 66.290730 }
+    height: { a: 12215.926348, b: 91.709023 }
+  id4:
+    width: { a: 14319.186286, b: 86.567008 }
+    height: { a: 11848.800579, b: 131.191055 }
+
+max_axis_distance_disagreement_mm: 0.0
+fixed_z_mm: 330.0
+teach_assist_distance_mm: 85.0
+approach_gap_mm: 30.0
+
+contact_probe:
+  max_travel_mm: 65.0
+  staging_step_mm: 5.0
+  step_mm: 2.0
+  point_interval_seconds: 0.5
+  poll_seconds: 0.02
+  retreat_extra_mm: 30.0
+
+velocity_scale: 0.05
+acceleration_scale: 0.05
+planning_time: 5.0
+motion_settle_seconds: 0.25
+base_min_z_mm: 40.0
+base_max_radius_mm: 500.0

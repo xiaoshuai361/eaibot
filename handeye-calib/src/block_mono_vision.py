@@ -392,24 +392,32 @@ def merge_config(base, override):
 def load_config(path=None):
     config = merge_config(DEFAULT_CONFIG, {})
     if path:
-        config = merge_config(config, _read_yaml_mapping(path))
+        overrides = _read_yaml_mapping(path)
+        config = merge_config(config, overrides)
+        # A dedicated detector config owns its complete class table.  Deep
+        # merging here would silently append the four default no-Tag classes.
+        if "target_classes" in overrides:
+            config["target_classes"] = merge_config(
+                {}, overrides["target_classes"])
     return normalize_config(config)
 
 
 def normalize_config(config):
-    result = merge_config(DEFAULT_CONFIG, config or {})
-    if "target_classes" not in result and "class_names" in result:
+    overrides = config or {}
+    explicit_target_classes = "target_classes" in overrides
+    result = merge_config(DEFAULT_CONFIG, overrides)
+    if explicit_target_classes:
+        classes = overrides.get("target_classes")
+        if not isinstance(classes, dict) or not classes:
+            raise LocalizationError("target_classes must be a non-empty mapping")
+        result["target_classes"] = merge_config({}, classes)
+    elif "class_names" in overrides:
         result["target_classes"] = {}
         for index, target in enumerate(("power", "fire", "gas", "support")):
             result["target_classes"][target] = {
                 "class_id": index,
-                "class_name": result["class_names"].get(target, target),
+                "class_name": overrides["class_names"].get(target, target),
             }
-    for target, metadata in DEFAULT_TARGET_CLASSES.items():
-        configured = result["target_classes"].setdefault(target, {})
-        configured.setdefault("target_id", metadata["target_id"])
-        configured.setdefault("class_id", metadata["class_id"])
-        configured.setdefault("class_name", metadata["class_name"])
     return result
 
 
@@ -471,8 +479,11 @@ def target_metadata(config, target):
 
 def class_count_from_config(config):
     classes = (config or {}).get("target_classes") or DEFAULT_TARGET_CLASSES
-    max_id = max(int(item["class_id"]) for item in classes.values())
-    return max_id + 1
+    class_ids = [int(item["class_id"]) for item in classes.values()]
+    if sorted(class_ids) != list(range(len(class_ids))):
+        raise LocalizationError(
+            "target class_id values must be unique and contiguous from zero")
+    return len(class_ids)
 
 
 def select_target_detection(detections, target, config):
@@ -673,6 +684,12 @@ class OnnxYoloDetector(object):
                 int(detection["class_id"]), str(detection["class_id"])
             )
         return detections
+
+    def validate_output_schema(self):
+        """Run one blank frame so an incompatible ONNX export fails early."""
+        blank = np.zeros(
+            (self.input_size, self.input_size, 3), dtype=np.uint8)
+        self.detect(blank)
 
     def detect_path(self, image_path):
         try:

@@ -334,6 +334,7 @@ def test_target_entry_requires_independent_model_offset_and_place():
         normalize_vector,
         require_pickup_model,
         require_pregrasp_offset,
+        require_grasp_entry,
         require_entry,
     ) = load_symbols(
         "finite_scalar",
@@ -342,6 +343,7 @@ def test_target_entry_requires_independent_model_offset_and_place():
         "normalize_vector",
         "require_block_pickup_model",
         "require_block_pregrasp_offset",
+        "require_block_grasp_entry",
         "require_block_target_entry",
     )
     fire = {
@@ -361,6 +363,70 @@ def test_target_entry_requires_independent_model_offset_and_place():
     assert offset == pytest.approx([0.1, 0.2, 0.3])
     with pytest.raises(RuntimeError, match="power"):
         require_entry(preset, "power")
+
+
+def test_tag_yolo_motion_target_maps_native_ids_to_no_tag_actions():
+    motion_target, = load_symbols("motion_target_for_visual_target")
+    config = {
+        "target_classes": {
+            "id1": {"target_id": 1},
+            "id4": {"target_id": 4},
+        },
+        "motion_target_by_id": {
+            "1": "power",
+            "4": "support",
+        },
+    }
+
+    assert motion_target(config, "id1") == "power"
+    assert motion_target(config, "id4") == "support"
+    with pytest.raises(RuntimeError, match="ID2"):
+        motion_target({
+            "target_classes": {"id2": {"target_id": 2}},
+            "motion_target_by_id": {"1": "power"},
+        }, "id2")
+
+
+def test_visual_grasp_and_motion_place_can_come_from_separate_entries():
+    (
+        finite_scalar,
+        finite_vector3,
+        normalize_quaternion,
+        normalize_vector,
+        require_pickup_model,
+        require_pregrasp_offset,
+        require_grasp_entry,
+        require_motion_entry,
+    ) = load_symbols(
+        "finite_scalar",
+        "finite_vector3",
+        "normalize_quaternion",
+        "normalize_vector",
+        "require_block_pickup_model",
+        "require_block_pregrasp_offset",
+        "require_block_grasp_entry",
+        "require_block_motion_entry",
+    )
+    visual_entry = {
+        "pickup_model": {
+            "orientation_xyzw_base": [0.0, 0.0, 0.0, 1.0],
+            "approach_axis_xyz_base": [-1.0, 0.0, 0.0],
+        },
+        "pregrasp_offset_xyz_base": [0.1, 0.2, 0.3],
+    }
+    motion_entry = {
+        "place_ee_in_base": {
+            "position": [0.4, 0.5, 0.6],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+    }
+
+    assert require_grasp_entry(
+        {"targets": {"id1": visual_entry}}, "id1")[0] is visual_entry
+    assert require_motion_entry(
+        {"targets": {"power": motion_entry}}, "power") is motion_entry
+    with pytest.raises(RuntimeError, match="place data"):
+        require_motion_entry({"targets": {}}, "power")
 
 
 def test_motion_lock_rejects_a_second_arm_command(tmp_path):
@@ -511,14 +577,16 @@ def test_separate_pregrasp_and_place_teaching_preserve_the_other_half():
     assert entry["place_ee_in_base"] == {"captured": True}
 
 
-def test_no_tag_runtime_reads_model_offset_and_place_from_selected_target():
+def test_runtime_can_read_visual_grasp_and_mapped_motion_place_separately():
     source = SCRIPT.read_text(encoding="utf-8")
     start = source.index("def do_run_taught_block_mono")
     function_source = source[start:source.index("\ndef ", start + 1)]
 
-    assert "require_block_target_entry(\n        preset, target)" in function_source
+    assert "require_block_grasp_entry(\n        preset, target)" in function_source
     assert "anchor_pose, pickup_model, pregrasp_offset" in function_source
-    assert "entry, target, localization[\"base_frame\"]" in function_source
+    assert "motion_target_for_visual_target(config, target)" in function_source
+    assert "motion_entry, motion_target, localization[\"base_frame\"]" in \
+        function_source
     assert "shared_pregrasp_offset_xyz_base" not in function_source
 
 
@@ -552,8 +620,8 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     assert "do_run_taught_block_mono(" in source
     assert "except ContactProbeMiss:" in source
     assert "compute_drive_command(" in source
-    assert 'require_joint_values(preset, "carry_joint_values")' in source
-    assert 'require_joint_values(preset, "idle_joint_values")' in source
+    assert 'require_joint_values(motion_preset, "carry_joint_values")' in source
+    assert 'require_joint_values(motion_preset, "idle_joint_values")' in source
     assert "signal.signal(signal.SIGTERM, raise_termination_requested)" in source
     assert "finally:\n        publisher.shutdown()" in source
     assert 'deadline = time.time() + float(settings["max_align_seconds"])' in source

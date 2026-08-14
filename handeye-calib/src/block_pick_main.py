@@ -15,7 +15,6 @@ import sys
 from block_mono_vision import (
     DEFAULT_CONFIG,
     DEFAULT_CONFIG_PATH as PACKAGED_CONFIG_PATH,
-    DEFAULT_TARGET_CLASSES,
     OnnxYoloDetector,
     is_detection_usable,
     load_config,
@@ -23,7 +22,6 @@ from block_mono_vision import (
     parse_target_sequence,
     resolve_target_alias,
     select_target_detection,
-    target_aliases,
 )
 
 
@@ -78,7 +76,6 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--target",
-        choices=sorted(target_aliases(DEFAULT_CONFIG)),
         help="Target to localize/grasp. Omit in --dry-run to print every detected block.",
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
@@ -117,6 +114,12 @@ def parse_args(argv=None):
     parser.add_argument("--align-only", action="store_true")
     parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
+    parser.add_argument(
+        "--motion-preset-file",
+        help=(
+            "Optional separate block preset supplying place, carry and idle "
+            "motions; defaults to --preset-file."),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--known-z-mm", type=float)
     parser.add_argument("--frames", type=int)
@@ -283,7 +286,7 @@ def _request_id(payload):
 def _handle_request(detector, config, payload):
     request_id = _request_id(payload)
     target = payload.get("target")
-    if target is not None and target not in DEFAULT_TARGET_CLASSES:
+    if target is not None and target not in config["target_classes"]:
         raise DetectorError("Unknown target: %r" % target)
     image_path = payload.get("image_path")
     if not isinstance(image_path, str) or not os.path.isfile(image_path):
@@ -431,6 +434,8 @@ def build_child_command(args, request_fd, response_fd):
         command.append("--skip-startup-home")
     if args.preset_file:
         command += ["--preset-file", args.preset_file]
+    if args.motion_preset_file:
+        command += ["--motion-preset-file", args.motion_preset_file]
     if args.overwrite:
         command.append("--overwrite")
     if args.known_z_mm is not None:
@@ -558,6 +563,8 @@ def run_parent(args):
     detector = None
     if action not in ("teach_block_idle", "teach_block_carry"):
         detector = OnnxYoloDetector(config["model_path"], config)
+        if config.get("validate_model_output_on_start", False):
+            detector.validate_output_schema()
 
     request_read = request_write = response_read = response_write = None
     request_stream = response_stream = None
