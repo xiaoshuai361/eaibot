@@ -4,12 +4,12 @@
 
 物资编号：
 
-| ID | 类别 | 物资 |
-| --: | --- | --- |
-| 1 | `power` | 应急电源 |
-| 2 | `fire` | 灭火装置 |
-| 3 | `gas` | 气体净化装置 |
-| 4 | `support` | 结构支撑装置 |
+|  ID | 类别      | 物资         |
+| --: | --------- | ------------ |
+|   1 | `power`   | 应急电源     |
+|   2 | `fire`    | 灭火装置     |
+|   3 | `gas`     | 气体净化装置 |
+|   4 | `support` | 结构支撑装置 |
 
 无 Tag 抓取使用 Astra 矫正 RGB、YOLO、纯 RGB 估距和手眼 TF，不使用深度图。
 四类物资分别保存预抓点和入仓放置点。
@@ -145,6 +145,26 @@ python3 block_pick_main.py \
 
 无 Tag 入仓放置点与有 Tag 分开；投递时的仓内抓取点和中转点则共用
 `delivery_presets.json`。
+
+### 示教共享中转点
+
+启动 MoveIt/RViz 后运行：
+
+```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+cd /home/eaibot/handeye-calib/src
+
+python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
+  --mode teach_transit \
+  --delivery-file /home/eaibot/handeye-calib/config/delivery_presets.json \
+  --overwrite
+```
+
+按提示在 RViz 中把机械臂移动到安全的携物中转姿态，再回终端按 Enter；当前
+6个关节角会保存为 `transit_joint_values`。该点由有 Tag
+和无 Tag 投递共用，必须确保四个仓内抓取点、固定投递点和楼宇共享 P 都能安全到达。
 
 ## 5. 验证和连续抓取
 
