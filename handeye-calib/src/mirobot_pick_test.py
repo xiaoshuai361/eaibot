@@ -209,7 +209,7 @@ def parse_args(argv):
     parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--place-approach-gap", type=float, default=0.02)
+    parser.add_argument("--place-approach-gap", type=float, default=0.05)
     parser.add_argument("--known-z-mm", type=float)
     parser.add_argument("--frames", type=int)
     parser.add_argument("--preview-hz", type=float, default=1.0)
