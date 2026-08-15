@@ -22,7 +22,7 @@ from std_msgs.msg import String
 DEFAULT_SEQUENCE = '1,2,3,4'
 DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json'
 DEFAULT_PICK_SCRIPT = '/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py'
-DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.24,1.00'
+DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.28,1.00'
 DEFAULT_DEBUG_WINDOW_NAME = 'tag_pick_detection'
 CONTACT_PROBE_MISS_EXIT_CODE = 4
 DEFAULT_MAX_DETECTION_AGE_SECONDS = 4.0

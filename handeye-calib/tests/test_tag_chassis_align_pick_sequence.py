@@ -346,7 +346,7 @@ def test_parse_args_defaults_match_competition_short_command():
     assert args.sequence == [1, 2, 3, 4]
     assert args.order == "left_to_right"
     assert args.preset_file == "/home/eaibot/handeye-calib/config/tag_pick_place_presets.json"
-    assert args.target_roi_ratio == pytest.approx([0.06, 0.0, 0.24, 1.0])
+    assert args.target_roi_ratio == pytest.approx([0.06, 0.0, 0.28, 1.0])
     assert args.drive_speed == pytest.approx(0.012)
     assert args.align_tolerance_px == pytest.approx(12.0)
     assert args.stable_frames == 1
