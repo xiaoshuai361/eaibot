@@ -62,7 +62,8 @@ def make_pose(x=0.0, y=0.0, z=0.0, q=None, frame="base"):
 
 
 def make_v3_preset(tag_ids=(1, 2), idle_joint_values=None,
-                   carry_joint_values=None):
+                   carry_joint_values=None,
+                   pre_pick_transit_joint_values=None):
     preset = {
         "version": 3,
         "base_frame": "base",
@@ -85,6 +86,11 @@ def make_v3_preset(tag_ids=(1, 2), idle_joint_values=None,
         preset["idle_joint_values"] = list(idle_joint_values)
     if carry_joint_values is not None:
         preset["carry_joint_values"] = list(carry_joint_values)
+    transit_values = (
+        [0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
+        if pre_pick_transit_joint_values is None
+        else pre_pick_transit_joint_values)
+    preset["pre_pick_transit_joint_values"] = list(transit_values)
     return preset
 
 
@@ -121,6 +127,9 @@ def test_parse_args_has_no_post_pick_place_joint_alignment():
     assert args.velocity_scale == pytest.approx(0.4)
     assert args.acceleration_scale == pytest.approx(0.4)
     assert parse_args(["prog", "--mode", "teach_carry"]).mode == "teach_carry"
+    assert parse_args([
+        "prog", "--mode", "teach_pre_pick_transit"
+    ]).mode == "teach_pre_pick_transit"
     assert parse_args(["prog", "--mode", "teach_place_start"]).mode == \
         "teach_place_start"
 
@@ -624,6 +633,33 @@ def test_teach_carry_records_current_joint_values(tmp_path):
         [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
 
 
+def test_teach_pre_pick_transit_updates_only_shared_joint_point(tmp_path):
+    teach_transit, = load_module_symbols("teach_pre_pick_transit")
+    preset = make_v3_preset()
+    preset.pop("pre_pick_transit_joint_values")
+    original_tags = copy.deepcopy(preset["tags"])
+    saved = {}
+    args = SimpleNamespace(
+        preset_file=str(tmp_path / "preset.json"), overwrite=False)
+    arm = SimpleNamespace(
+        get_current_joint_values=lambda: [0.6, 0.5, 0.4, 0.3, 0.2, 0.1])
+    teach_transit.__globals__.update({
+        "load_preset": lambda path: preset,
+        "prompt_enter": lambda text: None,
+        "save_preset": lambda path, data, overwrite: saved.update({
+            "preset": copy.deepcopy(data), "overwrite": overwrite,
+        }),
+        "rospy": SimpleNamespace(loginfo=lambda *items: None),
+    })
+
+    teach_transit(args, arm)
+
+    assert saved["overwrite"] is True
+    assert saved["preset"]["pre_pick_transit_joint_values"] == pytest.approx(
+        [0.6, 0.5, 0.4, 0.3, 0.2, 0.1])
+    assert saved["preset"]["tags"] == original_tags
+
+
 def test_run_taught_sequence_dry_run_does_not_move_or_pump():
     run_taught_sequence, = load_module_symbols("run_taught_sequence")
     args = SimpleNamespace(
@@ -666,6 +702,18 @@ def test_run_taught_sequence_dry_run_does_not_move_or_pump():
     assert "cartesian" not in events
     assert "idle" not in events
     assert "pump" not in events
+
+
+def test_run_taught_sequence_requires_pre_pick_transit_before_motion():
+    run_taught_sequence, = load_module_symbols("run_taught_sequence")
+    preset = make_v3_preset(tag_ids=(1, 2))
+    preset.pop("pre_pick_transit_joint_values")
+    run_taught_sequence.__globals__["load_preset"] = lambda path: preset
+    args = SimpleNamespace(
+        sequence=[1], preset_file="/tmp/unused.json")
+
+    with pytest.raises(RuntimeError, match="teach_pre_pick_transit"):
+        run_taught_sequence(args, object(), None)
 
 
 def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next_tag():
@@ -711,17 +759,23 @@ def test_run_taught_sequence_moves_to_idle_after_each_successful_tag_before_next
         args, object(), object(), contact_proxies=(object(), object()))
 
     idle_event = ("idle", [0.0, 0.1, 0.2], "idle")
+    transit_event = (
+        "idle", preset["pre_pick_transit_joint_values"],
+        "pre_pick_transit")
     assert events.count(idle_event) == 2
+    assert events.count(transit_event) == 2
     assert events.count("approach_staging") == 2
     assert events.count("probe") == 2
     first_wait = events.index(("wait_tag", 1))
     second_wait = events.index(("wait_tag", 2))
     first_staging = events.index("approach_staging", first_wait)
+    first_transit = events.index(transit_event, first_wait)
     first_probe = events.index("probe", first_staging)
-    assert first_staging < first_probe < second_wait
+    assert first_transit < first_staging < first_probe < second_wait
     second_staging = events.index("approach_staging", second_wait)
+    second_transit = events.index(transit_event, second_wait)
     second_probe = events.index("probe", second_staging)
-    assert second_staging < second_probe
+    assert second_transit < second_staging < second_probe
     assert events.index(idle_event) < events.index(("wait_tag", 2))
 
 
@@ -1345,7 +1399,7 @@ def test_contact_probe_miss_retreats_keeps_pump_off_and_reports_incomplete():
     # Tag x=0.20, shared pre-grasp offset=-0.03, then another 30mm back.
     assert cartesian_targets[
         "contact_probe_miss_retreat"].pose.position.x == pytest.approx(0.14)
-    assert joint_labels == ["idle"]
+    assert joint_labels == ["pre_pick_transit", "idle"]
 
 
 def test_source_contract_removes_old_tuning_modes_and_parameters():

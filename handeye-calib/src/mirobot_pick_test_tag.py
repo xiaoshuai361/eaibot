@@ -136,6 +136,7 @@ def parse_args(argv):
             '  teach_tag_grasp      record a tag pickup point\n'
             '  teach_place_start    record the shared place-teach start pose\n'
             '  teach_tag_place      record a fixed bin place point\n'
+            '  teach_pre_pick_transit record the shared pre-pick transit pose\n'
             '  teach_carry          record the safe carry pose after pickup\n'
             '  teach_idle           record the idle/waiting pose\n'
             '  run_taught_sequence  pick and place taught tags\n\n'
@@ -147,6 +148,7 @@ def parse_args(argv):
     parser.add_argument('--mode',
                         choices=['teach_tag_sequence', 'teach_tag_grasp',
                                  'teach_place_start', 'teach_tag_place',
+                                 'teach_pre_pick_transit',
                                  'teach_carry',
                                  'teach_idle',
                                  'run_taught_sequence'],
@@ -762,6 +764,21 @@ def require_shared_grasp_offset(preset):
     return values
 
 
+def require_joint_values(preset, field):
+    values = preset.get(field)
+    if not isinstance(values, (list, tuple)) or len(values) != 6:
+        raise RuntimeError(
+            'Preset is missing %s with six joint values. Run '
+            '--mode teach_pre_pick_transit first.' % field)
+    try:
+        result = [float(value) for value in values]
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError('%s must contain finite joint values.' % field)
+    if any(math.isnan(value) or math.isinf(value) for value in result):
+        raise RuntimeError('%s must contain finite joint values.' % field)
+    return result
+
+
 def require_field_overwrite(preset, sequence, field, overwrite):
     if overwrite:
         return
@@ -843,6 +860,16 @@ def record_carry_in_preset(preset, arm):
         float(value) for value in arm.get_current_joint_values()
     ]
     return preset['carry_joint_values']
+
+
+def record_pre_pick_transit_in_preset(preset, arm):
+    values = [float(value) for value in arm.get_current_joint_values()]
+    if len(values) != 6 or any(
+            math.isnan(value) or math.isinf(value) for value in values):
+        raise RuntimeError(
+            'Current pre-pick transit pose must contain six finite joints.')
+    preset['pre_pick_transit_joint_values'] = values
+    return values
 
 
 def build_move_group(group_name, base_frame, velocity_scale, acceleration_scale,
@@ -1138,6 +1165,7 @@ def pose_to_text(name, pose_stamped):
 DISPLAY_LABELS = {
     'tag_in_base': 'tag在base下位姿',
     'place_teach_start': '共用放置示教起点',
+    'pre_pick_transit': '抓取前共享中转点',
     'approach_staging': '预抓点后方安全点',
     'taught_pre_grasp': '示教预抓点',
     'pickup_retreat': '吸附后退点',
@@ -1581,11 +1609,32 @@ def teach_carry(args, arm):
     rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
 
 
+def teach_pre_pick_transit(args, arm):
+    preset = load_preset(args.preset_file)
+    field = 'pre_pick_transit_joint_values'
+    if field in preset and not args.overwrite:
+        raise RuntimeError(
+            'Preset already contains %s. Use --overwrite to update it.'
+            % field)
+    prompt_enter(
+        '记录 B 点有 Tag 抓取前共享中转点\n'
+        '请在 RViz 中把机械臂移动到安全、不会碰撞的抓取前中间姿态。\n'
+        '四个 Tag 每次都按“该中转点 -> 当前 Tag 抓取安全点 -> 抓取”执行；'
+        '它与抓取完成后到达的 idle 是两个不同的点。'
+        'Plan/Execute 到位后回这里按 Enter。')
+    joint_values = record_pre_pick_transit_in_preset(preset, arm)
+    save_preset(args.preset_file, preset, overwrite=True)
+    rospy.loginfo('已保存 B 点抓取前共享中转点：%s', joint_values)
+    rospy.loginfo('已保存 tag 示教参数：%s', args.preset_file)
+
+
 def run_taught_sequence(args, arm, pump_proxy, contact_proxies=None):
     preset = load_preset(args.preset_file)
     require_preset_tags(preset, args.sequence)
     pickup_model = require_pickup_model(preset)
     shared_grasp_offset = require_shared_grasp_offset(preset)
+    pre_pick_transit = require_joint_values(
+        preset, 'pre_pick_transit_joint_values')
     rospy.loginfo(
         '四个 Tag 共用 ID%d 的示教抓取偏移。',
         DEFAULT_SHARED_GRASP_REFERENCE_TAG)
@@ -1646,6 +1695,8 @@ def run_taught_sequence(args, arm, pump_proxy, contact_proxies=None):
         holding_object = False
         try:
             set_pump(pump_proxy, False)
+            execute_joint_values(
+                arm, pre_pick_transit, 'pre_pick_transit')
             execute_pose(arm, approach_staging_pose, 'approach_staging')
             if not run_contact_approach(
                     arm, taught_pre_grasp_pose, pickup_model, args.base_frame,
@@ -1727,6 +1778,8 @@ def main():
             teach_place_start(args, arm)
         elif args.mode == 'teach_tag_place':
             teach_tag_place(args, arm)
+        elif args.mode == 'teach_pre_pick_transit':
+            teach_pre_pick_transit(args, arm)
         elif args.mode == 'teach_carry':
             teach_carry(args, arm)
         elif args.mode == 'teach_idle':
