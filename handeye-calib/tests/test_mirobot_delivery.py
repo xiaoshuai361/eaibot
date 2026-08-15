@@ -21,6 +21,7 @@ def load_symbols(*names):
         "json": json,
         "math": __import__("math"),
         "os": __import__("os"),
+        "sys": __import__("sys"),
         "STRING_TYPES": (str,),
         "arm_api": SimpleNamespace(
             DEFAULT_STARTUP_HOME_SERVICE="/mirobot_startup_home"),
@@ -28,6 +29,15 @@ def load_symbols(*names):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SCRIPT), "exec"),
          namespace)
     return [namespace[name] for name in names]
+
+
+def test_delivery_status_emits_machine_readable_stage(capsys):
+    delivery_status, = load_symbols("delivery_status")
+
+    delivery_status(4, "前往固定投递位姿")
+
+    assert capsys.readouterr().out == \
+        "DELIVERY_STATUS ID4 前往固定投递位姿\n"
 
 
 def make_item(seed):
@@ -85,15 +95,6 @@ def test_parse_args_defaults_to_three_point_delivery_workflow():
     assert args.camera_frame == "camera_rgb_optical_frame"
     assert args.velocity_scale == pytest.approx(0.2)
     assert args.acceleration_scale == pytest.approx(0.2)
-
-
-def test_home_ready_requires_all_six_joints_near_zero():
-    home_joint_state_is_ready, = load_symbols("home_joint_state_is_ready")
-
-    assert home_joint_state_is_ready([0.01, -0.02, 0.0, 0.03, 0.0, -0.01])
-    assert not home_joint_state_is_ready(
-        [0.01, -0.02, 0.0, 0.09, 0.0, -0.01])
-    assert not home_joint_state_is_ready([0.0, 0.0])
 
 
 def test_vertical_offset_moves_only_base_z_by_five_centimeters():
@@ -312,7 +313,7 @@ def test_contact_release_teach_saves_one_manual_pose_per_id(tmp_path):
     }
 
 
-def test_run_delivery_orders_home_pump_three_points_and_shared_idle(tmp_path):
+def test_run_delivery_skips_home_then_runs_three_points_and_idle(tmp_path):
     run_delivery, = load_symbols("run_delivery")
     delivery_path = tmp_path / "delivery.json"
     tag_path = tmp_path / "tag.json"
@@ -322,7 +323,6 @@ def test_run_delivery_orders_home_pump_three_points_and_shared_idle(tmp_path):
     events = []
 
     fake_api = SimpleNamespace(
-        run_startup_home=lambda args: events.append(("home",)),
         set_pump=lambda proxy, enabled: events.append(("pump", enabled)),
         execute_pose=lambda arm, pose, label: events.append(("pose", label)),
         execute_joint_values=lambda arm, values, label: events.append(
@@ -334,7 +334,6 @@ def test_run_delivery_orders_home_pump_three_points_and_shared_idle(tmp_path):
         "arm_api": fake_api,
         "compute_fk_pose": lambda args, arm, joints: events.append(
             ("fk",)) or "cargo_pose",
-        "wait_for_home_joint_state": lambda arm: events.append(("home_ready",)),
         "build_vertical_offset_pose": lambda pose, distance: events.append(
             ("build_pre_pick", distance)) or "pre_pick_pose",
         "rospy": SimpleNamespace(
@@ -353,8 +352,6 @@ def test_run_delivery_orders_home_pump_three_points_and_shared_idle(tmp_path):
     assert [event[:2] for event in events] == [
         ("fk",),
         ("build_pre_pick", 0.05),
-        ("home",),
-        ("home_ready",),
         ("pump", False),
         ("pose", "delivery_1_pre_pick_5cm"),
         ("joint", "delivery_1_cargo_pick"),
@@ -369,7 +366,7 @@ def test_run_delivery_orders_home_pump_three_points_and_shared_idle(tmp_path):
     ]
 
 
-def test_dry_run_does_not_home_move_or_operate_pump(tmp_path):
+def test_dry_run_does_not_move_or_operate_pump(tmp_path):
     run_delivery, = load_symbols("run_delivery")
     delivery_path = tmp_path / "delivery.json"
     tag_path = tmp_path / "tag.json"
@@ -404,13 +401,11 @@ def test_failure_while_carrying_keeps_pump_enabled(tmp_path):
 
     run_delivery.__globals__.update({
         "arm_api": SimpleNamespace(
-            run_startup_home=lambda args: None,
             set_pump=lambda proxy, enabled: pump_events.append(enabled),
             execute_pose=lambda arm, pose, label: None,
             execute_joint_values=execute,
             execute_cartesian_pose=lambda arm, pose, label: None),
         "compute_fk_pose": lambda args, arm, joints: object(),
-        "wait_for_home_joint_state": lambda arm: None,
         "build_vertical_offset_pose": lambda pose, distance: object(),
         "rospy": SimpleNamespace(
             sleep=lambda seconds: None,
@@ -449,7 +444,6 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
 
     fake_api = SimpleNamespace(
         get_contact_proxies=lambda: ("enable", "state"),
-        run_startup_home=lambda args: events.append(("home",)),
         set_pump=lambda proxy, enabled: events.append(("pump", enabled)),
         execute_pose=lambda arm, pose, label: events.append(("pose", label)),
         execute_joint_values=lambda arm, values, label: events.append(
@@ -465,7 +459,6 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
     run_delivery.__globals__.update({
         "arm_api": fake_api,
         "compute_fk_pose": lambda args, arm, joints: next(fk_poses),
-        "wait_for_home_joint_state": lambda arm: None,
         "build_vertical_offset_pose": lambda pose, distance: "pre_pick",
         "rospy": SimpleNamespace(
             sleep=lambda seconds: events.append(("sleep", seconds)),

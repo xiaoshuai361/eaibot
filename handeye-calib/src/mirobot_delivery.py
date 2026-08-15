@@ -30,9 +30,6 @@ DEFAULT_DELIVERY_FILE = (
     '/home/eaibot/handeye-calib/config/delivery_presets.json')
 DEFAULT_TAG_PRESET_FILE = (
     '/home/eaibot/handeye-calib/config/tag_pick_place_presets.json')
-HOME_READY_TIMEOUT_SECONDS = 30.0
-HOME_JOINT_TOLERANCE_RAD = 0.08
-HOME_STABLE_SAMPLES = 3
 DELIVERY_LIFT_METERS = 0.05
 COMPUTE_FK_SERVICE = '/compute_fk'
 COMPUTE_FK_WAIT_SECONDS = 5.0
@@ -54,6 +51,11 @@ except NameError:
 
 class UserAbort(Exception):
     pass
+
+
+def delivery_status(item_id, message):
+    print('DELIVERY_STATUS ID%d %s' % (int(item_id), message))
+    sys.stdout.flush()
 
 
 def parse_sequence(text):
@@ -129,10 +131,6 @@ def parse_args(argv):
         '--contact-distance-offset', type=float, default=0.0,
         help=('停车后楼宇估距相对450mm示教距离的偏差（米）；'
               '正数表示楼面更远，P沿前探方向前移。'))
-    parser.add_argument('--startup-home-service',
-                        default=arm_api.DEFAULT_STARTUP_HOME_SERVICE)
-    parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
-    parser.add_argument('--startup-home-settle-seconds', type=float, default=3.0)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
@@ -155,9 +153,6 @@ def parse_args(argv):
     if args.force_release_on_contact_miss and not args.contact_release:
         raise RuntimeError(
             '--force-release-on-contact-miss 必须和 --contact-release 一起使用。')
-    positive(args.startup_home_wait_seconds, '--startup-home-wait-seconds')
-    nonnegative(args.startup_home_settle_seconds,
-                '--startup-home-settle-seconds')
     return args
 
 
@@ -316,42 +311,6 @@ def camera_safe_axis_in_base(base_frame, camera_frame, timeout_seconds):
         '相机后退方向')
 
 
-def home_joint_state_is_ready(values, tolerance_rad=HOME_JOINT_TOLERANCE_RAD):
-    try:
-        joints = validate_joint_values(list(values), '回零关节状态')
-    except (RuntimeError, TypeError):
-        return False
-    return max(abs(value) for value in joints) <= float(tolerance_rad)
-
-
-def wait_for_home_joint_state(arm):
-    deadline = (
-        rospy.Time.now() + rospy.Duration(HOME_READY_TIMEOUT_SECONDS))
-    stable = 0
-    latest = None
-    rospy.loginfo(
-        '等待启动回零真正完成：需要连续 %d 次关节状态接近零位。',
-        HOME_STABLE_SAMPLES)
-    while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-        try:
-            latest = list(arm.get_current_joint_values())
-        except Exception:
-            latest = None
-        if home_joint_state_is_ready(latest or []):
-            stable += 1
-            if stable >= HOME_STABLE_SAMPLES:
-                rospy.loginfo('启动回零已完成，当前关节角：%s', latest)
-                arm.set_start_state_to_current_state()
-                return
-        else:
-            stable = 0
-        rospy.sleep(0.2)
-    raise RuntimeError(
-        '启动回零服务已返回，但 %.1fs 内 MoveIt 未收到稳定的零位关节状态。'
-        '最新关节角=%s。请检查终端 2 的串口状态和 /joint_states。'
-        % (HOME_READY_TIMEOUT_SECONDS, latest))
-
-
 def build_vertical_offset_pose(pose, offset_z):
     target = copy.deepcopy(pose)
     target.header.stamp = rospy.Time.now()
@@ -462,7 +421,6 @@ def teach_contact_release(args, arm):
 
 def build_delivery_actions(item, idle_joint_values):
     return [
-        ('home', None),
         ('pump', False),
         ('pose_above_cargo', DELIVERY_LIFT_METERS),
         ('joint_to_cargo', item['cargo_pick_joint_values']),
@@ -503,7 +461,7 @@ def run_delivery(args, arm, pump_proxy):
                 build_delivery_actions(item, idle_joint_values)
             )
             rospy.loginfo('Dry-run ID%d 投递动作：%s', item_id, actions)
-        rospy.logwarn('Dry-run：未回零、未移动机械臂、未操作吸泵。')
+        rospy.logwarn('Dry-run：未移动机械臂、未操作吸泵。')
         return
 
     contact_proxies = arm_api.get_contact_proxies() \
@@ -514,28 +472,32 @@ def run_delivery(args, arm, pump_proxy):
         holding_object = False
         rospy.loginfo('开始投递 ID%d（%d/%d）。', item_id, index,
                       len(args.sequence))
+        delivery_status(item_id, '开始，正在计算载物仓抓取位姿')
         try:
             cargo_pose = compute_fk_pose(
                 args, arm, entry['cargo_pick_joint_values'])
             pre_pick_pose = build_vertical_offset_pose(
                 cargo_pose, DELIVERY_LIFT_METERS)
-            arm_api.run_startup_home(args)
-            wait_for_home_joint_state(arm)
             arm_api.set_pump(pump_proxy, False)
+            delivery_status(item_id, '前往载物仓上方安全点')
             arm_api.execute_pose(
                 arm, pre_pick_pose, 'delivery_%d_pre_pick_5cm' % item_id)
+            delivery_status(item_id, '下降到载物仓抓取点')
             arm_api.execute_joint_values(
                 arm, entry['cargo_pick_joint_values'],
                 'delivery_%d_cargo_pick' % item_id)
             arm_api.set_pump(pump_proxy, True)
             holding_object = True
             rospy.sleep(args.pump_on_settle_seconds)
+            delivery_status(item_id, '已吸取，正在抬升')
             arm_api.execute_cartesian_pose(
                 arm, pre_pick_pose, 'delivery_%d_lift_5cm' % item_id)
+            delivery_status(item_id, '前往中间过渡点')
             arm_api.execute_joint_values(
                 arm, entry['transit_joint_values'],
                 'delivery_%d_transit' % item_id)
             if contact_release:
+                delivery_status(item_id, '计算楼宇估距修正后的投递位姿')
                 precontact_pose = compute_fk_pose(
                     args, arm, entry['precontact_joint_values'])
                 pickup_model = {
@@ -551,9 +513,11 @@ def run_delivery(args, arm, pump_proxy):
                 staging_pose = arm_api.build_backoff_pose(
                     precontact_pose, pickup_model,
                     args.contact_staging_gap, args.base_frame)
+                delivery_status(item_id, '前往楼宇投递点后方30mm安全点')
                 arm_api.execute_pose(
                     arm, staging_pose,
                     'delivery_%d_contact_staging_30mm' % item_id)
+                delivery_status(item_id, '限位保护前探并执行释放')
                 triggered = arm_api.run_contact_approach(
                     arm, precontact_pose, pickup_model, args.base_frame,
                     contact_proxies[0], contact_proxies[1],
@@ -577,12 +541,14 @@ def run_delivery(args, arm, pump_proxy):
                         item_id, args.contact_probe_max_travel * 1000.0)
             else:
                 staging_pose = None
+                delivery_status(item_id, '前往固定投递位姿')
                 arm_api.execute_joint_values(
                     arm, entry['delivery_joint_values'],
                     'delivery_%d_release' % item_id)
             arm_api.set_pump(pump_proxy, False)
             holding_object = False
             rospy.sleep(args.pump_off_settle_seconds)
+            delivery_status(item_id, '物资已释放，正在回退并归位')
             if contact_release:
                 arm_api.execute_cartesian_pose(
                     arm, staging_pose,
@@ -590,12 +556,14 @@ def run_delivery(args, arm, pump_proxy):
                     eef_step=args.contact_staging_step)
             arm_api.execute_joint_values(
                 arm, idle_joint_values, 'idle')
-        except Exception:
+        except Exception as exc:
+            delivery_status(item_id, '失败：%s' % exc)
             if holding_object:
                 rospy.logerr(
                     'ID%d 携带物块时动作失败；为防止物块在未知位置掉落，'
                     '吸泵保持开启，请人工处理。', item_id)
             raise
+        delivery_status(item_id, '投递完成，已回到idle')
         rospy.loginfo('ID%d 投递完成，已回到 idle。', item_id)
 
 
