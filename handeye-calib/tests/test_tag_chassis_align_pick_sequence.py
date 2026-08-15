@@ -77,7 +77,6 @@ def load_symbols(*names):
         "sys": __import__("sys"),
         "time": __import__("time"),
         "rospy": FakeRospy,
-        "Trigger": object,
         "STRING_TYPES": (str,),
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SCRIPT), "exec"), namespace)
@@ -309,8 +308,6 @@ def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
         "--wait-key-between-tags",
         "--tag-tf-wait-seconds", "10",
         "--base-frame", "base",
-        "--startup-home-service", "/mirobot_startup_home",
-        "--skip-startup-home",
         "--max-detection-age-seconds", "1.5",
         "--chassis-settle-seconds", "0.8",
         "--result-file", "/tmp/tag-result.json",
@@ -322,8 +319,6 @@ def test_parse_args_accepts_wait_key_and_tag_tf_wait_option():
     assert args.wait_key_between_tags is True
     assert args.tag_tf_wait_seconds == 10.0
     assert args.base_frame == "base"
-    assert args.startup_home_service == "/mirobot_startup_home"
-    assert args.skip_startup_home is True
     assert args.max_detection_age_seconds == pytest.approx(1.5)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.result_file == "/tmp/tag-result.json"
@@ -359,7 +354,6 @@ def test_parse_args_defaults_match_competition_short_command():
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.tag_tf_wait_seconds == pytest.approx(10.0)
     assert args.pick_approach_gap == pytest.approx(0.030)
-    assert args.startup_home_settle_seconds == pytest.approx(3.0)
     assert args.pick_velocity_scale == pytest.approx(0.2)
     assert args.pick_acceleration_scale == pytest.approx(0.2)
     assert args.show_debug_window is False
@@ -569,9 +563,6 @@ def test_run_skips_alignment_timeout_and_continues_with_next_tag():
         def run_pick(self, tag_id):
             calls.append(("pick", tag_id))
 
-        def run_startup_home(self, tag_id):
-            calls.append(("home", tag_id))
-
         def stop_chassis(self):
             calls.append(("stop",))
 
@@ -581,13 +572,12 @@ def test_run_skips_alignment_timeout_and_continues_with_next_tag():
         ("align", 1),
         ("stop",),
         ("align", 2),
-        ("home", 2),
         ("pick", 2),
         ("stop",),
     ]
 
 
-def test_run_calls_controller_startup_home_before_each_pick():
+def test_run_picks_each_tag_without_startup_home():
     ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
     calls = []
 
@@ -613,9 +603,6 @@ def test_run_calls_controller_startup_home_before_each_pick():
         def run_pick(self, tag_id):
             calls.append(("pick", tag_id))
 
-        def run_startup_home(self, tag_id):
-            calls.append(("startup_home", tag_id))
-
         def stop_chassis(self):
             calls.append(("stop",))
 
@@ -623,11 +610,9 @@ def test_run_calls_controller_startup_home_before_each_pick():
 
     assert calls == [
         ("align", 1),
-        ("startup_home", 1),
         ("tf", 1),
         ("pick", 1),
         ("align", 2),
-        ("startup_home", 2),
         ("tf", 2),
         ("pick", 2),
         ("stop",),
@@ -645,7 +630,6 @@ def test_run_ignores_legacy_wait_key_between_tags_option():
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=True,
-                skip_startup_home=True,
             )
 
         def select_next_tag(self, remaining_tags):
@@ -687,7 +671,6 @@ def test_run_does_not_wait_between_tags_by_default():
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=False,
-                skip_startup_home=True,
             )
 
         def select_next_tag(self, remaining_tags):
@@ -727,7 +710,6 @@ def test_run_skips_pick_when_tag_tf_does_not_stabilize():
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=False,
-                skip_startup_home=True,
             )
 
         def select_next_tag(self, remaining_tags):
@@ -769,7 +751,6 @@ def test_run_continues_when_child_pick_loses_tag_tf_before_motion():
                 align_only=False,
                 dry_run=False,
                 wait_key_between_tags=False,
-                skip_startup_home=False,
             )
 
         def select_next_tag(self, remaining_tags):
@@ -786,9 +767,6 @@ def test_run_continues_when_child_pick_loses_tag_tf_before_motion():
             calls.append(("pick", tag_id))
             return tag_id != 1
 
-        def run_startup_home(self, tag_id):
-            calls.append(("startup_home", tag_id))
-
         def stop_chassis(self):
             calls.append(("stop",))
 
@@ -796,11 +774,9 @@ def test_run_continues_when_child_pick_loses_tag_tf_before_motion():
 
     assert calls == [
         ("align", 1),
-        ("startup_home", 1),
         ("tf", 1),
         ("pick", 1),
         ("align", 2),
-        ("startup_home", 2),
         ("tf", 2),
         ("pick", 2),
         ("stop",),
@@ -866,17 +842,14 @@ def test_run_stops_after_requested_success_count():
         def run_pick(self, tag_id):
             calls.append(("pick", tag_id))
 
-        def run_startup_home(self, tag_id):
-            calls.append(("home", tag_id))
-
         def stop_chassis(self):
             calls.append(("stop",))
 
     FakeSequence().run()
 
     assert calls == [
-        ("align", 1), ("home", 1), ("pick", 1),
-        ("align", 2), ("home", 2), ("pick", 2),
+        ("align", 1), ("pick", 1),
+        ("align", 2), ("pick", 2),
         ("stop",),
     ]
 
@@ -914,7 +887,7 @@ def test_partial_run_skips_missing_tf_and_returns_actual_inventory(tmp_path):
             self.args = SimpleNamespace(
                 sequence=[1, 2], max_targets=2, fail_on_skip=False,
                 allow_partial=True, align_only=False, dry_run=False,
-                wait_key_between_tags=False, skip_startup_home=True,
+                wait_key_between_tags=False,
                 result_file=str(result_file),
             )
 
@@ -984,9 +957,6 @@ def test_partial_run_skips_child_exit_one_after_alignment(tmp_path):
         def align_tag(self, tag_id):
             calls.append(("align", tag_id))
 
-        def run_startup_home(self, tag_id):
-            calls.append(("home", tag_id))
-
         def wait_for_tag_tf_before_pick(self, tag_id):
             calls.append(("tf", tag_id))
             return True
@@ -1002,8 +972,8 @@ def test_partial_run_skips_child_exit_one_after_alignment(tmp_path):
 
     FakeSequence().run()
 
-    assert calls[:4] == [
-        ("align", 1), ("home", 1), ("tf", 1), ("pick", 1)
+    assert calls[:3] == [
+        ("align", 1), ("tf", 1), ("pick", 1)
     ]
     assert ("align", 2) in calls
     assert json.loads(result_file.read_text(encoding="utf-8")) == {

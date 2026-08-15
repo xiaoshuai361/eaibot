@@ -17,7 +17,6 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
 
 
 DEFAULT_SEQUENCE = '1,2,3,4'
@@ -25,7 +24,6 @@ DEFAULT_PRESET_FILE = '/home/eaibot/handeye-calib/config/tag_pick_place_presets.
 DEFAULT_PICK_SCRIPT = '/home/eaibot/handeye-calib/src/mirobot_pick_test_tag.py'
 DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.24,1.00'
 DEFAULT_DEBUG_WINDOW_NAME = 'tag_pick_detection'
-DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
 CONTACT_PROBE_MISS_EXIT_CODE = 4
 DEFAULT_MAX_DETECTION_AGE_SECONDS = 4.0
 DEFAULT_PICK_APPROACH_GAP = 0.030
@@ -405,13 +403,6 @@ def parse_args(argv):
                         default=DEFAULT_PICK_APPROACH_GAP,
                         help='示教预抓点后方的安全过渡距离（米），默认 0.030。')
     parser.add_argument('--disable-replanning', action='store_true')
-    parser.add_argument('--startup-home-service', default=DEFAULT_STARTUP_HOME_SERVICE,
-                        help='Trigger service that sends the same $H homing command as mirobot.launch startup.')
-    parser.add_argument('--startup-home-wait-seconds', type=float, default=8.0)
-    parser.add_argument('--startup-home-settle-seconds', type=float, default=3.0,
-                        help='Wait after startup homing before the next chassis/tag step.')
-    parser.add_argument('--skip-startup-home', action='store_true',
-                        help='Skip controller startup homing before each pick.')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)
     if args.max_targets is not None and not (
@@ -437,10 +428,6 @@ def parse_args(argv):
         raise RuntimeError('--tag-tf-wait-seconds must be non-negative.')
     if args.pick_approach_gap <= 0.0:
         raise RuntimeError('--pick-approach-gap must be positive.')
-    if args.startup_home_wait_seconds <= 0.0:
-        raise RuntimeError('--startup-home-wait-seconds must be positive.')
-    if args.startup_home_settle_seconds < 0.0:
-        raise RuntimeError('--startup-home-settle-seconds must be non-negative.')
     return args
 
 
@@ -707,23 +694,6 @@ class ChassisAlignPickSequence(object):
         finally:
             self.pick_in_progress = False
 
-    def run_startup_home(self, tag_id):
-        if (self.args.align_only or self.args.dry_run or
-                getattr(self.args, 'skip_startup_home', False)):
-            return
-        rospy.loginfo(
-            'ID%d 抓取前调用 %s 执行启动回零。',
-            tag_id, self.args.startup_home_service)
-        rospy.wait_for_service(
-            self.args.startup_home_service,
-            timeout=self.args.startup_home_wait_seconds)
-        response = rospy.ServiceProxy(self.args.startup_home_service, Trigger)()
-        if not response.success:
-            raise RuntimeError(
-                'ID%d 后启动回零服务失败：%s'
-                % (tag_id, response.message))
-        rospy.sleep(self.args.startup_home_settle_seconds)
-
     def read_tag_tf_stamp(self, tag_id):
         if self.tf_listener is None:
             self.tf_listener = tf.TransformListener()
@@ -810,7 +780,6 @@ class ChassisAlignPickSequence(object):
                     remaining_tags.remove(tag_id)
                     continue
                 try:
-                    self.run_startup_home(tag_id)
                     needs_pick_tf = not self.args.align_only and not self.args.dry_run
                     if (needs_pick_tf
                             and not self.wait_for_tag_tf_before_pick(tag_id)):
