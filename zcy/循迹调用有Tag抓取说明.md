@@ -92,7 +92,7 @@ python2 /home/eaibot/handeye-calib/src/tag_chassis_align_pick_sequence.py \
   --preset-file /home/eaibot/handeye-calib/config/tag_pick_place_presets.json \
   --pick-velocity-scale 0.2 \
   --pick-acceleration-scale 0.2 \
-  --pick-approach-gap 0.030 \
+  --pick-approach-gap 0.040 \
   --tag-tf-wait-seconds 18.0
 ```
 
@@ -127,17 +127,17 @@ AprilTag 自带的 `show_image` 窗口默认关闭，YOLO relay 也不在送给 
 -> 等待新的 base -> tag_N TF
 -> 收集3个不同时间戳的新鲜 TF 并过滤
 -> 普通关节规划到四个 Tag 共用的抓取前中转点
--> 普通规划到示教预抓点后方30mm（`--pick-approach-gap` 可配置）
+-> 普通规划到示教预抓点后方40mm（`--pick-approach-gap` 可配置）
 -> 在该后方安全点开启限位检测
 -> 以5mm步长保持姿态受保护地直线伸到示教预抓点；途中触发立即停止
 -> 若尚未触发，再从预抓点最多前探65mm，每2mm检查
 -> 收到精确限位消息 3\r\n 后停止剩余路点
 -> 确认限位后才开泵
--> 沿原路径退到示教预抓点后方30mm
+-> 沿原路径退到示教预抓点后方40mm
 -> carry -> ID对应载物仓 -> idle
 ```
 
-无论限位在“后方安全点到 P”途中还是 P 前方触发，吸附后都沿原轴直退到 P 后方 `30mm`。限位未触发时也先退到该位置，不得开泵或进入 carry。
+无论限位在“后方安全点到 P”途中还是 P 前方触发，吸附后都沿原轴直退到 P 后方 `40mm`。限位未触发时也先退到该位置，不得开泵或进入 carry。
 
 四个 Tag 固定共用真机 preset 中 ID2 的 `grasp_offset_xyz_base`，其语义是“近距离、正对、未接触的示教预抓点”。不新增迁移字段。四个 ID 只分别保存自己的载物仓放置点。
 

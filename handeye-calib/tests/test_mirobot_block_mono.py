@@ -645,6 +645,25 @@ def test_runtime_can_read_visual_grasp_and_mapped_motion_place_separately():
     assert "shared_pregrasp_offset_xyz_base" not in function_source
 
 
+def test_a_point_loads_b_shared_pre_pick_transit_from_tag_preset(tmp_path):
+    finite_scalar, require_joints, load_transit = load_symbols(
+        "finite_scalar", "require_joint_values",
+        "load_pre_pick_transit_joint_values")
+    load_transit.__globals__.update({
+        "finite_scalar": finite_scalar,
+        "require_joint_values": require_joints,
+    })
+    path = tmp_path / "tag.json"
+    expected = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    path.write_text(json.dumps({
+        "pre_pick_transit_joint_values": expected,
+    }), encoding="utf-8")
+
+    assert load_transit({
+        "pre_pick_transit_preset_file": str(path),
+    }) == pytest.approx(expected)
+
+
 def test_teach_confirmation_rejects_pasted_commands_and_requires_empty_enter():
     prompt_enter, = load_symbols("prompt_enter")
     responses = iter(["python3 another_command.py", ""])
@@ -684,10 +703,13 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     assert "finally:\n        publisher.shutdown()" in source
     assert 'deadline = time.time() + float(settings["max_align_seconds"])' in source
     sequence_start = source.index("def run_block_chassis_sequence")
-    home_call = source.index("run_sequence_startup_home(", sequence_start)
     localization_call = source.index(
         "localization = compute_block_localization(", sequence_start)
-    assert home_call < localization_call
+    pickup_call = source.index("do_run_taught_block_mono(", localization_call)
+    assert localization_call < pickup_call
+    assert "run_sequence_startup_home" not in source
+    assert "skip_startup_home" not in source
+    assert "pre_pick_transit)" in source[localization_call:pickup_call + 300]
     assert "stopped confirmation: %d/%d fresh frames" in source
     selection_function = next(
         node for node in ast.parse(source).body
@@ -904,11 +926,12 @@ def test_no_tag_runtime_uses_tag_style_staging_then_taught_pregrasp():
         'arm, taught_pre_grasp_pose, "taught_block_pre_grasp"', staging)
     contact_probe = function_source.index("if not run_contact_approach(", taught_pregrasp)
 
-    stable_wait = function_source.index("wait_for_joint_state_stable(arm)")
+    transit = function_source.index(
+        'arm, pre_pick_transit_joint_values, "block_pre_pick_transit"')
     runtime_staging = function_source.index(
         'execute_pose(arm, approach_staging_pose, "block_approach_staging")',
-        stable_wait)
-    assert stable_wait < runtime_staging < contact_probe
+        transit)
+    assert transit < runtime_staging < contact_probe
     assert staging < taught_pregrasp < contact_probe
 
 
@@ -1050,9 +1073,6 @@ def test_chassis_sequence_settings_are_validated_from_yaml_mapping():
         "control_hz": 5.0,
         "command_max_age_seconds": 1.0,
         "target_right_motion": "forward",
-        "startup_home_service": "/mirobot_startup_home",
-        "startup_home_wait_seconds": 8.0,
-        "startup_home_settle_seconds": 3.0,
     }
 
     assert require_settings({"chassis_sequence": settings}) is settings

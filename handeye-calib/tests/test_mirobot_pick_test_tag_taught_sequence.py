@@ -121,7 +121,7 @@ def test_parse_args_has_no_post_pick_place_joint_alignment():
     assert args.tag_min_samples == 3
     assert args.tag_max_age_seconds == pytest.approx(2.0)
     assert args.tf_timeout == pytest.approx(12.0)
-    assert args.approach_gap == pytest.approx(0.030)
+    assert args.approach_gap == pytest.approx(0.040)
     assert args.assist_front_gap == pytest.approx(0.065)
     assert args.place_approach_gap == pytest.approx(0.05)
     assert args.velocity_scale == pytest.approx(0.4)
@@ -829,8 +829,8 @@ def test_run_taught_sequence_moves_to_carry_between_grasp_and_place():
     assert events.index("pickup_retreat") < events.index(carry_event)
     assert events.index(carry_event) < events.index("taught_pre_place")
     # tag x=0.20, taught offset=-0.03, approach axis=-X:
-    # Taught pre-grasp x=0.17; retreat ends 30mm behind it at x=0.14.
-    assert cartesian_targets["pickup_retreat"].pose.position.x == pytest.approx(0.14)
+    # Taught pre-grasp x=0.17; retreat ends 40mm behind it at x=0.13.
+    assert cartesian_targets["pickup_retreat"].pose.position.x == pytest.approx(0.13)
 
 
 def test_run_taught_sequence_ignores_stale_place_joint_values_after_pickup():
@@ -1396,9 +1396,9 @@ def test_contact_probe_miss_retreats_keeps_pump_off_and_reports_incomplete():
 
     assert pump_events == [False, False]
     assert cartesian_labels == ["contact_probe_miss_retreat"]
-    # Tag x=0.20, shared pre-grasp offset=-0.03, then another 30mm back.
+    # Tag x=0.20, shared pre-grasp offset=-0.03, then another 40mm back.
     assert cartesian_targets[
-        "contact_probe_miss_retreat"].pose.position.x == pytest.approx(0.14)
+        "contact_probe_miss_retreat"].pose.position.x == pytest.approx(0.13)
     assert joint_labels == ["pre_pick_transit", "idle"]
 
 

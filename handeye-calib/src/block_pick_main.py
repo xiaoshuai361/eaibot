@@ -113,7 +113,6 @@ def parse_args(argv=None):
         "--wait-key-between-targets", action="store_true",
         help=argparse.SUPPRESS)
     parser.add_argument("--align-only", action="store_true")
-    parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument(
         "--motion-preset-file",
@@ -229,8 +228,6 @@ def validate_runtime_args(args, config):
         raise ValueError("--fail-on-skip and --allow-partial are mutually exclusive")
     if args.result_file and action != "run_chassis_sequence":
         raise ValueError("--result-file requires --run-chassis-sequence")
-    if args.skip_startup_home and action != "run_chassis_sequence":
-        raise ValueError("--skip-startup-home requires --run-chassis-sequence")
     targetless_actions = (
         "dry_run", "live_preview", "teach_block_idle",
         "teach_block_carry", "run_chassis_sequence")
@@ -437,8 +434,6 @@ def build_child_command(args, request_fd, response_fd):
         command += ["--result-file", args.result_file]
     if args.align_only:
         command.append("--align-only")
-    if args.skip_startup_home:
-        command.append("--skip-startup-home")
     if args.preset_file:
         command += ["--preset-file", args.preset_file]
     if args.motion_preset_file:

@@ -42,7 +42,10 @@ box_aspect_ratio_min: 0.75
 box_aspect_ratio_max: 1.30
 center_std_max_px: 2.0
 width_cv_max: 0.03
-grasp_roi_ratio: [0.06, 0.00, 0.24, 1.00]
+grasp_roi_ratio: [0.06, 0.00, 0.28, 1.00]
+
+# 与正式 A/B 抓取共用同一个抓取前中转点。
+pre_pick_transit_preset_file: /home/eaibot/handeye-calib/config/tag_pick_place_presets.json
 
 chassis_sequence:
   order: left_to_right
@@ -56,9 +59,6 @@ chassis_sequence:
   control_hz: 5.0
   command_max_age_seconds: 1.0
   target_right_motion: forward
-  startup_home_service: /mirobot_startup_home
-  startup_home_wait_seconds: 8.0
-  startup_home_settle_seconds: 3.0
 
 rgb_topic: /camera/rgb/image_rect_color
 camera_info_topic: /camera/rgb/camera_info
@@ -85,7 +85,7 @@ distance_models:
 max_axis_distance_disagreement_mm: 0.0
 fixed_z_mm: 330.0
 teach_assist_distance_mm: 85.0
-approach_gap_mm: 30.0
+approach_gap_mm: 40.0
 
 contact_probe:
   max_travel_mm: 65.0
@@ -93,7 +93,7 @@ contact_probe:
   step_mm: 2.0
   point_interval_seconds: 0.5
   poll_seconds: 0.02
-  retreat_extra_mm: 30.0
+  retreat_extra_mm: 40.0
 
 velocity_scale: 0.05
 acceleration_scale: 0.05

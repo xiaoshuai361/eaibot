@@ -28,7 +28,6 @@ import moveit_commander
 import rospy
 import tf
 from geometry_msgs.msg import PoseStamped, Twist
-from std_srvs.srv import Trigger
 
 from tag_chassis_align_pick_sequence import (
     compute_drive_command,
@@ -214,7 +213,6 @@ def parse_args(argv):
         "--wait-key-between-targets", action="store_true",
         help=argparse.SUPPRESS)
     parser.add_argument("--align-only", action="store_true")
-    parser.add_argument("--skip-startup-home", action="store_true")
     parser.add_argument("--preset-file", default=DEFAULT_BLOCK_PRESET_FILE)
     parser.add_argument("--motion-preset-file")
     parser.add_argument("--overwrite", action="store_true")
@@ -473,6 +471,21 @@ def require_joint_values(preset, field):
             "Preset must contain six %s values; copy them from the Tag preset."
             % field)
     return [finite_scalar(value, field) for value in values]
+
+
+def load_pre_pick_transit_joint_values(config):
+    path = config.get("pre_pick_transit_preset_file")
+    if not isinstance(path, STRING_TYPES) or not path.strip():
+        raise RuntimeError(
+            "Config must contain pre_pick_transit_preset_file for the shared "
+            "A/B pre-pick transit point.")
+    try:
+        with open(path, "r") as handle:
+            preset = json.load(handle)
+    except (IOError, OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot load shared pre-pick transit preset %s: %s" % (path, exc))
+    return require_joint_values(preset, "pre_pick_transit_joint_values")
 
 
 def compute_taught_block_pregrasp_pose(anchor_pose, pickup_model, offset,
@@ -1187,7 +1200,6 @@ def require_chassis_sequence_config(config):
         "progress_reset_px",
         "control_hz",
         "command_max_age_seconds",
-        "startup_home_wait_seconds",
     )
     for field in positive_fields:
         if finite_scalar(settings.get(field), "chassis_sequence.%s" % field) <= 0.0:
@@ -1199,7 +1211,6 @@ def require_chassis_sequence_config(config):
     nonnegative_fields = (
         "align_tolerance_px",
         "chassis_settle_seconds",
-        "startup_home_settle_seconds",
     )
     for field in nonnegative_fields:
         if finite_scalar(settings.get(field), "chassis_sequence.%s" % field) < 0.0:
@@ -1208,7 +1219,7 @@ def require_chassis_sequence_config(config):
     if str(settings.get("target_right_motion")) not in ("forward", "backward"):
         raise RuntimeError(
             "chassis_sequence.target_right_motion must be forward or backward.")
-    for field in ("cmd_vel_topic", "startup_home_service"):
+    for field in ("cmd_vel_topic",):
         if not isinstance(settings.get(field), STRING_TYPES) or not settings[field].strip():
             raise RuntimeError("chassis_sequence.%s must not be empty." % field)
     return settings
@@ -1522,23 +1533,6 @@ def align_sequence_target(args, config, detector, target, publisher, settings,
             target_number(config, target), target, detail))
 
 
-def run_sequence_startup_home(config, target, settings, skip):
-    if skip:
-        return
-    service_name = settings["startup_home_service"]
-    rospy.loginfo(
-        "Preparing target %d=%s; calling startup home service %s before localization.",
-        target_number(config, target), ascii_log_text(target), service_name)
-    rospy.wait_for_service(
-        service_name, timeout=float(settings["startup_home_wait_seconds"]))
-    response = rospy.ServiceProxy(service_name, Trigger)()
-    if not response.success:
-        raise RuntimeError(
-            "Startup home failed before target %s: %s" % (
-                target, safe_log_text(response.message)))
-    rospy.sleep(float(settings["startup_home_settle_seconds"]))
-
-
 def run_block_chassis_sequence(args, config, detector):
     if (getattr(args, "fail_on_skip", False)
             and getattr(args, "allow_partial", False)):
@@ -1546,10 +1540,12 @@ def run_block_chassis_sequence(args, config, detector):
             "--fail-on-skip and --allow-partial are mutually exclusive.")
     settings = require_chassis_sequence_config(config)
     targets = parse_target_sequence(args.sequence, config)
+    pre_pick_transit = None
     if not args.align_only:
         validate_chassis_sequence_preset(
             args.preset_file, targets, config,
             getattr(args, "motion_preset_file", None))
+        pre_pick_transit = load_pre_pick_transit_joint_values(config)
     if args.search_before_chassis:
         wait_for_search_trigger(args, config, detector, targets)
     raw_publisher = rospy.Publisher(
@@ -1593,13 +1589,12 @@ def run_block_chassis_sequence(args, config, detector):
                     visible_targets=remaining_targets)
                 stop_chassis(publisher)
                 if not args.align_only:
-                    run_sequence_startup_home(
-                        config, target, settings, args.skip_startup_home)
                     args.block_target = target
                     localization = compute_block_localization(
                         args, config, detector)
                     do_run_taught_block_mono(
-                        args, config, localization, "run_taught_block")
+                        args, config, localization, "run_taught_block",
+                        pre_pick_transit)
             except ContactProbeMiss as exc:
                 rospy.logwarn(
                     "Target %d=%s did not trigger the contact switch; "
@@ -2299,7 +2294,8 @@ def do_teach_block_joints(args, config, action):
     rospy.loginfo("Saved %s=%s", field, preset[field])
 
 
-def do_run_taught_block_mono(args, config, localization, action):
+def do_run_taught_block_mono(args, config, localization, action,
+                             pre_pick_transit_joint_values=None):
     target = require_taught_target(args, action)
     preset = load_block_preset(args.preset_file)
     _entry, pickup_model, pregrasp_offset = require_block_grasp_entry(
@@ -2338,7 +2334,12 @@ def do_run_taught_block_mono(args, config, localization, action):
     rospy.loginfo(pose_to_text("taught_block_retreat", retreat_pose))
 
     if action == "stop_at_taught_pre_grasp":
+        if pre_pick_transit_joint_values is None:
+            pre_pick_transit_joint_values = \
+                load_pre_pick_transit_joint_values(config)
         arm = build_move_group(config, args.group)
+        execute_joint_values(
+            arm, pre_pick_transit_joint_values, "block_pre_pick_transit")
         execute_pose(arm, approach_staging_pose, "block_approach_staging")
         execute_cartesian_pose(
             arm, taught_pre_grasp_pose, "taught_block_pre_grasp")
@@ -2373,6 +2374,8 @@ def do_run_taught_block_mono(args, config, localization, action):
         rospy.logwarn("Preview only: no arm motion or pump command executed.")
         return
 
+    if pre_pick_transit_joint_values is None:
+        pre_pick_transit_joint_values = load_pre_pick_transit_joint_values(config)
     carry_joint_values = require_joint_values(
         motion_preset, "carry_joint_values")
     idle_joint_values = None
@@ -2385,10 +2388,8 @@ def do_run_taught_block_mono(args, config, localization, action):
     holding_object = False
     try:
         set_pump(pump_proxy, False)
-        # 每个目标前都刚执行过启动回零。服务返回并不等于最后一帧
-        # joint_states 已经稳定，先确认稳定再发送第一条 MoveIt 轨迹，
-        # 避免控制器以过期起点拒绝 block_approach_staging。
-        wait_for_joint_state_stable(arm)
+        execute_joint_values(
+            arm, pre_pick_transit_joint_values, "block_pre_pick_transit")
         execute_pose(arm, approach_staging_pose, "block_approach_staging")
         if not run_contact_approach(
                 arm, taught_pre_grasp_pose, pickup_model,

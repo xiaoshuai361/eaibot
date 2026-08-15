@@ -27,11 +27,16 @@ def test_default_model_and_config_paths_match_robot_layout():
 
 def test_default_no_tag_probe_distances_match_tag_flow():
     assert main.DEFAULT_CONFIG["teach_assist_distance_mm"] == pytest.approx(85.0)
-    assert main.DEFAULT_CONFIG["approach_gap_mm"] == pytest.approx(30.0)
+    assert main.DEFAULT_CONFIG["approach_gap_mm"] == pytest.approx(40.0)
     assert main.DEFAULT_CONFIG["contact_probe"]["max_travel_mm"] == pytest.approx(65.0)
     assert main.DEFAULT_CONFIG["contact_probe"]["staging_step_mm"] == pytest.approx(5.0)
     assert main.DEFAULT_CONFIG["contact_probe"]["step_mm"] == pytest.approx(2.0)
-    assert main.DEFAULT_CONFIG["contact_probe"]["retreat_extra_mm"] == pytest.approx(30.0)
+    assert main.DEFAULT_CONFIG["contact_probe"]["retreat_extra_mm"] == pytest.approx(40.0)
+    assert main.DEFAULT_CONFIG["grasp_roi_ratio"] == pytest.approx(
+        [0.06, 0.0, 0.28, 1.0])
+    assert main.DEFAULT_CONFIG["pre_pick_transit_preset_file"].endswith(
+        "/tag_pick_place_presets.json")
+    assert "startup_home_service" not in main.DEFAULT_CONFIG["chassis_sequence"]
     assert "place_preset_file" not in main.DEFAULT_CONFIG
 
 
