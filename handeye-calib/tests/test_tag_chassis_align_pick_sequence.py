@@ -353,7 +353,7 @@ def test_parse_args_defaults_match_competition_short_command():
     assert args.max_detection_age_seconds == pytest.approx(4.0)
     assert args.chassis_settle_seconds == pytest.approx(0.8)
     assert args.tag_tf_wait_seconds == pytest.approx(10.0)
-    assert args.pick_approach_gap == pytest.approx(0.040)
+    assert args.pick_approach_gap == pytest.approx(0.030)
     assert args.pick_velocity_scale == pytest.approx(0.2)
     assert args.pick_acceleration_scale == pytest.approx(0.2)
     assert args.show_debug_window is False

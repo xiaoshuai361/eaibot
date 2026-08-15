@@ -26,7 +26,7 @@ DEFAULT_TARGET_ROI_RATIO = '0.06,0.00,0.28,1.00'
 DEFAULT_DEBUG_WINDOW_NAME = 'tag_pick_detection'
 CONTACT_PROBE_MISS_EXIT_CODE = 4
 DEFAULT_MAX_DETECTION_AGE_SECONDS = 4.0
-DEFAULT_PICK_APPROACH_GAP = 0.040
+DEFAULT_PICK_APPROACH_GAP = 0.030
 
 try:
     STRING_TYPES = (basestring,)
@@ -401,7 +401,7 @@ def parse_args(argv):
     parser.add_argument('--pick-motion-settle-seconds', type=float, default=0.25)
     parser.add_argument('--pick-approach-gap', type=float,
                         default=DEFAULT_PICK_APPROACH_GAP,
-                        help='示教预抓点后方的安全过渡距离（米），默认 0.040。')
+                        help='示教预抓点后方的安全过渡距离（米），默认 0.030。')
     parser.add_argument('--disable-replanning', action='store_true')
     args = parser.parse_args(rospy.myargv(argv)[1:])
     args.sequence = parse_sequence(args.sequence)

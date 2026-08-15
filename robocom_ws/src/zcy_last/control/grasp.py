@@ -73,7 +73,7 @@ class GraspCoordinator(object):
             "--preset-file", TAG_PRESET_FILE,
             "--pick-velocity-scale", "0.2",
             "--pick-acceleration-scale", "0.2",
-            "--pick-approach-gap", "0.040",
+            "--pick-approach-gap", "0.030",
             "--tag-tf-wait-seconds", str(float(TAG_PICK_TF_WAIT_SECONDS)),
         ]
         if PICK_DEBUG_VIEW:

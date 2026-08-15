@@ -147,7 +147,7 @@ def test_tag_pick_command_uses_partial_mode_and_releases_camera():
     assert "--allow-partial" in supervisor.command
     assert "--fail-on-skip" not in supervisor.command
     assert supervisor.command[
-        supervisor.command.index("--pick-approach-gap") + 1] == "0.040"
+        supervisor.command.index("--pick-approach-gap") + 1] == "0.030"
     assert "--show-debug-window" in supervisor.command
     assert supervisor.calls[-2:] == ["stop_tag_stack", "stop_astra"]
     assert "stop_arm_common" not in supervisor.calls
