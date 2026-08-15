@@ -304,6 +304,10 @@ class YoloTaskLedger(object):
         self.building_seen_classes = set()
         self.people_stable_key = None
         self.people_stable_hits = 0
+        self.trash_stable_key = None
+        self.trash_stable_hits = 0
+        self.building_stable_key = None
+        self.building_stable_hits = 0
         self.pending_event = None
         self.save_index = 0
 
@@ -323,6 +327,14 @@ class YoloTaskLedger(object):
     def _reset_people_stability(self):
         self.people_stable_key = None
         self.people_stable_hits = 0
+
+    def _reset_trash_stability(self):
+        self.trash_stable_key = None
+        self.trash_stable_hits = 0
+
+    def _reset_building_stability(self):
+        self.building_stable_key = None
+        self.building_stable_hits = 0
 
     def _stable_people_candidate(self, area, candidates, stable_frames):
         grouped = dict((name, []) for name in YOLO_PEOPLE_CLASS_NAMES)
@@ -348,11 +360,25 @@ class YoloTaskLedger(object):
             return None
         return max(grouped[class_name], key=lambda item: item.confidence)
 
+    def _stable_trash_candidate(self, area, candidates, stable_frames):
+        selected = max(candidates, key=lambda item: item.confidence)
+        key = (str(area), selected.class_name)
+        if key == self.trash_stable_key:
+            self.trash_stable_hits += 1
+        else:
+            self.trash_stable_key = key
+            self.trash_stable_hits = 1
+        if self.trash_stable_hits < max(1, int(stable_frames)):
+            return None
+        return selected
+
     def select_event(self, context, detections, confidence,
                      building_confidence=None, people_stable_frames=1,
-                     trash_confidence=None):
+                     trash_confidence=None, trash_stable_frames=1,
+                     building_stable_frames=1):
         kind = context.get("kind")
         if kind == "street":
+            self._reset_building_stability()
             trash_threshold = confidence if trash_confidence is None \
                 else float(trash_confidence)
             candidates = self._target_candidates(
@@ -373,12 +399,14 @@ class YoloTaskLedger(object):
                     street.append(item)
             if not street:
                 self._reset_people_stability()
+                self._reset_trash_stability()
                 return None
             people = [
                 item for item in street
                 if item.class_name in YOLO_PEOPLE_CLASS_NAMES
             ]
             if people:
+                self._reset_trash_stability()
                 selected = self._stable_people_candidate(
                     area, people, people_stable_frames
                 )
@@ -386,13 +414,18 @@ class YoloTaskLedger(object):
                     return None
             else:
                 self._reset_people_stability()
-                selected = max(street, key=lambda item: item.confidence)
+                selected = self._stable_trash_candidate(
+                    area, street, trash_stable_frames
+                )
+                if selected is None:
+                    return None
             _, display_name = YOLO_STREET_MESSAGES[selected.class_name]
             return YoloTaskEvent(
                 "street", area, selected.class_name, display_name, selected
             )
         if kind == "building":
             self._reset_people_stability()
+            self._reset_trash_stability()
             threshold = confidence if building_confidence is None \
                 else building_confidence
             candidates = [
@@ -411,8 +444,18 @@ class YoloTaskLedger(object):
                 and item.class_name not in self.building_seen_classes
             ]
             if not buildings:
+                self._reset_building_stability()
                 return None
             selected = max(buildings, key=lambda item: item.confidence)
+            key = (str(area), selected.class_name)
+            if key == self.building_stable_key:
+                self.building_stable_hits += 1
+            else:
+                self.building_stable_key = key
+                self.building_stable_hits = 1
+            if self.building_stable_hits < max(
+                    1, int(building_stable_frames)):
+                return None
             return YoloTaskEvent(
                 "building", area, selected.class_name,
                 YOLO_BUILDING_MESSAGE_BY_CLASS[selected.class_name],
@@ -428,9 +471,11 @@ class YoloTaskLedger(object):
             self.street_results[event.area] = event
             self.street_seen_classes.add(event.class_name)
             self._reset_people_stability()
+            self._reset_trash_stability()
         elif event.kind == "building":
             self.building_results[event.area] = event
             self.building_seen_classes.add(event.class_name)
+            self._reset_building_stability()
 
 
 class YoloObstacleDetector(object):

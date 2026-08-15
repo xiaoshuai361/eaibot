@@ -70,15 +70,6 @@ def test_normalize_vector_rejects_zero_and_returns_unit_vector():
         normalize_vector((0.0, 0.0, 0.0), "axis")
 
 
-def test_search_roi_accepts_right_entry_area_and_rejects_invalid_order():
-    parse_search_roi_ratio, = load_symbols("parse_search_roi_ratio")
-
-    assert parse_search_roi_ratio("0.60,0.05,0.98,0.95") == pytest.approx(
-        [0.60, 0.05, 0.98, 0.95])
-    with pytest.raises(RuntimeError, match="x1<x2"):
-        parse_search_roi_ratio("0.9,0.1,0.6,0.9")
-
-
 def test_search_ready_signal_is_emitted_by_child_search_loop():
     source = SCRIPT.read_text(encoding="utf-8")
     function_source = source[
@@ -87,6 +78,70 @@ def test_search_ready_signal_is_emitted_by_child_search_loop():
 
     assert 'write_search_signal(args.search_ready_file, "ready")' in \
         function_source
+    assert "os.path.isfile(args.search_enable_file)" in function_source
+    assert "len(visible_targets) >= required_target_count" in function_source
+    assert "full_frame_visible_targets(" in function_source
+    assert 'alignment_roi = config["grasp_roi_ratio"]' in function_source
+    assert "args.max_targets" in function_source
+    assert function_source.index("request_sequence_detections(") < \
+        function_source.index(
+            'write_search_signal(args.search_ready_file, "ready")')
+
+
+def test_search_discovery_counts_distinct_targets_across_full_frame():
+    visible_targets, = load_symbols("full_frame_visible_targets")
+    detections = [
+        {"target": "power", "u": 100.0},
+        {"target": "fire", "u": 300.0},
+        {"target": "gas", "u": 500.0},
+        {"target": "support", "u": 700.0},
+        {"target": "support", "u": 710.0},
+        {"target": "other", "u": 400.0},
+    ]
+
+    assert visible_targets(
+        detections, ["power", "fire", "gas", "support"]
+    ) == {"power", "fire", "gas", "support"}
+
+
+def test_sequence_debug_window_refreshes_even_when_detection_fails():
+    request_sequence, = load_symbols("request_sequence_detections")
+    capture = {"rgb": object()}
+    shown = {}
+    request_sequence.__globals__.update({
+        "capture_rgb_once": lambda _config: capture,
+        "request_detection": lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("No usable YOLO detections")),
+        "show_rgb_debug": lambda image, detections, observations, wait_ms,
+        **kwargs: shown.update({
+            "image": image,
+            "detections": detections,
+            "observations": observations,
+            "wait_ms": wait_ms,
+            "roi": kwargs.get("roi_ratio"),
+        }),
+    })
+    args = SimpleNamespace(show_rgb=True)
+    config = {
+        "confidence_min": 0.5,
+        "box_width_min_px": 10.0,
+        "box_aspect_ratio_min": 0.5,
+        "box_aspect_ratio_max": 2.0,
+        "grasp_roi_ratio": [0.0, 0.0, 0.2, 1.0],
+    }
+
+    with pytest.raises(RuntimeError, match="No usable YOLO detections"):
+        request_sequence(
+            args, config, object(), ["power"],
+            display_roi_ratio=[0.6, 0.0, 1.0, 1.0])
+
+    assert shown == {
+        "image": capture["rgb"],
+        "detections": [],
+        "observations": [],
+        "wait_ms": 1,
+        "roi": [0.6, 0.0, 1.0, 1.0],
+    }
 
 
 def test_search_finishes_chassis_handoff_before_creating_velocity_publisher():
@@ -618,7 +673,10 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     assert "write_chassis_sequence_result(result_file, completed_ids)" in source
     assert "completed_ids.append(target_number(config, target))" in source
     assert "do_run_taught_block_mono(" in source
-    assert "except ContactProbeMiss:" in source
+    assert "except ContactProbeMiss as exc:" in source
+    assert 'parser.add_argument("--allow-partial"' in source
+    assert "visible_targets=remaining_targets" in source
+    assert "A-point pickup partially completed" in source
     assert "compute_drive_command(" in source
     assert 'require_joint_values(motion_preset, "carry_joint_values")' in source
     assert 'require_joint_values(motion_preset, "idle_joint_values")' in source
@@ -642,6 +700,74 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
         "\ndef ", sequence_start + 1)]
     assert "wait_key_between_targets" not in sequence_source
     assert "wait_between_sequence_targets" not in source
+
+
+def test_partial_chassis_sequence_skips_failed_target_and_records_success():
+    run_sequence, = load_symbols("run_block_chassis_sequence")
+    writes = []
+    aligned = []
+
+    class Keeper:
+        def __init__(self, *_args):
+            self.shutdown_called = False
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    def align(_args, _config, _detector, target, _publisher, _settings,
+              visible_targets=None):
+        aligned.append((target, list(visible_targets)))
+        if target == "power":
+            raise RuntimeError("power alignment failed")
+
+    args = SimpleNamespace(
+        fail_on_skip=False,
+        allow_partial=True,
+        align_only=True,
+        search_before_chassis=False,
+        sequence="1,2",
+        max_targets=2,
+        result_file="/tmp/result.json",
+    )
+    class ContactProbeMissForTest(RuntimeError):
+        pass
+
+    run_sequence.__globals__.update({
+        "require_chassis_sequence_config": lambda _config: {
+            "cmd_vel_topic": "/cmd_vel",
+            "control_hz": 5.0,
+            "command_max_age_seconds": 1.0,
+        },
+        "parse_target_sequence": lambda _sequence, _config: ["power", "fire"],
+        "validate_chassis_sequence_preset": lambda *_args: None,
+        "rospy": SimpleNamespace(
+            is_shutdown=lambda: False,
+            Publisher=lambda *_args, **_kwargs: object(),
+            loginfo=lambda *_args: None,
+            logwarn=lambda *_args: None,
+        ),
+        "Twist": object,
+        "ChassisVelocityKeeper": Keeper,
+        "select_next_sequence_target": (
+            lambda _args, _config, _detector, remaining, _settings:
+            remaining[0]),
+        "align_sequence_target": align,
+        "stop_chassis": lambda _publisher: None,
+        "write_chassis_sequence_result": (
+            lambda _path, ids: writes.append(list(ids))),
+        "target_number": lambda _config, target: {
+            "power": 1, "fire": 2}[target],
+        "ascii_log_text": str,
+        "ContactProbeMiss": ContactProbeMissForTest,
+    })
+
+    run_sequence(args, {}, object())
+
+    assert aligned == [
+        ("power", ["power", "fire"]),
+        ("fire", ["fire"]),
+    ]
+    assert writes[-1] == [2]
 
 
 def test_contact_probe_end_moves_toward_the_object():
@@ -778,7 +904,95 @@ def test_no_tag_runtime_uses_tag_style_staging_then_taught_pregrasp():
         'arm, taught_pre_grasp_pose, "taught_block_pre_grasp"', staging)
     contact_probe = function_source.index("if not run_contact_approach(", taught_pregrasp)
 
+    stable_wait = function_source.index("wait_for_joint_state_stable(arm)")
+    runtime_staging = function_source.index(
+        'execute_pose(arm, approach_staging_pose, "block_approach_staging")',
+        stable_wait)
+    assert stable_wait < runtime_staging < contact_probe
     assert staging < taught_pregrasp < contact_probe
+
+
+def test_execute_pose_accepts_controller_failure_if_target_was_reached():
+    execute_pose, = load_symbols("execute_pose")
+    events = []
+
+    class Arm:
+        def set_start_state_to_current_state(self):
+            events.append("start")
+
+        def set_pose_target(self, _pose):
+            events.append("target")
+
+        def go(self, wait=True):
+            events.append("go")
+            return False
+
+        def stop(self):
+            events.append("stop")
+
+        def clear_pose_targets(self):
+            events.append("clear")
+
+    execute_pose.__globals__.update({
+        "MOTION_SETTLE_SECONDS": 0.0,
+        "current_pose_reached_target": (
+            lambda *_args: (True, (0.002, 0.01))),
+        "wait_for_joint_state_stable": lambda _arm: pytest.fail(
+            "must not retry a target already reached"),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *_args: None,
+            logwarn=lambda *_args: None,
+            sleep=lambda _seconds: None,
+        ),
+    })
+
+    execute_pose(Arm(), object(), "block_approach_staging")
+
+    assert events.count("go") == 1
+
+
+def test_execute_pose_waits_for_stable_joints_before_retry():
+    execute_pose, = load_symbols("execute_pose")
+    events = []
+
+    class Arm:
+        def __init__(self):
+            self.go_calls = 0
+
+        def set_start_state_to_current_state(self):
+            events.append("start")
+
+        def set_pose_target(self, _pose):
+            pass
+
+        def go(self, wait=True):
+            self.go_calls += 1
+            events.append("go%d" % self.go_calls)
+            return self.go_calls == 2
+
+        def stop(self):
+            pass
+
+        def clear_pose_targets(self):
+            pass
+
+    execute_pose.__globals__.update({
+        "MOTION_SETTLE_SECONDS": 0.0,
+        "current_pose_reached_target": (
+            lambda *_args: (False, (0.05, 0.5))),
+        "wait_for_joint_state_stable": (
+            lambda _arm: events.append("stable") or True),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *_args: None,
+            logwarn=lambda *_args: None,
+            sleep=lambda _seconds: events.append("sleep"),
+        ),
+    })
+
+    execute_pose(Arm(), object(), "block_approach_staging")
+
+    assert events.index("stable") < events.index("go2")
+    assert events.count("start") == 2
 
 
 def test_no_tag_chassis_sequence_result_file_records_completed_ids(tmp_path):

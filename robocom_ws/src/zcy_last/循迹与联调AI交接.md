@@ -29,15 +29,15 @@ F:\桌面\平安城市\国赛\code\eaibot
 - 第 3 个路口完成后执行 A 点无 Tag 抓取，可独立开关；
 - B 点和 A 点投递分别独立开关；
 - 抓取期间管理 Astra、任务 YOLO 和 `/cmd_vel` 所有权；
-- 投递失败只报警并继续，抓取失败进入 `PICK_FAILED` 停车。
+- A/B 点目标缺失、对准/TF/限位或单次机械臂失败都按目标跳过并继续，最终使用实际库存；只有整批基础设施故障进入 `PICK_FAILED` 停车。
 
 已实现但仍需真机验收的最新改动：
 
 1. B 点有 Tag 检测窗口 `tag_pick_detection`。
 2. B 点抓取完成后不再寻找已越过的入口横条。
 3. B 点抓取完成后先判断绿灯，再按独立时间执行第一次直行和右转。
-4. A 点在第 3 个路口后加载无 Tag 模型，以固定零角速度直行并从 Astra 画面右侧等待物块出现，不恢复巡线修正。
-5. A 点触发后先停车，再把 `/cmd_vel` 交给抓取子进程。
+4. A 点在第 3 个路口后停车加载 Astra、无 Tag 模型、识别窗口和抓取子进程；窗口零检测也持续刷新。全部 ready 后先以普通 `FOLLOW_SPEED`、零角速度直行 2 秒，再降至独立低速边走边搜索，不恢复巡线修正，也不因第 4 个路口横条停车。
+5. A 点右侧稳定检测到要求数量的不同物块后先停车，再把 `/cmd_vel` 交给抓取子进程慢速对准抓取区。
 6. 正式比赛使用两终端：`launch.py` 常驻底盘、MoveIt 和手眼 TF，`main.py` 由用户决定是否启动，并按阶段托管 Astra、Tag 栈和 YOLO。
 7. `launch.py` 不得自动调用 `main.py`；它必须保持前台运行，退出时自动清理自己启动的依赖。
 
@@ -71,7 +71,7 @@ python3 -m zcy_last.main \
   --no-untagged-pick
 ```
 
-任务命令固定对外提供五种组合：只循迹、B 抓取并投递、B 只抓取、A 抓取并投递、A 只抓取。权威命令见 `使用命令.md`，不再额外列出 A+B 同时抓取组合。
+任务命令固定对外提供五种组合：只循迹、仅 B 抓取并投递、仅 A 抓取并投递、A+B 都抓取并投递、A+B 都抓取但都不投递。单个点只抓不投仅作为临时联调写法。权威命令见 `使用命令.md`。
 
 比赛命令速查以机器人文件为准：
 
@@ -271,6 +271,7 @@ B_PICK_PREPARE
 ```python
 TAG_PICK_FIRST_ENTRY_TIME = 5.5
 TAG_PICK_FIRST_TURN_TIME = 4.0
+TAG_PICK_TF_WAIT_SECONDS = 18.0
 ```
 
 仅当以下条件同时成立时使用：
@@ -292,12 +293,12 @@ A 点触发点是第 3 个路口完成后，即第 3 个 `right` 与第 4 个 `l
 ```text
 第 3 个路口完成
 -> 关闭任务 YOLO，释放共享相机
--> A_PICK_PREPARE，底盘停车
--> 启动 Astra、机械臂公共栈、无 Tag 父子进程
--> 子进程加载模型并进入搜索循环，写 ready 文件
--> A_PICK_SEARCH，固定零角速度直行，不使用 camera4 车道中心修正
--> Astra 只检测画面右侧搜索区
--> 目标稳定出现，子进程写 trigger 文件
+-> A_PICK_PREPARE，停车启动 Astra、机械臂公共栈和无 Tag 父子进程
+-> 子进程加载模型、先刷新识别窗口并写 ready 文件
+-> A_PICK_SEARCH，先按 FOLLOW_SPEED 固定直行 2 秒；期间窗口继续刷新但不触发抓取
+-> 主状态机写 enable 文件，降为 UNTAGGED_SEARCH_SPEED 低速搜索
+-> Astra 在全画面确认要求数量的不同目标
+-> 要求数量的不同目标稳定出现，子进程写 trigger 文件
 -> 主状态机先强制停车
 -> velocity_owner 改为 grasp
 -> 主状态机写 release 文件
@@ -312,10 +313,10 @@ A 点触发点是第 3 个路口完成后，即第 3 个 `right` 与第 4 个 `l
 搜索区：
 
 ```python
-UNTAGGED_SEARCH_ROI = (0.60, 0.05, 0.98, 0.95)
 UNTAGGED_SEARCH_STABLE_FRAMES = 3
 UNTAGGED_SEARCH_POLL_HZ = 3.0
-UNTAGGED_SEARCH_FORWARD_SPEED = 0.16
+UNTAGGED_SEARCH_FORWARD_TIME = 3.5
+UNTAGGED_SEARCH_SPEED = 0.03
 UNTAGGED_PICK_NEXT_ENTRY_TIME = 5.5
 UNTAGGED_PICK_NEXT_TURN_TIME = 4.0
 ```
@@ -327,9 +328,9 @@ UNTAGGED_PICK_NEXT_TURN_TIME = 4.0
 grasp_roi_ratio: [0.06, 0, 0.24, 1]
 ```
 
-右侧搜索区与左侧抓取区用途不同，禁止合并成一个 ROI。
+发现阶段使用全画面；抓取阶段再使用独立抓取 ROI，二者不能混用。
 
-如果已经到达第 4 个路口入口但 A 点仍未触发，当前设计进入 `PICK_FAILED`，防止跳过必须抓取的物资。不要擅自改成继续循迹。
+如果经过第 4 个路口横条时 A 点仍未触发，不把横条当作停车条件，继续按固定方向边走边搜索。只有要求数量的不同物块在全画面稳定出现后，才停车并交给抓取子进程慢速逐个对准抓取区。
 
 ## 9. 红绿灯逻辑
 
@@ -373,7 +374,9 @@ TRAFFIC_GREEN_STABLE_FRAMES = 2
 
 投递失败策略已由用户确定：终端报警、记录失败 ID、不自动重试、恢复循迹。不要改成永久停车。
 
-抓取失败策略：进入 `PICK_FAILED` 并停车。不要改成静默跳过。
+B 点容错策略：目标未出现、对准超时、Tag TF 超时、限位未接触或单次机械臂子命令非零退出时，父流程先停车再跳过当前 ID，最终按实际库存继续；终端 `TAG_STATUS` 必须区分 TF 稳定样本不足、TF 过期/链路断开、限位未接触及其他子进程真实错误，不能只打印“单次抓取失败”。A 点同样以 `--max-targets 4 --allow-partial` 尽力抓满4个，单个目标失败跳过并继续；逐个对齐窗口显示所有剩余目标，控制器只控制当前目标。父进程/结果文件/托管依赖整批故障才进入 `PICK_FAILED`。
+
+A 点 `block_approach_staging` 在启动回零后先等待关节状态稳定。控制器若返回失败，先检查实际末端是否已在15mm/0.35rad容差内；已到达则接受，否则等待稳定并从最新状态重试一次。最终失败信息必须包含位置和姿态误差，便于区分“控制器误报已到位”和“机械臂确实未到位”。
 
 ## 11. 调试窗口
 
@@ -541,5 +544,20 @@ $env:PYTHONPATH='F:\桌面\平安城市\国赛\code\eaibot\robocom_ws\src'
 8. A 点右侧触发后先停车再由抓取接管；
 9. A 点抓取完成后 Astra 释放、楼宇 YOLO 恢复，等待绿灯并用独立时序完成第 4 个路口；
 10. 投递成功更新库存，投递失败报警后继续。
+
+A 点后半程真机调试入口：车辆人工放在第 3 个右转完成且出口横条摆正后的正常位置和
+朝向，终端一保持 `python3 -m zcy_last.launch`，终端二运行：
+
+```bash
+python3 -m zcy_last.main \
+  --start-untagged-aligned \
+  --untagged-pick-count 4 \
+  --untagged-delivery
+```
+
+该开关强制 `tag_pick=False`、`untagged_pick=True`，从 `task_index=3`、
+`turn_cmd=left`、`A_PICK_PREPARE` 开始，不初始化前半程街区 YOLO；A 点抓取完成后
+恢复楼宇 YOLO，并沿正常第 4～9 个路口和楼宇投递流程继续。不得与 `--tag-pick` 或
+`--no-untagged-pick` 同时使用。
 
 未完成上述真机验收前，不要宣称整套比赛流程已经完成。

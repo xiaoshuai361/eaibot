@@ -1,5 +1,6 @@
 import ast
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -247,10 +248,48 @@ def test_pick_command_leaves_startup_homing_to_chassis_sequence():
 def test_pick_failure_is_missing_tf_detects_child_tf_error():
     pick_failure_is_missing_tf, = load_symbols("pick_failure_is_missing_tf")
 
-    assert pick_failure_is_missing_tf(
-        "RuntimeError: TF for tag_2 was not found.", 2) is True
+    tf_errors = [
+        "RuntimeError: TF for tag_2 was not found.",
+        ("RuntimeError: tag_2 did not provide enough stable, fresh, "
+         "unique TF samples"),
+        "RuntimeError: tag_2 did not provide 3 stable inlier TF samples",
+        "RuntimeError: TF for tag_2 was visible but too old",
+        "RuntimeError: Detected tag_2 under camera but TF is not connected",
+    ]
+    assert all(pick_failure_is_missing_tf(output, 2)
+               for output in tf_errors)
     assert pick_failure_is_missing_tf(
         "RuntimeError: MoveIt failed during taught_grasp.", 2) is False
+
+
+def test_pick_tf_failure_reason_distinguishes_sample_age_and_chain():
+    reason, = load_symbols("pick_tf_failure_reason")
+
+    assert reason(
+        "tag_2 did not provide 3 stable inlier TF samples", 2
+    ) == "TF稳定样本不足"
+    assert reason(
+        "TF for tag_2 was visible but too old", 2
+    ) == "TF已过期，没有足够新鲜样本"
+    assert reason(
+        "Detected tag_2 under camera but TF is not connected", 2
+    ) == "检测到Tag，但TF坐标链未连通"
+    assert reason(
+        "TF for tag_2 was not found", 2
+    ) == "未找到tag_2 TF"
+
+
+def test_compact_pick_child_error_reports_exit_code_and_real_last_error():
+    compact, = load_symbols("compact_pick_child_error")
+    output = """Traceback (most recent call last):
+  File \"pick.py\", line 10, in run
+RuntimeError: MoveIt 执行 taught_grasp 失败。
+"""
+
+    message = compact(output, 1)
+
+    assert "退出码1" in message
+    assert "MoveIt 执行 taught_grasp 失败" in message
 
 
 def test_pick_failure_is_contact_miss_requires_marker_and_exit_code():
@@ -335,6 +374,26 @@ def test_tag_debug_callback_contains_real_display_call():
 
     assert "cv2.imshow(self.args.debug_window_name, image)" in callback_source
     assert "cv2.waitKey(1)" in callback_source
+
+
+def test_run_pick_closes_debug_window_before_blocking_child_process():
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    node = ChassisAlignPickSequence.__new__(ChassisAlignPickSequence)
+    node.args = SimpleNamespace(align_only=False, dry_run=False)
+    node.pick_in_progress = False
+    events = []
+    node.close_debug_window = lambda: events.append(
+        ("close", node.pick_in_progress))
+    ChassisAlignPickSequence.run_pick.__globals__.update({
+        "build_pick_command": lambda _args, tag_id: ["pick", str(tag_id)],
+        "run_pick_command": lambda _command, _tag_id: events.append(
+            ("child", node.pick_in_progress)) or True,
+    })
+
+    assert node.run_pick(2) is True
+
+    assert events == [("close", True), ("child", True)]
+    assert node.pick_in_progress is False
 
 
 def test_tf_gate_ignores_cached_stamp_and_accepts_next_new_tf():
@@ -844,3 +903,109 @@ def test_strict_run_fails_on_alignment_skip():
 
     with pytest.raises(RuntimeError, match="alignment failed"):
         FakeSequence().run()
+
+
+def test_partial_run_skips_missing_tf_and_returns_actual_inventory(tmp_path):
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    result_file = tmp_path / "partial-result.json"
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2], max_targets=2, fail_on_skip=False,
+                allow_partial=True, align_only=False, dry_run=False,
+                wait_key_between_tags=False, skip_startup_home=True,
+                result_file=str(result_file),
+            )
+
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
+
+        def align_tag(self, _tag_id):
+            pass
+
+        def wait_for_tag_tf_before_pick(self, tag_id):
+            return tag_id == 2
+
+        def run_pick(self, _tag_id):
+            return True
+
+        def stop_chassis(self):
+            pass
+
+    FakeSequence().run()
+
+    assert json.loads(result_file.read_text(encoding="utf-8")) == {
+        "completed_ids": [2]
+    }
+
+
+def test_partial_run_finishes_when_no_remaining_tag_is_visible(tmp_path):
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    result_file = tmp_path / "empty-result.json"
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2], max_targets=2, fail_on_skip=False,
+                allow_partial=True, align_only=False, dry_run=False,
+                result_file=str(result_file),
+            )
+
+        def select_next_tag(self, _remaining_tags):
+            raise RuntimeError("没有看到任何剩余目标 tag")
+
+        def stop_chassis(self):
+            pass
+
+    FakeSequence().run()
+
+    assert json.loads(result_file.read_text(encoding="utf-8")) == {
+        "completed_ids": []
+    }
+
+
+def test_partial_run_skips_child_exit_one_after_alignment(tmp_path):
+    ChassisAlignPickSequence, = load_symbols("ChassisAlignPickSequence")
+    result_file = tmp_path / "child-failure-result.json"
+    calls = []
+
+    class FakeSequence(ChassisAlignPickSequence):
+        def __init__(self):
+            self.args = SimpleNamespace(
+                sequence=[1, 2], max_targets=2, fail_on_skip=False,
+                allow_partial=True, align_only=False, dry_run=False,
+                result_file=str(result_file),
+            )
+
+        def select_next_tag(self, remaining_tags):
+            return remaining_tags[0]
+
+        def align_tag(self, tag_id):
+            calls.append(("align", tag_id))
+
+        def run_startup_home(self, tag_id):
+            calls.append(("home", tag_id))
+
+        def wait_for_tag_tf_before_pick(self, tag_id):
+            calls.append(("tf", tag_id))
+            return True
+
+        def run_pick(self, tag_id):
+            calls.append(("pick", tag_id))
+            if tag_id == 1:
+                raise subprocess.CalledProcessError(1, ["pick", "1"])
+            return True
+
+        def stop_chassis(self):
+            calls.append(("stop",))
+
+    FakeSequence().run()
+
+    assert calls[:4] == [
+        ("align", 1), ("home", 1), ("tf", 1), ("pick", 1)
+    ]
+    assert ("align", 2) in calls
+    assert json.loads(result_file.read_text(encoding="utf-8")) == {
+        "completed_ids": [2]
+    }

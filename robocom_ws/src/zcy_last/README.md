@@ -70,29 +70,44 @@ python3 -m zcy_last.main \
   --tag-pick --tag-pick-count 4 --tag-delivery \
   --no-untagged-pick
 
-# 3. B 点只抓取 4 个，不投递
+# 3. A 点抓取 4 个并投递
+python3 -m zcy_last.main \
+  --no-tag-pick \
+  --untagged-pick --untagged-pick-count 4 --untagged-delivery
+
+# 4. A/B 都抓取 4 个并投递
+python3 -m zcy_last.main \
+  --tag-pick --tag-pick-count 4 --tag-delivery \
+  --untagged-pick --untagged-pick-count 4 --untagged-delivery
+
+# 5. A/B 都抓取 4 个，都不投递
 python3 -m zcy_last.main \
   --tag-pick --tag-pick-count 4 --no-tag-delivery \
-  --no-untagged-pick
-
-# 4. A 点抓取 3 个并投递
-python3 -m zcy_last.main \
-  --no-tag-pick \
-  --untagged-pick --untagged-pick-count 3 --untagged-delivery
-
-# 5. A 点只抓取 3 个，不投递
-python3 -m zcy_last.main \
-  --no-tag-pick \
-  --untagged-pick --untagged-pick-count 3 --no-untagged-delivery
+  --untagged-pick --untagged-pick-count 4 --no-untagged-delivery
 ```
 
-命令行开关优先于 `config.py` 顶部默认值。抓取数量范围为 `1..4`，表示必须成功完成的数量；目标按当前画面从左到右选择，目标不足或任一目标失败都会进入 `PICK_FAILED` 永久停车。
+命令行开关优先于 `config.py` 顶部默认值。抓取数量范围为 `1..4`。B 点按当前画面从左到右尝试最多该数量；目标未出现、对准超时、Tag TF 超时或限位未接触时跳过该 ID，并按实际成功库存继续比赛，允许最终库存为空。A 点仍要求完成指定数量。
 
-B 点有 Tag 和 A 点无 Tag 各有独立抓取、投递开关。临时只抓取不投递分别加 `--no-tag-delivery` 或 `--no-untagged-delivery`；投递只有在对应抓取开启且库存中存在目标 ID 时才执行。
+B 点有 Tag 和 A 点无 Tag 各有独立抓取、投递开关。临时联调单个点只抓取不投递时，分别使用 `--no-tag-delivery` 或 `--no-untagged-delivery`；这类调试写法不计入正式五种比赛组合。投递只有在对应抓取开启且库存中存在目标 ID 时才执行。
 
 B 点投递映射：普通人群 `1`、医疗人群 `2`、可回收垃圾 `3`、其他垃圾 `4`。A 点投递映射：电力故障楼宇 `1`、火灾楼宇 `2`、有毒气体楼宇 `3`、坍塌楼宇 `4`。程序只使用抓取脚本返回的实际成功 ID，不使用计划抓取数量代替库存。
 
 `python3 -m zcy_last.main` 是唯一任务入口。全部 ROS 依赖都由人工管理时可再加 `--external-ros`；此模式不托管、不检查也不关闭外部进程，只用于特殊联调。
+
+调试 A 点抓取和后续楼宇投递时，可将车放在第 3 个右转完成、出口横条摆正后的正常
+位置和朝向，再从终端二直接运行：
+
+```bash
+python3 -m zcy_last.main \
+  --start-untagged-aligned \
+  --untagged-pick-count 4 \
+  --untagged-delivery
+```
+
+该开关自动跳过 B 点和前三个路口，从内部 `task_index=3`、
+`A_PICK_PREPARE` 开始；A 点完成后仍按正常流程等待绿灯、执行第 4 个路口左转并继续
+剩余路线。它不能与 `--tag-pick` 或 `--no-untagged-pick` 同时使用。启动后底盘会
+真实运动，因此只用于已正确摆车的现场调试。
 
 ## 状态机
 
@@ -110,9 +125,9 @@ STARTUP
 
 实际开启 B 点抓取时，`B_PICKING` 成功后不进入普通 `PICK_RECOVER`：车辆已经越过首个入口横条，会直接进入 `TRAFFIC_WAIT`，确认绿灯后按 `TAG_PICK_FIRST_ENTRY_TIME` 直行、按 `TAG_PICK_FIRST_TURN_TIME` 执行第一次右转，再沿用 `MANEUVER -> EXIT_ALIGN` 识别出口并完成第 1 个路口计数。
 
-抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。A 点先在 `A_PICK_PREPARE` 停车加载 Astra、模型和抓取子进程；子进程进入检测循环后切换到 `A_PICK_SEARCH`，车辆以 `UNTAGGED_SEARCH_FORWARD_SPEED` 保持零角速度直行，不使用车道中心修正。无 Tag 目标在 Astra 画面右侧搜索区连续确认后，车辆先停车，再将底盘控制权交给抓取子进程低速对准左侧抓取 ROI。抓取成功后不进入 `PICK_RECOVER/FOLLOW`，而是等待绿灯，再按 `UNTAGGED_PICK_NEXT_ENTRY_TIME` 直行、按 `UNTAGGED_PICK_NEXT_TURN_TIME` 完成第 4 个路口左转，识别出口横条后恢复普通流程。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存。街区仍按固定点直接投递；楼宇框中心进入原始320×240画面的红框 `x=54~173` 就按原 `YOLO_STOP` 停车，不旋转，也不根据距离二次移动底盘。标定和正式运行显示并使用同一红框；只用停车框的左右宽度模型估算真实毫米距离，上下裁切不影响，机械臂据此沿前探轴修正以 `450mm` 为参考示教的 P，再执行原有限位接触投递。
+抓取关闭时会跳过对应状态。B 点只在循迹开始前执行一次；A 点只在路线第 3 个路口 `right` 完成后执行一次。开启 A 点抓取时，第 3 个右拐独立使用 `A_PICK_THIRD_RIGHT_ENTRY_TIME` 前进和 `A_PICK_THIRD_RIGHT_TURN_TIME` 右转，其他普通路口仍使用 `TURN_ENTRY_TIME/TURN_TIME`。A 点进入 `A_PICK_PREPARE` 后停车加载 Astra、模型、识别窗口和抓取子进程；窗口即使零检测也持续显示原始 RGB。全部就绪后切换到独立的 20Hz `A_PICK_SEARCH` 控制循环，从第一次实际发送普通 `FOLLOW_SPEED`、零角速度命令开始计满 `UNTAGGED_SEARCH_FORWARD_TIME`，再降至 `UNTAGGED_SEARCH_SPEED` 边走边搜索，不使用车道中心修正，也不因第 4 个路口横条停车。要求数量的不同无 Tag 目标在 Astra 全画面连续确认后，车辆先停车，再将底盘控制权交给抓取子进程低速逐个对准抓取 ROI。抓取成功后不进入 `PICK_RECOVER/FOLLOW`，而是等待绿灯，再按 `UNTAGGED_PICK_NEXT_ENTRY_TIME` 直行、按 `UNTAGGED_PICK_NEXT_TURN_TIME` 完成第 4 个路口左转，识别出口横条后恢复普通流程。第一圈街区识别消费 B 点库存，后两圈楼宇识别消费 A 点库存。街区仍按固定点直接投递；楼宇框中心进入原始320×240画面的红框 `x=54~173` 就按原 `YOLO_STOP` 停车，不旋转，也不根据距离二次移动底盘。标定和正式运行显示并使用同一红框；只用停车框的左右宽度模型估算真实毫米距离，上下裁切不影响，机械臂据此沿前探轴修正以 `450mm` 为参考示教的 P，再执行原有限位接触投递。
 
-抓取、依赖进程或车道恢复失败会进入 `PICK_FAILED`。投递失败例外：终端输出警告、该 ID 不再自动重试，并继续循迹。
+A/B 单目标失败（未出现、对准超时、TF/限位或该次机械臂动作失败）不会进入 `PICK_FAILED`，会停车并跳过当前目标、继续尝试剩余目标，最后按实际库存比赛。只有父进程自身无法继续运行、结果文件损坏或托管依赖退出等整批故障才停车。投递失败只输出警告并继续。A 点逐个慢速对齐时窗口显示所有剩余目标，控制器只对当前目标计算速度，成功后依次减少一个框。
 
 ## 摄像头切换
 
@@ -124,7 +139,7 @@ STARTUP
 
 `launch.py` 的启动顺序为底盘 -> 临时 Astra -> MoveIt/手眼 TF -> 关闭临时 Astra，因为手眼发布器需要 Astra 先提供 `camera_link` 内部 TF。`main.py` 执行 B 点时只重新启动 Astra 并启动 Tag 补白/AprilTag，直接使用终端一的常驻机械臂公共栈。Astra 优先使用项目指定的 RGB 内参文件；文件不存在时自动按驱动默认方式启动，但仍要求实际发布的 `CameraInfo.K` 非空。B 点结束后关闭 Astra，再由任务 YOLO 打开 `/dev/video2`。第 3 个路口后先关闭任务 YOLO，再启动 Astra；搜索循环就绪后由 Astra 检查画面右侧的无 Tag 物块。抓取结束后关闭 Astra 并加载楼宇模型。
 
-人偶多数类别默认需要连续确认 `6` 帧才停车，由 `YOLO_PEOPLE_STABLE_FRAMES` 调整；垃圾桶和楼宇不使用该帧数。
+人偶多数类别默认连续确认 `7` 帧，垃圾桶类别默认连续确认 `2` 帧才停车，分别由 `YOLO_PEOPLE_STABLE_FRAMES` 和 `YOLO_TRASH_STABLE_FRAMES` 调整；楼宇不使用这两个帧数。
 
 进程管理器会检查底盘节点、共享相机占用、Astra 内参、MoveIt 状态、机械臂服务和手眼 TF。日志保存在 `/home/eaibot/logs/zcy_last/<启动时间>/`。`launch` 退出时先停车，再逆序关闭本次启动的全部进程；检测到并复用的人工进程不属于本程序，不会被关闭。
 

@@ -36,16 +36,45 @@ from zcy_last.algorithms.building_delivery import (  # noqa: E402
     build_distance_calibration_entry,
     empty_building_calibration,
     estimate_building_distance_mm,
+    limited_building_offset_mm,
     load_building_calibration,
     save_building_calibration,
 )
+
+
 from zcy_last.algorithms.vision import (  # noqa: E402
     YoloDetection,
     YoloObstacleDetector,
     YoloTaskLedger,
     draw_yolo_boxes,
 )
-from zcy_last.config import YOLO_BUILDING_CENTER_ROI_X_RATIO  # noqa: E402
+from zcy_last.config import (  # noqa: E402
+    YOLO_BUILDING_CENTER_ROI_X_RATIO,
+    YOLO_BUILDING_STABLE_FRAMES,
+    YOLO_PEOPLE_STABLE_FRAMES,
+    YOLO_TRASH_STABLE_FRAMES,
+)
+
+
+@pytest.mark.parametrize(
+    "distance_mm,expected_raw,expected_limited",
+    [
+        (300.0, -150.0, -5.0),
+        (425.8, -24.2, -5.0),
+        (450.0, 0.0, 0.0),
+        (566.0, 116.0, 60.0),
+        (650.0, 200.0, 60.0),
+    ],
+)
+def test_building_arm_offset_is_saturated_to_safe_range(
+        distance_mm, expected_raw, expected_limited):
+    raw, limited = limited_building_offset_mm(
+        distance_mm, 450.0, -5.0, 60.0)
+
+    assert raw == pytest.approx(expected_raw)
+    assert limited == pytest.approx(expected_limited)
+
+
 def detection(class_name="Fire Building", box=(135, 105, 185, 135),
               confidence=0.9):
     return YoloDetection(
@@ -102,6 +131,61 @@ def test_building_roi_is_drawn_red_and_controls_building_stop_event():
         context, [inside_red], 0.5, building_confidence=0.5) is not None
     assert ledger.select_event(
         context, [outside_red], 0.5, building_confidence=0.5) is None
+
+
+def test_people_requires_seven_consecutive_confirmation_frames():
+    ledger = YoloTaskLedger()
+    context = {"kind": "street", "areas": ("C区", "P区", "A区", "S区")}
+    target = detection(class_name="General population")
+
+    for _ in range(YOLO_PEOPLE_STABLE_FRAMES - 1):
+        assert ledger.select_event(
+            context, [target], 0.5,
+            people_stable_frames=YOLO_PEOPLE_STABLE_FRAMES,
+            trash_confidence=0.5,
+            trash_stable_frames=YOLO_TRASH_STABLE_FRAMES,
+        ) is None
+    assert ledger.select_event(
+        context, [target], 0.5,
+        people_stable_frames=YOLO_PEOPLE_STABLE_FRAMES,
+        trash_confidence=0.5,
+        trash_stable_frames=YOLO_TRASH_STABLE_FRAMES,
+    ) is not None
+
+
+def test_trash_requires_two_consecutive_confirmation_frames():
+    ledger = YoloTaskLedger()
+    context = {"kind": "street", "areas": ("C区", "P区", "A区", "S区")}
+    target = detection(class_name="Recyclable waste")
+
+    assert ledger.select_event(
+        context, [target], 0.5,
+        people_stable_frames=YOLO_PEOPLE_STABLE_FRAMES,
+        trash_confidence=0.5,
+        trash_stable_frames=YOLO_TRASH_STABLE_FRAMES,
+    ) is None
+    assert ledger.select_event(
+        context, [target], 0.5,
+        people_stable_frames=YOLO_PEOPLE_STABLE_FRAMES,
+        trash_confidence=0.5,
+        trash_stable_frames=YOLO_TRASH_STABLE_FRAMES,
+    ) is not None
+
+
+def test_building_requires_two_consecutive_confirmation_frames():
+    ledger = YoloTaskLedger()
+    context = {"kind": "building", "area": "楼宇A"}
+    target = detection(class_name="Fire Building")
+
+    for _ in range(YOLO_BUILDING_STABLE_FRAMES - 1):
+        assert ledger.select_event(
+            context, [target], 0.5, building_confidence=0.5,
+            building_stable_frames=YOLO_BUILDING_STABLE_FRAMES,
+        ) is None
+    assert ledger.select_event(
+        context, [target], 0.5, building_confidence=0.5,
+        building_stable_frames=YOLO_BUILDING_STABLE_FRAMES,
+    ) is not None
 
 
 def test_real_distance_fit_uses_only_box_width():

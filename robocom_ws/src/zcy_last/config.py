@@ -12,12 +12,15 @@ ENABLE_UNTAGGED_DELIVERY = True # A 点抓取开启时，后两圈按楼宇识�
 UNTAGGED_TRIGGER_INTERSECTION = 3
 PICK_CANDIDATE_IDS = (1, 2, 3, 4)
 PICK_DEBUG_VIEW = True        # True 抓取时显示检测框和对准区域。
-UNTAGGED_SEARCH_ROI = (0.60, 0.05, 0.98, 0.95) # A 点物块从画面右侧进入的搜索区。
-UNTAGGED_SEARCH_STABLE_FRAMES = 3 # 右侧连续检测帧数；误触发就加。
+UNTAGGED_SEARCH_STABLE_FRAMES = 3 # 全画面要求数量的目标连续出现这些帧后停车。
 UNTAGGED_SEARCH_POLL_HZ = 3.0 # A 点搜索推理频率；算力不足就降。
-UNTAGGED_SEARCH_FORWARD_SPEED = 0.16 # 第 3 个路口出口摆正后，搜索 A 点物块的固定直行速度。
+UNTAGGED_SEARCH_FORWARD_TIME = 6 # 模型和窗口就绪后，先按普通循迹速度直行的时间。
+UNTAGGED_SEARCH_SPEED = 0.03 # 上述直行结束后，边搜索边前进的低速。
+A_PICK_THIRD_RIGHT_ENTRY_TIME = 5.8 # A 点抓取前第3路口右拐：摆正后先直行时间；停车偏近时可加。
+A_PICK_THIRD_RIGHT_TURN_TIME = 4.0 # A 点抓取前第3路口右拐：固定右转时间；转不够加、转过头减。
 TAG_PICK_FIRST_ENTRY_TIME = 5.5 # B 点抓取后绿灯放行的直行时间；起转太早加。
 TAG_PICK_FIRST_TURN_TIME = 4.0 # B 点抓取后第一次右转时间；转不够加。
+TAG_PICK_TF_WAIT_SECONDS = 18.0 # 底盘对准后等待目标 Tag 发布新 TF 的最长时间。
 UNTAGGED_PICK_NEXT_ENTRY_TIME = 5.5 # A 点抓取后绿灯放行的直行时间；起转太早加。
 UNTAGGED_PICK_NEXT_TURN_TIME = 4.0 # A 点抓取后第 4 个路口左转时间；转不够加。
 
@@ -64,7 +67,7 @@ TASK_TURN_COMMANDS = (
 )
 
 # ===== 路口时序快速调参 =====
-STOP_STABLE_FRAMES = 3    # 入口横条确认帧数；误触发就加。
+STOP_STABLE_FRAMES = 1    # 入口横条确认帧数；当前单帧命中立即进入靠近流程。
 ENTRY_MIN_STRIPES = 1     # 入口最少斑马条数；边线误报就加。
 ALIGN_STABLE_FRAMES = 8   # 摆正稳定帧数；容易误通过就加。
 ALIGN_LOCK_SETTLE_TIME = 0.15 # 横条丢失补转后的稳定时间(s)。
@@ -88,9 +91,9 @@ FINAL_EXIT_TIME = 6.0     # 第九次出口摆正后继续直行时间(s)。
 FOLLOW_SPEED = 0.16       # 普通巡线 linear.x 前进速度(m/s)；整车过弯慢可小幅加。
 APPROACH_SPEED = 0.16     # 靠近横条 linear.x 前进速度(m/s)；冲过横条就降。
 MANEUVER_SPEED = 0.16     # 路口内 linear.x 前进速度(m/s)；路口通过慢可小幅加。
-MANEUVER_CENTER_BIAS_PIXELS = 40.0 # 直行路口避障量；只填正数，数值越大避让越多。
+MANEUVER_CENTER_BIAS_PIXELS = 22.0 # 直行路口避障量；只填正数，数值越大避让越多。
 MAX_ANGULAR = 0.50       # angular.z 偏航角速度上限(rad/s)；只影响转头快慢，不提高前进速度。
-FOLLOW_LEFT_ANGULAR_SCALE = 0.83 # 所有巡线左弯力度；左弯太猛就减小。
+FOLLOW_LEFT_ANGULAR_SCALE = 0.8 # 所有巡线左弯力度；左弯太猛就减小。
 FOLLOW_RIGHT_ANGULAR_SCALE = 1.00 # 巡线右弯力度；右弯正常保持 1.0。
 
 # 左右转固定控制；直行路口和普通巡线不使用这两项。
@@ -168,7 +171,7 @@ BAR_ONLY_MIN_THICKNESS_RATIO = 0.010 # 纯横条最小厚度；细线误报就�
 BAR_ONLY_MAX_THICKNESS_RATIO = 0.075 # 纯横条最大厚度；大块误报就减。
 
 # ===== 横条时间防抖与纯横条通道 =====
-STOP_NEAR_RATIO = 0.75       # 横条接近画面底部比例；停得太早加，太晚减。
+STOP_NEAR_RATIO = 0.74       # 横条接近画面底部比例；停得太早加，太晚减。
 STOP_CENTER_WIDTH_RATIO = 0.08 # 底部停车区占画面中央宽度比例；减小可排除两侧干扰。
 BAR_ONLY_STABLE_FRAMES = 1   # 无竖纹时横条连续确认帧数；误识别就加，出现太慢就减。
 BAR_ONLY_MIN_LENGTH_RATIO = 0.2 # 无竖纹横条最小宽度比例；误识别就加，近景短条漏检就减。
@@ -184,6 +187,11 @@ ALIGN_TOLERANCE_DEG = 2.0    # 横条水平容差；难以完成摆正就加，�
 ALIGN_KP = 0.018             # 摆正转向比例；摆正太慢就加，来回过冲就减。
 ALIGN_MIN_ANGULAR = 0.08     # 摆正最小角速度；小误差转不动就加。
 ALIGN_MAX_ANGULAR = 0.20     # 摆正最大角速度；转得太猛就减，太慢可加。
+# 第3个右转出口直接衔接 A 点抓取，使用更窄容差和更小角速度单独精调。
+A_PICK_EXIT_ALIGN_TOLERANCE_DEG = 1.0
+A_PICK_EXIT_ALIGN_KP = 0.012
+A_PICK_EXIT_ALIGN_MIN_ANGULAR = 0.05
+A_PICK_EXIT_ALIGN_MAX_ANGULAR = 0.12
 ALIGN_LOST_FALLBACK_ENABLED = True # 横条丢失时用最后角度完成补转。
 ALIGN_ENTRY_MAX_ANGLE = 10.0 # 超时进入路口允许的最大横条角度；入场太斜就减。
 ALIGN_ENTRY_MIN_STRIPES = 3  # 超时进入至少需要的竖条数；误进入就加。
@@ -204,6 +212,8 @@ PROCESSED_WINDOW_NAME = "line_cy_task_processed" # 二值处理结果窗口名�
 # ===== YOLO 模型识别 =====
 YOLO_FRAME_INTERVAL = 1      # YOLO 线程每隔多少个任务摄像头新帧做一次模型推理。
 YOLO_PEOPLE_STABLE_FRAMES = 6 # 人群多数类别连续确认帧数；停得早就加，反应慢就减。
+YOLO_TRASH_STABLE_FRAMES = 2 # 垃圾桶类别连续确认帧数；原来单帧触发，误触发就加。
+YOLO_BUILDING_STABLE_FRAMES = 2 # 楼宇类别连续确认帧数；由单帧增加为2帧，避免过早停车。
 YOLO_CONFIDENCE = 0.60       # 人群 YOLO 置信度阈值。
 YOLO_TRASH_CONFIDENCE = 0.65 # 垃圾桶 YOLO 置信度阈值。
 YOLO_BUILDING_CONFIDENCE = 0.65 # 楼宇 YOLO 置信度阈值。
@@ -298,6 +308,8 @@ YOLO_WINDOW_NAME = "line_cy_task_yolo" # 任务识别调试窗口。
 BUILDING_DELIVERY_CALIBRATION_FILE = \
     "/home/eaibot/handeye-calib/config/building_delivery_calibration.json"
 BUILDING_DELIVERY_REFERENCE_DISTANCE_MM = 450.0 # 示教P时镜头平面到楼面的参考距离。
+BUILDING_DELIVERY_OFFSET_MIN_MM = -5.0 # 视觉估距再近也只把P向内修正5mm。
+BUILDING_DELIVERY_OFFSET_MAX_MM = 60.0 # 视觉估距再远也只把P向外修正60mm。
 
 # ===== 红绿灯等待 =====
 TRAFFIC_GREEN_STABLE_FRAMES = 2 # 连续绿灯确认帧数，防止单帧误放行。
@@ -313,6 +325,7 @@ PICK_RECOVER_STABLE_FRAMES = 5
 PICK_RECOVER_TIMEOUT = 8.0
 PROCESS_START_TIMEOUT = 35.0
 PROCESS_STOP_TIMEOUT = 5.0
+DELIVERY_PROGRESS_TIMEOUT = 35.0 # 投递单个动作超过此时间无阶段进展就取消，防止MoveIt永久卡住。
 MANAGE_ROS_PROCESSES = True
 PICK_BASE_FRAME = "base"
 PICK_CAMERA_FRAME = "camera_link"

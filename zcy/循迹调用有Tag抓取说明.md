@@ -49,7 +49,7 @@ python3 -m zcy_last.main \
   --untagged-pick --untagged-pick-count 3 --untagged-delivery
 ```
 
-抓取数量只能是 `1..4`，表示必须成功入仓的数量，不代表固定 ID 顺序。不要同时运行两个 `zcy_last.main`，也不要手动并行启动 Tag 抓取、Astra、Tag 检测栈或键盘控制。
+抓取数量只能是 `1..4`，表示本次最多尝试成功入仓的数量，不代表固定 ID 顺序。单个目标缺失、对准超时、Tag TF 超时或限位未接触会跳过，并按实际库存继续比赛。不要同时运行两个 `zcy_last.main`，也不要手动并行启动 Tag 抓取、Astra、Tag 检测栈或键盘控制。
 
 ## 2. 当前 B 点状态机
 
@@ -87,13 +87,13 @@ python2 /home/eaibot/handeye-calib/src/tag_chassis_align_pick_sequence.py \
   --sequence 1,2,3,4 \
   --order left_to_right \
   --max-targets <要求成功数> \
-  --fail-on-skip \
+  --allow-partial \
   --result-file <临时JSON> \
   --preset-file /home/eaibot/handeye-calib/config/tag_pick_place_presets.json \
   --pick-velocity-scale 0.2 \
   --pick-acceleration-scale 0.2 \
   --pick-approach-gap 0.030 \
-  --tag-tf-wait-seconds 12.0
+  --tag-tf-wait-seconds 18.0
 ```
 
 `PICK_DEBUG_VIEW=True` 时会添加 `--show-debug-window`，正式比赛只显示一个 `tag_pick_detection` 合成窗口：
@@ -150,15 +150,17 @@ AprilTag 自带的 `show_image` 窗口默认关闭，YOLO relay 也不在送给 
 {"completed_ids": [3, 1]}
 ```
 
-只有以下条件同时满足才成功：
+总调度接受部分成功：
 
 - 整批退出码为 `0`；
 - ID 均为 `1..4` 且不重复；
-- 数量严格等于 `--tag-pick-count`。
+- 数量可以是 `0..--tag-pick-count`，只投递实际成功 ID。
 
-结果保存到 `tag_inventory`。不能根据 Tag 检测画面、数字顺序或计划数量猜库存。单 Tag 返回码 `4` 表示限位未接触；`--fail-on-skip` 下未达到整批数量就是抓取失败。
+结果保存到 `tag_inventory`。不能根据 Tag 检测画面、数字顺序或计划数量猜库存。单 Tag 返回码 `4` 表示限位未接触，会跳过当前 ID。
 
-- 抓取失败或 TF 超时：进入 `PICK_FAILED`，持续零速度，永久停车，不重试。
+- 目标未出现、对准超时、TF 超时或限位未接触：跳过当前 ID，不重试，继续其他目标或按实际库存进入比赛。
+- 单次机械臂子命令非零退出：父流程先停车，再跳过当前 ID 并继续剩余目标。
+- B 点父进程自身崩溃、结果文件损坏或托管依赖退出：进入 `PICK_FAILED`。
 - 投递失败：报警、记录 failed ID、继续循迹，不重试该 ID。
 
 ## 6. 有 Tag 投递

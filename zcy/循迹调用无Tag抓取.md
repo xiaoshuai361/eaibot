@@ -14,7 +14,7 @@ conda activate ww
 cd /home/eaibot/robocom_ws/src
 
 python3 -m zcy_last.main \
-  --untagged-pick --untagged-pick-count 3 \
+  --untagged-pick --untagged-pick-count 4 \
   --untagged-delivery
 ```
 
@@ -22,7 +22,7 @@ python3 -m zcy_last.main \
 
 ```bash
 python3 -m zcy_last.main \
-  --untagged-pick --untagged-pick-count 3 \
+  --untagged-pick --untagged-pick-count 4 \
   --no-untagged-delivery
 ```
 
@@ -31,7 +31,7 @@ python3 -m zcy_last.main \
 ```bash
 python3 -m zcy_last.main \
   --tag-pick --tag-pick-count 4 --tag-delivery \
-  --untagged-pick --untagged-pick-count 3 --untagged-delivery
+  --untagged-pick --untagged-pick-count 4 --untagged-delivery
 ```
 
 抓取数量只能是 `1..4`，表示必须成功入仓的数量，不代表固定类别顺序。不要同时运行两个 `zcy_last.main`，也不要手动并行启动无 Tag 抓取或键盘控制。
@@ -44,10 +44,11 @@ python3 -m zcy_last.main \
 完成第3个路口
 -> 关闭任务 YOLO
 -> A_PICK_PREPARE：停车，启动 Astra、机械臂公共栈和无Tag模型
--> 子进程写 search_ready 文件
--> A_PICK_SEARCH：总调度继续拥有 /cmd_vel，以固定零角速度向前直行
--> 无Tag模型只检查画面右侧搜索区
--> 右侧目标连续3帧稳定，子进程写 search_trigger 文件
+-> 子进程先显示识别窗口，再写 search_ready 文件；零检测也持续刷新
+-> A_PICK_SEARCH：总调度以 FOLLOW_SPEED、固定零角速度直行2秒，窗口仅预览
+-> 总调度写 search_enable 文件，降为 UNTAGGED_SEARCH_SPEED 低速搜索
+-> 无Tag模型在全画面确认要求数量的不同目标
+-> 要求数量的不同目标在右侧连续3帧稳定，子进程写 search_trigger 文件
 -> 总调度先发布零速度
 -> 总调度写 search_release 文件
 -> /cmd_vel 所有权切换给抓取子进程
@@ -59,14 +60,15 @@ python3 -m zcy_last.main \
 -> 识别出口横条并摆正后恢复普通流程
 ```
 
-如果到达第 4 个路口入口时仍未触发无 Tag 抓取，任务进入 `PICK_FAILED`，不会带病继续。
+如果到达第 4 个路口入口时仍未检测够目标，不因横条停车或进入 `PICK_FAILED`，继续固定直行搜索。
 
 两个 ROI 不能混用：
 
 ```text
-右侧搜索区：zcy_last/config.py 的 UNTAGGED_SEARCH_ROI=(0.60,0.05,0.98,0.95)
+发现阶段：全画面统计不同目标，没有单独搜索框；窗口红框直接显示慢速抓取对齐 ROI
 左侧抓取区：block_mono_grasp.yaml 的 grasp_roi_ratio=(0.06,0.00,0.24,1.00)
-搜索直行速度：UNTAGGED_SEARCH_FORWARD_SPEED=0.16
+模型就绪后快速直行时间：UNTAGGED_SEARCH_FORWARD_TIME=3.5
+边走边搜索速度：UNTAGGED_SEARCH_SPEED=0.03，angular.z 固定为0
 A 点抓取后直行时间：UNTAGGED_PICK_NEXT_ENTRY_TIME=5.5
 A 点抓取后左转时间：UNTAGGED_PICK_NEXT_TURN_TIME=4.0
 ```
@@ -80,23 +82,23 @@ python3 /home/eaibot/handeye-calib/src/block_pick_main.py \
   --run-chassis-sequence \
   --sequence 1,2,3,4 \
   --max-targets <要求成功数> \
-  --fail-on-skip \
+  --allow-partial \
   --result-file <临时JSON> \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
   --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json \
   --search-before-chassis \
   --search-ready-file <ready文件> \
+  --search-enable-file <enable文件> \
   --search-trigger-file <trigger文件> \
   --search-release-file <release文件> \
-  --search-roi-ratio 0.6,0.05,0.98,0.95 \
   --search-stable-frames 3 \
   --search-poll-hz 3.0
 ```
 
 `PICK_DEBUG_VIEW=True` 时协调器还会添加 `--show-rgb`。
 
-必须保留 `--run-chassis-sequence`。旧版“循迹直接调用单目标抓取”的接法已废弃；当前通过 ready/trigger/release 明确交接 `/cmd_vel`。
+必须保留 `--run-chassis-sequence`。旧版“循迹直接调用单目标抓取”的接法已废弃；当前通过 ready/enable/trigger/release 明确交接 `/cmd_vel`。
 
 该连续入口一键处理 `1,2,3,4`，物块之间不读取终端输入、不等待 Enter。旧命令即使仍带 `--wait-key-between-targets` 也会忽略该兼容参数并自动继续。
 
@@ -144,7 +146,7 @@ python3 /home/eaibot/handeye-calib/src/block_pick_main.py \
 
 结果保存到 `untagged_inventory`。不能根据检测画面、目标顺序或计划数量猜库存。单目标返回码 `4` 表示限位未接触，但总调度层仍把未达到整批数量视为抓取失败。
 
-- 抓取失败：进入 `PICK_FAILED`，持续零速度，永久停车，不重试。
+- 单个物资失败：停车、记录原因并跳过，继续尝试其他物资，最后按实际库存继续比赛；只有整批父进程、结果文件或依赖故障才进入 `PICK_FAILED`。
 - 投递失败：报警、记录 failed ID、继续循迹，不重试该 ID。
 
 ## 6. 无 Tag 投递

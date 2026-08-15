@@ -4,7 +4,6 @@
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import threading
@@ -13,6 +12,7 @@ from ..config import (
     PICK_CANDIDATE_IDS,
     PICK_DEBUG_VIEW,
     TAG_ALIGN_SCRIPT,
+    TAG_PICK_TF_WAIT_SECONDS,
     TAG_DELIVERY_PRESET_FILE,
     TAG_DELIVERY_SCRIPT,
     TAG_PRESET_FILE,
@@ -21,7 +21,6 @@ from ..config import (
     UNTAGGED_PICK_SCRIPT,
     UNTAGGED_PRESET_FILE,
     UNTAGGED_SEARCH_POLL_HZ,
-    UNTAGGED_SEARCH_ROI,
     UNTAGGED_SEARCH_STABLE_FRAMES,
 )
 
@@ -48,6 +47,8 @@ class GraspCoordinator(object):
             result_directory, "untagged_pick_result_%d.json" % os.getpid())
         self.untagged_search_ready_file = os.path.join(
             result_directory, "untagged_search_ready_%d" % os.getpid())
+        self.untagged_search_enable_file = os.path.join(
+            result_directory, "untagged_search_enable_%d" % os.getpid())
         self.untagged_search_trigger_file = os.path.join(
             result_directory, "untagged_search_trigger_%d" % os.getpid())
         self.untagged_search_release_file = os.path.join(
@@ -63,17 +64,17 @@ class GraspCoordinator(object):
         except OSError:
             pass
         command = [
-            "/usr/bin/python2", TAG_ALIGN_SCRIPT,
+            "/usr/bin/python2", "-u", TAG_ALIGN_SCRIPT,
             "--sequence", self._sequence_text(),
             "--order", "left_to_right",
             "--max-targets", str(int(count)),
-            "--fail-on-skip",
+            "--allow-partial",
             "--result-file", self.tag_result_file,
             "--preset-file", TAG_PRESET_FILE,
             "--pick-velocity-scale", "0.2",
             "--pick-acceleration-scale", "0.2",
             "--pick-approach-gap", "0.030",
-            "--tag-tf-wait-seconds", "12.0",
+            "--tag-tf-wait-seconds", str(float(TAG_PICK_TF_WAIT_SECONDS)),
         ]
         if PICK_DEBUG_VIEW:
             command.append("--show-debug-window")
@@ -91,7 +92,7 @@ class GraspCoordinator(object):
         else:
             raise ValueError("未知投递来源：%s" % source)
         command = [
-            "/usr/bin/python2", TAG_DELIVERY_SCRIPT,
+            "/usr/bin/python2", "-u", TAG_DELIVERY_SCRIPT,
             "--mode", "run_delivery",
             "--sequence", sequence,
             "--delivery-file", delivery_file,
@@ -111,7 +112,8 @@ class GraspCoordinator(object):
             ])
         return command
 
-    def _read_pick_result(self, path, expected_count, label):
+    def _read_pick_result(self, path, expected_count, label,
+                          allow_partial=False):
         try:
             with open(path, "r") as handle:
                 payload = json.load(handle)
@@ -121,13 +123,15 @@ class GraspCoordinator(object):
         if not isinstance(completed_ids, list):
             raise RuntimeError("%s抓取结果缺少 completed_ids" % label)
         completed_ids = [int(item_id) for item_id in completed_ids]
-        if (len(completed_ids) != int(expected_count)
-                or len(set(completed_ids)) != len(completed_ids)
+        count_valid = len(completed_ids) <= int(expected_count) \
+            if allow_partial else len(completed_ids) == int(expected_count)
+        if (not count_valid or len(set(completed_ids)) != len(completed_ids)
                 or any(item_id not in PICK_CANDIDATE_IDS
                        for item_id in completed_ids)):
             raise RuntimeError(
-                "%s抓取库存异常：期望 %d 个，实际 %s"
-                % (label, int(expected_count), completed_ids))
+                "%s抓取库存异常：%s %d 个，实际 %s"
+                % (label, "最多" if allow_partial else "期望",
+                   int(expected_count), completed_ids))
         return completed_ids
 
     @staticmethod
@@ -139,38 +143,76 @@ class GraspCoordinator(object):
                 pass
 
     def _untagged_command(self, count, search_before_pick=False):
-        self._remove_files((
-            self.untagged_result_file,
-            self.untagged_search_ready_file,
-            self.untagged_search_trigger_file,
-            self.untagged_search_release_file,
-        ))
         command = [
             self.python3, UNTAGGED_PICK_SCRIPT,
             "--run-chassis-sequence",
             "--sequence", self._sequence_text(),
             "--max-targets", str(int(count)),
-            "--fail-on-skip",
+            "--allow-partial",
             "--result-file", self.untagged_result_file,
             "--confidence", "0.5",
             "--config", UNTAGGED_CONFIG_FILE,
             "--preset-file", UNTAGGED_PRESET_FILE,
         ]
-        if PICK_DEBUG_VIEW:
+        # 正式 A 点移动搜索必须始终显示识别窗口；窗口直接显示后续
+        # 慢速对齐的抓取 ROI，发现阶段本身按全画面统计目标种类。
+        if PICK_DEBUG_VIEW or search_before_pick:
             command.append("--show-rgb")
         if search_before_pick:
             command.extend([
                 "--search-before-chassis",
                 "--search-ready-file", self.untagged_search_ready_file,
+                "--search-enable-file", self.untagged_search_enable_file,
                 "--search-trigger-file", self.untagged_search_trigger_file,
                 "--search-release-file", self.untagged_search_release_file,
-                "--search-roi-ratio", ",".join(
-                    str(float(value)) for value in UNTAGGED_SEARCH_ROI),
                 "--search-stable-frames",
                 str(int(UNTAGGED_SEARCH_STABLE_FRAMES)),
                 "--search-poll-hz", str(float(UNTAGGED_SEARCH_POLL_HZ)),
             ])
         return command
+
+    def _job_failure(self, job_name, code, command):
+        log_dir = getattr(self.supervisor, "log_dir", None)
+        log_path = os.path.join(log_dir, "%s.log" % job_name) \
+            if log_dir else None
+        detail = None
+        if log_path and os.path.isfile(log_path):
+            try:
+                with open(log_path, "rb") as handle:
+                    lines = handle.read().decode(
+                        "utf-8", "replace").splitlines()
+                # block_pick_main 最后一行通常只是二次包装的
+                # "Arm child exited"，优先找更早的真实 RuntimeError。
+                for line in reversed(lines):
+                    text = line.strip()
+                    if "RuntimeError:" in text:
+                        detail = text.split("RuntimeError:", 1)[1].strip()
+                        break
+                    if "DELIVERY_TIMEOUT " in text:
+                        detail = text.split("DELIVERY_TIMEOUT ", 1)[1].strip()
+                        break
+                if detail is None:
+                    for line in reversed(lines):
+                        text = line.strip()
+                        if (text and "Arm child exited with status" not in text
+                                and not text.startswith("Traceback")):
+                            detail = text
+                            break
+            except (IOError, OSError):
+                pass
+        labels = {
+            "pick_untagged": "无Tag抓取",
+            "delivery": "投递",
+        }
+        label = labels.get(job_name, job_name)
+        message = "%s子进程退出码%d" % (label, int(code))
+        if detail:
+            message += "：%s" % detail
+        if log_path:
+            message += "；日志 %s" % log_path
+        if not detail and not log_path:
+            message += "；命令 %s" % " ".join(command)
+        return RuntimeError(message)
 
     def _run(self, kind, payload):
         success = False
@@ -194,13 +236,15 @@ class GraspCoordinator(object):
                 "pick_%s" % ("untagged" if kind == "untagged_search" else kind)
             code = self.supervisor.run_job(job_name, command)
             if code != 0:
-                raise subprocess.CalledProcessError(code, command)
+                raise self._job_failure(job_name, code, command)
             if kind == "tag":
                 result_items = self._read_pick_result(
-                    self.tag_result_file, payload, "有 Tag")
+                    self.tag_result_file, payload, "有 Tag",
+                    allow_partial=True)
             elif kind in ("untagged", "untagged_search"):
                 result_items = self._read_pick_result(
-                    self.untagged_result_file, payload, "无 Tag")
+                    self.untagged_result_file, payload, "无 Tag",
+                    allow_partial=True)
             success = True
         except Exception as exc:
             error = exc
@@ -226,6 +270,16 @@ class GraspCoordinator(object):
             if not 1 <= int(count) <= len(PICK_CANDIDATE_IDS):
                 raise ValueError("抓取数量必须在 1 到 4 之间")
             self.kind = str(kind)
+            if self.kind in ("untagged", "untagged_search"):
+                # 必须在后台启动 Astra 之前同步清除旧握手文件，避免主
+                # 状态机把上一次 ready 当成本次就绪并过早写 enable。
+                self._remove_files((
+                    self.untagged_result_file,
+                    self.untagged_search_ready_file,
+                    self.untagged_search_enable_file,
+                    self.untagged_search_trigger_file,
+                    self.untagged_search_release_file,
+                ))
             self.result = None
             self.result_items = []
             self.error = None
@@ -242,6 +296,10 @@ class GraspCoordinator(object):
 
     def untagged_search_triggered(self):
         return os.path.isfile(self.untagged_search_trigger_file)
+
+    def enable_untagged_search(self):
+        with open(self.untagged_search_enable_file, "w") as handle:
+            handle.write("enable\n")
 
     def release_untagged_search(self):
         with open(self.untagged_search_release_file, "w") as handle:

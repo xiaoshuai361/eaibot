@@ -11,6 +11,7 @@ import time
 
 from ..config import (
     ASTRA_CAMERA_INFO_FILE,
+    DELIVERY_PROGRESS_TIMEOUT,
     DEPLOY_HOME,
     PICK_BASE_FRAME,
     PICK_CAMERA_FRAME,
@@ -126,12 +127,23 @@ class ProcessSupervisor(object):
         """Astra 按 USB 设备启动，不依赖不稳定的 /dev/videoN 编号。"""
         if self._process_alive(self.processes.get("astra")):
             return
-        if self._probe(
-                "rosnode list 2>/dev/null | grep -qE '^/camera(/|$)'",
-                timeout=2.0):
+        if self._astra_nodes_running():
             raise RuntimeError(
                 "检测到外部 Astra 相机节点；请先关闭临时启动的 "
                 "astrapro.launch，再运行比赛主程序")
+
+    def _astra_nodes_running(self):
+        return self._probe(
+            "rosnode list 2>/dev/null | grep -qE '^/camera(/|$)'",
+            timeout=2.0)
+
+    def _wait_astra_nodes_stopped(self, timeout=5.0):
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            if not self._astra_nodes_running():
+                return True
+            time.sleep(0.2)
+        return not self._astra_nodes_running()
 
     def wait_until(self, description, probe, timeout=PROCESS_START_TIMEOUT,
                    watched=()):
@@ -307,7 +319,31 @@ class ProcessSupervisor(object):
             raise
 
     def stop_astra(self):
+        owned = "astra" in self.processes
         self.stop("astra")
+        if not owned or self._wait_astra_nodes_stopped():
+            return
+        self._info(
+            "Astra roslaunch 已退出但 /camera 节点仍残留，"
+            "正在清理本次启动的相机节点")
+        # 不要把所有节点一次性交给 rosnode kill。Astra 的某个 nodelet
+        # 无响应时会卡住整条命令，使后续节点完全没有收到关闭请求。
+        # 逐节点加超时关闭，再用 rosnode cleanup 清掉已经死亡但仍被
+        # ROS Master 列出的陈旧注册。cleanup 只删除无法 ping 通的节点，
+        # 不会关闭仍在运行的底盘、MoveIt 或手眼 TF。
+        self._probe(
+            "for node in $(rosnode list 2>/dev/null | "
+            "grep -E '^/camera(/|$)'); do "
+            "timeout 2 rosnode kill \"$node\" >/dev/null 2>&1 & "
+            "done; wait || true; "
+            "printf 'y\\n' | timeout 8 rosnode cleanup >/dev/null 2>&1 "
+            "|| true",
+            timeout=12.0,
+        )
+        if not self._wait_astra_nodes_stopped(timeout=6.0):
+            raise RuntimeError(
+                "本次启动的 Astra 已停止，但 ROS Master 中仍有 /camera "
+                "节点；不要启动 main，请先检查 `rosnode list | grep '^/camera'`")
 
     def start_tag_stack(self):
         if not self.enabled:
@@ -346,11 +382,140 @@ class ProcessSupervisor(object):
         self.stop("apriltag")
         self.stop("tag_relay")
 
+    @staticmethod
+    def _tag_status_from_output(raw_line):
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = str(raw_line)
+        marker = "TAG_STATUS "
+        if marker not in line:
+            return None
+        return line.split(marker, 1)[1].strip()
+
+    def _run_tag_job_with_status(self, name, command, log_handle):
+        process = subprocess.Popen(
+            list(command), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        item = ManagedProcess(name, process, log_handle, command)
+        self.processes[name] = item
+        try:
+            while True:
+                raw_line = process.stdout.readline()
+                if raw_line:
+                    log_handle.write(raw_line)
+                    status = self._tag_status_from_output(raw_line)
+                    if status:
+                        self._info("Tag抓取：%s" % status)
+                    continue
+                if process.poll() is not None:
+                    break
+            return process.wait()
+        finally:
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+            self.processes.pop(name, None)
+            log_handle.close()
+
+    @staticmethod
+    def _delivery_status_from_output(raw_line):
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = str(raw_line)
+        marker = "DELIVERY_STATUS "
+        if marker not in line:
+            return None
+        return line.split(marker, 1)[1].strip()
+
+    def _cancel_arm_trajectory(self):
+        self._probe(
+            "source /opt/ros/melodic/setup.bash && "
+            "timeout 2 rostopic pub -1 /execute_trajectory/cancel "
+            "actionlib_msgs/GoalID '{}' >/dev/null 2>&1 || true; "
+            "timeout 2 rostopic pub -1 "
+            "/mirobot_arm_controller/follow_joint_trajectory/cancel "
+            "actionlib_msgs/GoalID '{}' >/dev/null 2>&1 || true",
+            timeout=5.0,
+        )
+
+    @staticmethod
+    def _terminate_job_process(process):
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3.0)
+        except (OSError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def _run_delivery_job_with_status(self, name, command, log_handle):
+        process = subprocess.Popen(
+            list(command), stdout=log_handle, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        item = ManagedProcess(name, process, log_handle, command)
+        self.processes[name] = item
+        reader = open(log_handle.name, "rb")
+        last_progress = time.time()
+        last_status = "投递子进程已启动"
+        timed_out = False
+        try:
+            while True:
+                while True:
+                    raw_line = reader.readline()
+                    if not raw_line:
+                        break
+                    status = self._delivery_status_from_output(raw_line)
+                    if status:
+                        last_progress = time.time()
+                        last_status = status
+                        self._info("投递：%s" % status)
+                code = process.poll()
+                if code is not None:
+                    return code
+                now = time.time()
+                stalled = now - last_progress
+                if stalled >= float(DELIVERY_PROGRESS_TIMEOUT):
+                    reason = "阶段 %.1f 秒无进展，最后阶段：%s" % (
+                        stalled, last_status)
+                    timed_out = True
+                else:
+                    time.sleep(0.1)
+                    continue
+                message = "DELIVERY_TIMEOUT %s\n" % reason
+                log_handle.write(message.encode("utf-8"))
+                self._info("投递超时：%s；正在取消机械臂轨迹" % reason)
+                self._cancel_arm_trajectory()
+                self._terminate_job_process(process)
+                return 124
+        finally:
+            if timed_out and process.poll() is None:
+                self._terminate_job_process(process)
+            reader.close()
+            self.processes.pop(name, None)
+            log_handle.close()
+
     def run_job(self, name, command):
         if not self.enabled:
             return subprocess.call(command)
         log_path = os.path.join(self.log_dir, "%s.log" % name)
         log_handle = open(log_path, "ab", buffering=0)
+        if name == "pick_tag":
+            return self._run_tag_job_with_status(
+                name, command, log_handle)
+        if name == "delivery":
+            return self._run_delivery_job_with_status(
+                name, command, log_handle)
         process = subprocess.Popen(
             list(command), stdout=log_handle, stderr=subprocess.STDOUT,
             start_new_session=True)

@@ -2,6 +2,7 @@
 # coding=utf-8
 
 import json
+import os
 import sys
 import time
 import types
@@ -36,7 +37,10 @@ def _install_ros_stubs():
 _install_ros_stubs()
 
 from zcy_last.control.grasp import GraspCoordinator  # noqa: E402
-from zcy_last.task.competition import LaneFollower  # noqa: E402
+from zcy_last.task.competition import (  # noqa: E402
+    LaneFollower,
+    initial_competition_position,
+)
 
 
 class FakeSupervisor(object):
@@ -72,6 +76,7 @@ class FakeCoordinator(object):
     def __init__(self):
         self.calls = []
         self.search_ready = False
+        self.search_enabled = False
         self.search_triggered = False
         self.search_released = False
 
@@ -90,6 +95,10 @@ class FakeCoordinator(object):
 
     def untagged_search_triggered(self):
         return self.search_triggered
+
+    def enable_untagged_search(self):
+        self.search_enabled = True
+        self.calls.append(("untagged_search_enable",))
 
     def release_untagged_search(self):
         self.search_released = True
@@ -112,7 +121,16 @@ def _wait_result(coordinator):
     raise AssertionError("coordinator did not finish")
 
 
-def test_tag_pick_command_uses_count_strict_mode_and_releases_camera():
+def test_untagged_aligned_debug_entry_starts_at_fourth_left_turn():
+    assert initial_competition_position(False, True) == (
+        3, "left", "A_PICK_PREPARE")
+    assert initial_competition_position(False, False) == (
+        0, "right", "FOLLOW")
+    assert initial_competition_position(True, False) == (
+        0, "right", "B_PICK_PREPARE")
+
+
+def test_tag_pick_command_uses_partial_mode_and_releases_camera():
     supervisor = FakeSupervisor()
     coordinator = GraspCoordinator(
         supervisor, keep_arm_after_tag=True, python3="/env/python3")
@@ -124,7 +142,10 @@ def test_tag_pick_command_uses_count_strict_mode_and_releases_camera():
     assert error is None
     assert supervisor.command[
         supervisor.command.index("--max-targets") + 1] == "2"
-    assert "--fail-on-skip" in supervisor.command
+    assert supervisor.command[
+        supervisor.command.index("--tag-tf-wait-seconds") + 1] == "18.0"
+    assert "--allow-partial" in supervisor.command
+    assert "--fail-on-skip" not in supervisor.command
     assert supervisor.command[
         supervisor.command.index("--pick-approach-gap") + 1] == "0.030"
     assert "--show-debug-window" in supervisor.command
@@ -141,22 +162,45 @@ def test_untagged_pick_command_enables_detection_window():
     assert "--show-rgb" in command
 
 
-def test_untagged_search_command_uses_right_entry_roi_and_handshake_files():
+def test_untagged_search_command_uses_full_frame_and_handshake_files():
     supervisor = FakeSupervisor()
     coordinator = GraspCoordinator(supervisor, python3="/env/python3")
 
     command = coordinator._untagged_command(2, search_before_pick=True)
 
     assert "--search-before-chassis" in command
-    assert command[command.index("--search-roi-ratio") + 1] == \
-        "0.6,0.05,0.98,0.95"
+    assert "--show-rgb" in command
+    assert "--allow-partial" in command
+    assert "--fail-on-skip" not in command
+    assert "--search-roi-ratio" not in command
     assert command[command.index("--search-stable-frames") + 1] == "3"
     assert command[command.index("--search-ready-file") + 1] == \
         coordinator.untagged_search_ready_file
+    assert command[command.index("--search-enable-file") + 1] == \
+        coordinator.untagged_search_enable_file
     assert command[command.index("--search-trigger-file") + 1] == \
         coordinator.untagged_search_trigger_file
     assert command[command.index("--search-release-file") + 1] == \
         coordinator.untagged_search_release_file
+
+
+def test_untagged_search_clears_stale_handshake_before_background_start():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+    stale_paths = (
+        coordinator.untagged_search_ready_file,
+        coordinator.untagged_search_enable_file,
+        coordinator.untagged_search_trigger_file,
+        coordinator.untagged_search_release_file,
+    )
+    for path in stale_paths:
+        with open(path, "w") as handle:
+            handle.write("stale\n")
+
+    coordinator.start_untagged_search(2)
+
+    assert all(not os.path.exists(path) for path in stale_paths)
+    _wait_result(coordinator)
 
 
 def test_delivery_directly_runs_preset_without_dependency_recheck():
@@ -170,6 +214,8 @@ def test_delivery_directly_runs_preset_without_dependency_recheck():
     assert result is True
     assert error is None
     assert supervisor.calls == ["delivery"]
+    assert supervisor.command[:2] == ["/usr/bin/python2", "-u"]
+    assert supervisor.command[2].endswith("/src/mirobot_delivery.py")
     assert supervisor.command[
         supervisor.command.index("--sequence") + 1] == "2"
 
@@ -189,8 +235,30 @@ def test_tag_pick_can_request_all_four_targets_in_left_to_right_order():
         supervisor.command.index("--max-targets") + 1] == "4"
     assert supervisor.command[
         supervisor.command.index("--order") + 1] == "left_to_right"
-    assert supervisor.command[
-        supervisor.command.index("--pick-approach-gap") + 1] == "0.030"
+
+
+def test_tag_pick_accepts_partial_inventory():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(
+        supervisor, keep_arm_after_tag=True, python3="/env/python3")
+    with open(coordinator.tag_result_file, "w") as handle:
+        json.dump({"completed_ids": [2, 4]}, handle)
+
+    assert coordinator._read_pick_result(
+        coordinator.tag_result_file, 4, "有 Tag", allow_partial=True
+    ) == [2, 4]
+
+
+def test_tag_pick_accepts_empty_inventory_in_partial_mode():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(
+        supervisor, keep_arm_after_tag=True, python3="/env/python3")
+    with open(coordinator.tag_result_file, "w") as handle:
+        json.dump({"completed_ids": []}, handle)
+
+    assert coordinator._read_pick_result(
+        coordinator.tag_result_file, 4, "有 Tag", allow_partial=True
+    ) == []
 
 
 def test_untagged_pick_failure_stops_camera_and_arm_stack():
@@ -221,6 +289,56 @@ def test_untagged_pick_reports_actual_inventory_and_can_keep_arm():
     assert supervisor.calls[0] == "start_astra"
     assert supervisor.calls[-1] == "stop_astra"
     assert "stop_arm_common" not in supervisor.calls
+
+
+def test_untagged_pick_accepts_partial_inventory():
+    supervisor = FakeSupervisor()
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+    with open(coordinator.untagged_result_file, "w") as handle:
+        json.dump({"completed_ids": [1, 3]}, handle)
+
+    assert coordinator._read_pick_result(
+        coordinator.untagged_result_file, 4, "无 Tag", allow_partial=True
+    ) == [1, 3]
+
+
+def test_untagged_child_error_reports_real_runtime_error(tmp_path):
+    supervisor = FakeSupervisor(result=1)
+    supervisor.log_dir = str(tmp_path)
+    log_path = tmp_path / "pick_untagged.log"
+    log_path.write_text(
+        "Traceback (most recent call last):\n"
+        "RuntimeError: Target 2=fire chassis alignment timed out.\n"
+        "Error: Arm child exited with status 1\n",
+        encoding="utf-8",
+    )
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+
+    error = coordinator._job_failure(
+        "pick_untagged", 1, ["python3", "block_pick_main.py"])
+
+    assert "退出码1" in str(error)
+    assert "Target 2=fire chassis alignment timed out" in str(error)
+    assert str(log_path) in str(error)
+
+
+def test_delivery_timeout_reports_last_motion_stage(tmp_path):
+    supervisor = FakeSupervisor(result=124)
+    supervisor.log_dir = str(tmp_path)
+    log_path = tmp_path / "delivery.log"
+    log_path.write_text(
+        "DELIVERY_STATUS ID4 前往固定投递位姿\n"
+        "DELIVERY_TIMEOUT 阶段 35.0 秒无进展，最后阶段："
+        "ID4 前往固定投递位姿\n",
+        encoding="utf-8",
+    )
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+
+    error = coordinator._job_failure(
+        "delivery", 124, ["python2", "mirobot_delivery.py"])
+
+    assert "投递子进程退出码124" in str(error)
+    assert "最后阶段：ID4 前往固定投递位姿" in str(error)
 
 
 def test_delivery_command_uses_only_requested_inventory_id():
@@ -315,6 +433,21 @@ def test_third_intersection_triggers_untagged_pick_before_follow():
     assert follower.states == ["yolo_stopped", "A_PICK_PREPARE"]
 
 
+def test_third_right_exit_uses_finer_a_pick_alignment_only_when_needed():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.task_index = 2
+    follower.turn_cmd = "right"
+    follower.enable_untagged_pick = True
+    follower.untagged_pick_completed = False
+
+    assert follower._exit_alignment_parameters() == (
+        1.0, 0.012, 0.05, 0.12)
+
+    follower.untagged_pick_completed = True
+    assert follower._exit_alignment_parameters() == (
+        2.0, 0.018, 0.08, 0.20)
+
+
 def test_b_pick_is_started_once_before_following():
     follower = LaneFollower.__new__(LaneFollower)
     follower.state = "B_PICK_PREPARE"
@@ -343,6 +476,7 @@ def test_a_pick_prepare_waits_until_search_child_is_actually_ready():
     follower.state_started = 0.0
     follower.untagged_pick_count = 4
     follower.untagged_search_started = False
+    follower.untagged_search_enabled = False
     follower.grasp_coordinator = FakeCoordinator()
     follower.velocity_owner = "line"
     follower.active_pick_kind = None
@@ -360,12 +494,70 @@ def test_a_pick_prepare_waits_until_search_child_is_actually_ready():
     assert follower.state == "A_PICK_SEARCH"
     assert follower.velocity_owner == "line"
     assert follower.stop_hits == 0
+    assert follower.grasp_coordinator.search_enabled is False
+
+
+def test_a_pick_prepare_stays_stopped_until_model_is_ready():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.state = "A_PICK_PREPARE"
+    follower.state_started = 10.0
+    follower.untagged_pick_count = 4
+    follower.untagged_search_started = False
+    follower.untagged_search_enabled = False
+    follower.grasp_coordinator = FakeCoordinator()
+    commands = []
+    follower.publish = lambda *args, **kwargs: commands.append(args) or True
+    follower._set_state = lambda state: setattr(follower, "state", state)
+
+    follower._handle_pick_without_frame(10.0)
+
+    assert commands == [(0, 0)]
+    assert follower.grasp_coordinator.calls == [("untagged_search", 4)]
+    assert follower.state == "A_PICK_PREPARE"
+    follower.grasp_coordinator.search_ready = True
+
+    follower._handle_pick_without_frame(10.1)
+
+    assert commands[-1] == (0, 0)
+    assert follower.grasp_coordinator.calls == [("untagged_search", 4)]
+    assert follower.state == "A_PICK_SEARCH"
+
+
+def test_a_pick_prepare_does_not_poll_stale_result_before_search_starts():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.state = "A_PICK_PREPARE"
+    follower.state_started = 10.0
+    follower.untagged_pick_count = 4
+    follower.untagged_search_started = False
+    follower.untagged_search_enabled = False
+    follower.grasp_coordinator = FakeCoordinator()
+    stale_result = {"present": True}
+
+    def start_search(count):
+        follower.grasp_coordinator.calls.append(("untagged_search", count))
+        stale_result["present"] = False
+
+    def poll_search():
+        if stale_result["present"]:
+            raise AssertionError("搜索启动前不应读取旧任务结果")
+        return None, None
+
+    follower.grasp_coordinator.start_untagged_search = start_search
+    follower.grasp_coordinator.poll = poll_search
+    follower.publish = lambda *args, **kwargs: True
+
+    follower._handle_pick_without_frame(10.0)
+
+    assert follower.state == "A_PICK_PREPARE"
+    assert follower.grasp_coordinator.calls == [("untagged_search", 4)]
 
 
 def test_a_pick_search_stops_before_releasing_chassis_to_grasp():
     follower = LaneFollower.__new__(LaneFollower)
     follower.grasp_coordinator = FakeCoordinator()
     follower.grasp_coordinator.search_triggered = True
+    follower.untagged_search_enabled = True
+    follower.untagged_search_speed = 0.03
     follower.velocity_owner = "line"
     follower.state = "A_PICK_SEARCH"
     order = []
@@ -382,11 +574,15 @@ def test_a_pick_search_stops_before_releasing_chassis_to_grasp():
     assert follower.velocity_owner == "grasp"
 
 
-def test_a_pick_search_drives_straight_before_right_side_trigger():
+def test_a_pick_search_drives_default_speed_for_configured_time(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 10.0)
     follower = LaneFollower.__new__(LaneFollower)
     follower.grasp_coordinator = FakeCoordinator()
     follower.stop_hits = 0
-    follower.untagged_search_forward_speed = 0.13
+    follower.untagged_forward_started_at = 9.0
+    follower.untagged_search_forward_time = 2.0
+    follower.untagged_search_speed = 0.03
+    follower.untagged_search_enabled = False
     commands = []
     follower._control = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("A 点搜索阶段不应使用巡线控制"))
@@ -398,26 +594,85 @@ def test_a_pick_search_drives_straight_before_right_side_trigger():
 
     follower._handle_untagged_search(observation, cross, 640)
 
-    assert commands == [(0.13, 0.0)]
+    assert commands == [(0.16, 0.0)]
+    assert follower.grasp_coordinator.search_enabled is False
     assert follower.grasp_coordinator.search_released is False
 
 
-def test_a_pick_search_fails_if_fourth_entry_arrives_without_target():
+def test_a_pick_search_switches_to_slow_speed_after_forward_time(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 10.0)
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.stop_hits = 0
+    follower.untagged_forward_started_at = 7.0
+    follower.untagged_search_forward_time = 2.0
+    follower.untagged_search_speed = 0.03
+    follower.untagged_search_enabled = False
+    commands = []
+    follower.publish = lambda *args, **kwargs: commands.append(args) or True
+    follower._pick_failed = lambda message: (_ for _ in ()).throw(
+        AssertionError(message))
+    observation = types.SimpleNamespace(valid=True, center_x=333.0)
+    cross = types.SimpleNamespace(candidate=False, stripe_polygons=[])
+
+    follower._handle_untagged_search(observation, cross, 640)
+
+    assert follower.grasp_coordinator.calls == [
+        ("untagged_search_enable",)]
+    assert follower.untagged_search_enabled is True
+    assert commands == [(0.03, 0.0)]
+
+
+def test_a_pick_search_timer_starts_with_first_forward_command(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 10.0)
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.untagged_search_forward_time = 2.0
+    follower.untagged_search_speed = 0.03
+    follower.untagged_search_enabled = False
+    follower.untagged_forward_started_at = None
+    commands = []
+    follower.publish = lambda *args, **kwargs: commands.append(args) or True
+    follower._pick_failed = lambda message: (_ for _ in ()).throw(
+        AssertionError(message))
+
+    follower._handle_untagged_search(None, None, None)
+
+    assert follower.untagged_forward_started_at == 10.0
+    assert commands == [(0.16, 0.0)]
+    assert follower.grasp_coordinator.search_enabled is False
+
+
+def test_a_pick_search_without_lane_frame_uses_dedicated_handler():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.state = "A_PICK_SEARCH"
+    calls = []
+    follower._handle_untagged_search = lambda *args: calls.append(args)
+
+    follower._handle_pick_without_frame(12.0)
+
+    assert calls == [(None, None, None)]
+
+
+def test_a_pick_search_keeps_driving_if_fourth_entry_arrives_without_target():
     follower = LaneFollower.__new__(LaneFollower)
     follower.grasp_coordinator = FakeCoordinator()
     follower.stop_hits = 2
+    follower.untagged_search_enabled = True
+    follower.untagged_search_speed = 0.03
     follower.entry_accept_after = 0.0
     failures = []
     follower._pick_failed = failures.append
     follower._control = lambda *args, **kwargs: None
-    follower.publish = lambda *args, **kwargs: True
+    commands = []
+    follower.publish = lambda *args, **kwargs: commands.append(args) or True
     observation = types.SimpleNamespace(valid=True, center_x=320.0)
     cross = types.SimpleNamespace(candidate=True, stripe_polygons=[object()])
 
     follower._handle_untagged_search(observation, cross, 640)
 
-    assert failures == [
-        "已到达第四个路口入口，但 A 点无 Tag 物块未触发抓取"]
+    assert failures == []
+    assert commands == [(0.03, 0.0)]
 
 
 def test_completed_untagged_pick_is_not_triggered_twice():
@@ -465,6 +720,35 @@ def test_completed_untagged_pick_records_actual_inventory():
     assert follower.states == ["TRAFFIC_WAIT"]
 
 
+def test_partial_untagged_inventory_continues_competition():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.grasp_coordinator.completed_items = lambda: [1]
+    follower.untagged_pick_count = 4
+    follower.untagged_inventory = []
+    follower.untagged_pick_completed = False
+    follower.velocity_owner = "grasp"
+    follower.bridge = types.SimpleNamespace(reset=lambda _width: None)
+    follower.lane_width = 620.0
+    follower.stop_hits = 3
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._resume_yolo = lambda profile: profile == "building"
+    follower._entry_ready_state = lambda: "TRAFFIC_WAIT"
+    follower._set_state = follower.states.append
+    follower.untagged_pick_next_entry_time = 5.4
+    follower.untagged_pick_next_turn_time = 3.2
+    failures = []
+    follower._pick_failed = failures.append
+
+    follower._finish_pick("untagged")
+
+    assert failures == []
+    assert follower.untagged_inventory == [1]
+    assert follower.untagged_pick_completed is True
+    assert follower.states == ["TRAFFIC_WAIT"]
+
+
 def test_completed_tag_pick_waits_for_green_before_first_right_turn():
     follower = LaneFollower.__new__(LaneFollower)
     follower.grasp_coordinator = FakeCoordinator()
@@ -491,6 +775,56 @@ def test_completed_tag_pick_waits_for_green_before_first_right_turn():
     assert follower.tag_pick_first_maneuver is True
     assert follower.velocity_owner == "line"
     assert follower.states == ["TRAFFIC_WAIT"]
+
+
+def test_partial_tag_pick_still_waits_for_green_and_continues():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.grasp_coordinator.completed_items = lambda: [2]
+    follower.tag_pick_count = 4
+    follower.tag_inventory = []
+    follower.tag_pick_completed = False
+    follower.velocity_owner = "grasp"
+    follower.bridge = types.SimpleNamespace(reset=lambda _width: None)
+    follower.lane_width = 620.0
+    follower.stop_hits = 3
+    follower.publish = lambda *args, **kwargs: True
+    follower._resume_yolo = lambda profile: profile == "street"
+    follower._entry_ready_state = lambda: "TRAFFIC_WAIT"
+    follower._set_state = lambda state: setattr(follower, "state", state)
+    follower.tag_pick_first_entry_time = 5.2
+    follower.tag_pick_first_turn_time = 3.1
+
+    follower._finish_pick("tag")
+
+    assert follower.tag_inventory == [2]
+    assert follower.tag_pick_completed is True
+    assert follower.state == "TRAFFIC_WAIT"
+
+
+def test_zero_tag_pick_still_continues_without_delivery_inventory():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.grasp_coordinator = FakeCoordinator()
+    follower.grasp_coordinator.completed_items = lambda: []
+    follower.tag_pick_count = 4
+    follower.tag_inventory = [1]
+    follower.tag_pick_completed = False
+    follower.velocity_owner = "grasp"
+    follower.bridge = types.SimpleNamespace(reset=lambda _width: None)
+    follower.lane_width = 620.0
+    follower.stop_hits = 3
+    follower.publish = lambda *args, **kwargs: True
+    follower._resume_yolo = lambda profile: profile == "street"
+    follower._entry_ready_state = lambda: "TRAFFIC_WAIT"
+    follower._set_state = lambda state: setattr(follower, "state", state)
+    follower.tag_pick_first_entry_time = 5.2
+    follower.tag_pick_first_turn_time = 3.1
+
+    follower._finish_pick("tag")
+
+    assert follower.tag_inventory == []
+    assert follower.tag_pick_completed is True
+    assert follower.state == "TRAFFIC_WAIT"
 
 
 def test_first_tag_pick_right_turn_uses_independent_times(monkeypatch):
@@ -557,6 +891,68 @@ def test_untagged_pick_next_left_turn_uses_independent_times():
 
     assert transitions == ["TURN"]
     assert commands[-1] == (0.16, 0.58)
+
+
+def test_third_right_before_untagged_pick_uses_independent_times():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.tag_pick_first_maneuver = False
+    follower.untagged_pick_next_maneuver = False
+    follower.task_index = 2
+    follower.turn_cmd = "right"
+    follower.enable_untagged_pick = True
+    follower.untagged_pick_completed = False
+    follower.turn_entry_time = 6.5
+    follower.turn_time = 4.0
+    follower.a_pick_third_right_entry_time = 7.2
+    follower.a_pick_third_right_turn_time = 3.6
+    follower.maneuver_phase = "ENTRY"
+    follower.maneuver_phase_started = 10.0
+    follower.turn_speed = 0.16
+    follower.turn_angular = 0.58
+    transitions = []
+    commands = []
+
+    def set_phase(phase, now=None):
+        follower.maneuver_phase = phase
+        follower.maneuver_phase_started = float(now)
+        transitions.append(phase)
+
+    follower._set_maneuver_phase = set_phase
+    follower.publish = lambda linear, angular: commands.append(
+        (linear, angular))
+
+    follower._run_timed_turn_phase(17.1)
+    assert transitions == []
+    follower._run_timed_turn_phase(17.21)
+
+    assert transitions == ["TURN"]
+    assert commands[-1] == (0.16, -0.58)
+
+
+def test_third_right_without_untagged_pick_keeps_normal_times():
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.tag_pick_first_maneuver = False
+    follower.untagged_pick_next_maneuver = False
+    follower.task_index = 2
+    follower.turn_cmd = "right"
+    follower.enable_untagged_pick = False
+    follower.untagged_pick_completed = True
+    follower.turn_entry_time = 6.5
+    follower.turn_time = 4.0
+    follower.a_pick_third_right_entry_time = 1.0
+    follower.a_pick_third_right_turn_time = 1.0
+    follower.maneuver_phase = "ENTRY"
+    follower.maneuver_phase_started = 10.0
+    follower.turn_speed = 0.16
+    follower.turn_angular = 0.58
+    transitions = []
+    follower._set_maneuver_phase = lambda phase, now=None: transitions.append(
+        phase)
+    follower.publish = lambda *_args: None
+
+    follower._run_timed_turn_phase(11.1)
+
+    assert transitions == []
 
 
 def test_normal_intersections_do_not_use_tag_pick_first_times():
@@ -687,7 +1083,7 @@ def test_building_event_delivers_only_matching_untagged_inventory():
     assert follower.active_delivery_id == 4
     call = follower.grasp_coordinator.calls[0]
     assert call[:3] == ("delivery", "untagged", [4])
-    assert abs(call[3] - 0.1) < 1e-9
+    assert abs(call[3] - 0.06) < 1e-9
     assert follower.states == ["DELIVERING"]
 
 

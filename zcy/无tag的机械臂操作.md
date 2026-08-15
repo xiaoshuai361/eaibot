@@ -56,7 +56,7 @@ roslaunch astra_camera astrapro.launch
 source /opt/ros/melodic/setup.bash
 source /home/eaibot/mirobot_ws/devel/setup.bash
 source /home/eaibot/handeye-calib/devel/setup.bash
-roslaunch mirobot_moveit_config mirobot.launch start_rviz:=true
+roslaunch mirobot_moveit_config mirobot.launch start_rviz:=false
 ```
 
 正式运行不需要 RViz 时改为 `start_rviz:=false`。
@@ -79,15 +79,12 @@ source /home/eaibot/handeye-calib/devel/setup.bash
 conda activate ww
 cd /home/eaibot/handeye-calib/src
 stty -ixon
-```
-
-检测预览（可选）：
-
-```bash
 python3 block_pick_main.py \
   --live-preview --preview-hz 1.0 --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml
 ```
+
+````
 
 按 `q`/`Esc` 或 `Ctrl+C` 退出。若旧进程仍占用
 `/tmp/mirobot_arm_motion.lock`，必须根据报错 PID 结束旧进程，不能只删除锁文件。
@@ -104,18 +101,29 @@ python3 /home/eaibot/handeye-calib/src/block_distance_collect.py \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
   --output-dir /home/eaibot/handeye-calib/config/block_distance_samples_occlusion640_400
-```
+````
 
 镜头到物块正面的距离必须准确，物块正面尽量与相机平行。每个距离依次采集四类；
 重复运行会跳过已有 CSV，不要随意加 `--overwrite`。
+| ID | 类别 | 物资 |
+| --: | --------- | ------------ |
+| 1 | `power` | 应急电源 |
+| 2 | `fire` | 灭火装置 |
+| 3 | `gas` | 气体净化装置 |
+| 4 | `support` | 结构支撑装置 |
 
 ## 4. 示教无 Tag 抓取和入仓放置
 
 四类物资尺寸和位置不同，必须分别示教。下面示教 ID4；依次改为 `1~4`：
 
 ```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/handeye-calib/src
 python3 block_pick_main.py \
-  --target 4 \
+  --target 1 \
   --teach-block-pick-place \
   --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
@@ -173,7 +181,7 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
 
 ```bash
 python3 block_pick_main.py \
-  --target 4 --run-taught-block --confidence 0.5 \
+  --target 1 --run-taught-block --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \
   --preset-file /home/eaibot/handeye-calib/config/block_mono_pick_place_presets.json
 ```
@@ -181,6 +189,11 @@ python3 block_pick_main.py \
 一键连续抓取四类，中途不需要按 Enter：
 
 ```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/handeye-calib/src
 python3 block_pick_main.py \
   --run-chassis-sequence --sequence 1,2,3,4 --confidence 0.5 \
   --config /home/eaibot/handeye-calib/src/config/block_mono_grasp.yaml \

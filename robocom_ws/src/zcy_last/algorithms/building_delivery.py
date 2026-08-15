@@ -205,3 +205,14 @@ def estimate_building_distance_mm(detection, calibration_entry, frame_shape):
             "楼宇估距%.1fmm超出标定范围%.1f~%.1fmm" %
             (distance_mm, minimum, maximum))
     return geometry["center_x_ratio"], distance_mm
+
+
+def limited_building_offset_mm(
+        distance_mm, reference_mm, minimum_offset_mm, maximum_offset_mm):
+    raw_offset = _finite(distance_mm, "distance_mm") - _finite(
+        reference_mm, "reference_mm")
+    minimum = _finite(minimum_offset_mm, "minimum_offset_mm")
+    maximum = _finite(maximum_offset_mm, "maximum_offset_mm")
+    if maximum < minimum:
+        raise RuntimeError("楼宇机械臂P修正范围上下限颠倒")
+    return raw_offset, max(minimum, min(maximum, raw_offset))

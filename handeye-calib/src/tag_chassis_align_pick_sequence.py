@@ -9,6 +9,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 
 import rospy
 import tf
@@ -82,7 +83,10 @@ def write_result_file(path, completed_ids):
             json.dump({'completed_ids': list(completed_ids)}, handle,
                       sort_keys=True)
             handle.write('\n')
-        os.rename(temporary, path)
+        if hasattr(os, 'replace'):
+            os.replace(temporary, path)
+        else:
+            os.rename(temporary, path)
     finally:
         try:
             os.unlink(temporary)
@@ -254,8 +258,56 @@ def build_pick_command(args, tag_id):
 
 
 def pick_failure_is_missing_tf(output, tag_id):
-    marker = 'TF for tag_%d was not found' % int(tag_id)
-    return marker in output
+    tag_frame = 'tag_%d' % int(tag_id)
+    markers = (
+        'TF for %s was not found' % tag_frame,
+        '%s did not provide enough stable, fresh, unique TF samples' % tag_frame,
+        '%s did not provide' % tag_frame,
+        'TF for %s was visible but too old' % tag_frame,
+        'Detected %s under' % tag_frame,
+    )
+    return any(marker in output for marker in markers)
+
+
+def pick_tf_failure_reason(output, tag_id):
+    tag_frame = 'tag_%d' % int(tag_id)
+    if ('did not provide enough stable, fresh, unique TF samples' in output or
+            ('%s did not provide' % tag_frame) in output):
+        return 'TF稳定样本不足'
+    if 'TF for %s was visible but too old' % tag_frame in output:
+        return 'TF已过期，没有足够新鲜样本'
+    if 'Detected %s under' % tag_frame in output:
+        return '检测到Tag，但TF坐标链未连通'
+    if 'TF for %s was not found' % tag_frame in output:
+        return '未找到%s TF' % tag_frame
+    return 'TF未稳定'
+
+
+def compact_pick_child_error(output, return_code, max_chars=180):
+    lines = [
+        ' '.join(line.strip().split())
+        for line in str(output or '').splitlines()
+        if line.strip()
+    ]
+    detail = None
+    markers = (
+        'RuntimeError:', 'Error:', '[ERROR]', 'MoveIt',
+        '失败', 'Exception:', 'Traceback',
+    )
+    for marker in markers:
+        for line in reversed(lines):
+            if marker in line and not line.startswith('Traceback'):
+                detail = line
+                break
+        if detail is not None:
+            break
+    if detail is None and lines:
+        detail = lines[-1]
+    if detail is None:
+        detail = '子进程没有输出错误详情'
+    if len(detail) > int(max_chars):
+        detail = detail[-int(max_chars):]
+    return '机械臂子进程退出码%d：%s' % (int(return_code), detail)
 
 
 def pick_failure_is_contact_miss(output, tag_id, return_code):
@@ -285,16 +337,21 @@ def run_pick_command(command, tag_id):
     if return_code == 0:
         return True
     if pick_failure_is_missing_tf(output, tag_id):
+        reason = pick_tf_failure_reason(output, tag_id)
         rospy.logwarn(
-            '跳过 ID%d 抓取：机械臂动作前 tag TF 已经消失。',
-            tag_id)
+            'TAG_STATUS ID%d抓取失败：%s；跳过并继续。',
+            tag_id, reason)
+        rospy.logwarn(
+            '跳过 ID%d 抓取：%s。', tag_id, reason)
         return False
     if pick_failure_is_contact_miss(output, tag_id, return_code):
+        rospy.logwarn(
+            'TAG_STATUS ID%d 限位未接触，跳过当前目标。', tag_id)
         rospy.logwarn(
             '跳过 ID%d 抓取：限位探测达到最大距离仍未接触物块。',
             tag_id)
         return False
-    raise subprocess.CalledProcessError(return_code, command)
+    raise RuntimeError(compact_pick_child_error(output, return_code))
 
 
 def parse_args(argv):
@@ -307,6 +364,8 @@ def parse_args(argv):
                         help='把实际成功入仓的 Tag ID 写入 JSON 文件。')
     parser.add_argument('--fail-on-skip', action='store_true',
                         help='任何对准、TF 或抓取跳过都按失败退出。')
+    parser.add_argument('--allow-partial', action='store_true',
+                        help='允许目标不足或部分目标跳过，并按实际成功库存正常退出。')
     parser.add_argument('--order', choices=['left_to_right', 'sequence'],
                         default='left_to_right')
     parser.add_argument('--detections-topic', default='/tag_yolo_quiet/detections_json')
@@ -399,6 +458,7 @@ class ChassisAlignPickSequence(object):
         self.latest_detections = None
         self.pick_in_progress = False
         self.debug_window_enabled = bool(args.show_debug_window)
+        self.debug_window_lock = threading.Lock()
         self.bridge = CvBridge()
         self.cmd_pub = rospy.Publisher(args.cmd_vel_topic, Twist, queue_size=1)
         self.debug_image_pub = rospy.Publisher(args.debug_image_topic, Image, queue_size=1)
@@ -445,8 +505,15 @@ class ChassisAlignPickSequence(object):
             output.header = message.header
             self.debug_image_pub.publish(output)
             if self.debug_window_enabled:
-                cv2.imshow(self.args.debug_window_name, image)
-                cv2.waitKey(1)
+                self.debug_window_lock.acquire()
+                try:
+                    # run_pick 可能在本次回调绘图期间开始。持锁后再次
+                    # 检查，避免机械臂长动作开始后又把窗口重新打开。
+                    if not self.pick_in_progress:
+                        cv2.imshow(self.args.debug_window_name, image)
+                        cv2.waitKey(1)
+                finally:
+                    self.debug_window_lock.release()
         except Exception as exc:
             self.debug_window_enabled = False
             rospy.logwarn_throttle(2.0, '无法绘制底盘对准调试图：%s', exc)
@@ -454,13 +521,21 @@ class ChassisAlignPickSequence(object):
     def close_debug_window(self):
         if not getattr(self.args, 'show_debug_window', False):
             return
+        lock = getattr(self, 'debug_window_lock', None)
+        acquired = False
         try:
             import cv2
+            if lock is not None:
+                lock.acquire()
+                acquired = True
             cv2.destroyWindow(getattr(
                 self.args, 'debug_window_name', DEFAULT_DEBUG_WINDOW_NAME))
             cv2.waitKey(1)
         except Exception:
             pass
+        finally:
+            if acquired:
+                lock.release()
 
     def publish_velocity(self, linear_x):
         if self.args.dry_run:
@@ -498,6 +573,9 @@ class ChassisAlignPickSequence(object):
             order = left_to_right_order(
                 message, remaining_tags, self.args.min_confidence)
             if order:
+                rospy.loginfo(
+                    'TAG_STATUS 检测到%d个可处理Tag，左到右=%s，当前处理ID%d。',
+                    len(order), order, order[0])
                 rospy.loginfo(
                     '当前可见剩余 tag 从左到右：%s。下一步处理 ID%d。',
                     order, order[0])
@@ -568,6 +646,9 @@ class ChassisAlignPickSequence(object):
                         tag_id, stable, self.args.stable_frames)
                     if stable >= self.args.stable_frames:
                         rospy.loginfo(
+                            'TAG_STATUS ID%d停稳对准完成，准备检查TF。',
+                            tag_id)
+                        rospy.loginfo(
                             'ID%d 对准确认完成：底盘已停稳，连续 %d 帧在红框内，center_x=%.1f。',
                             tag_id, stable, result.center_x)
                         return
@@ -575,6 +656,9 @@ class ChassisAlignPickSequence(object):
                     continue
                 if stable >= 1:
                     self.stop_chassis()
+                    rospy.loginfo(
+                        'TAG_STATUS ID%d已进入红框，底盘停车并等待停稳。',
+                        tag_id)
                     rospy.loginfo(
                         'ID%d 已进入红框，立即停车；等待 %.2fs 让底盘停稳，再确认 %d 帧。',
                         tag_id, self.args.chassis_settle_seconds,
@@ -607,9 +691,17 @@ class ChassisAlignPickSequence(object):
             rospy.logwarn('当前是 dry-run，跳过 ID%d 抓取。', tag_id)
             return
         command = build_pick_command(self.args, tag_id)
+        rospy.loginfo('TAG_STATUS ID%d开始机械臂抓取。', tag_id)
         rospy.loginfo('开始执行 ID%d 示教抓取。', tag_id)
         rospy.loginfo('实际抓取子命令：%s', ' '.join(command))
         self.pick_in_progress = True
+        # 子进程内的 MoveIt arm.go(wait=True) 可能阻塞几十秒。若保留
+        # HighGUI 窗口却停止 waitKey，Ubuntu 会弹出“无响应”。先关闭
+        # 窗口；本次抓取结束、图像回调恢复后会在下一个目标自动重开。
+        self.close_debug_window()
+        rospy.loginfo(
+            'ID%d 机械臂动作期间暂时关闭 Tag 检测窗口；'
+            '下一个目标对准时自动重开。', tag_id)
         try:
             return run_pick_command(command, tag_id)
         finally:
@@ -657,6 +749,9 @@ class ChassisAlignPickSequence(object):
         rospy.loginfo(
             '抓取前最多等待 %.1fs，确认 tag_%d 发布一个新的 TF；多帧过滤由抓取脚本执行。',
             self.args.tag_tf_wait_seconds, tag_id)
+        rospy.loginfo(
+            'TAG_STATUS ID%d等待新TF，最长%.1f秒。',
+            tag_id, self.args.tag_tf_wait_seconds)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
             stamp = self.read_tag_tf_stamp(tag_id)
             if stamp is not None and (
@@ -664,12 +759,17 @@ class ChassisAlignPickSequence(object):
                 rospy.loginfo(
                     'tag_%d 已发布新的 TF，开始由抓取脚本采集并过滤多帧位姿。',
                     tag_id)
+                rospy.loginfo(
+                    'TAG_STATUS ID%d检测到新TF，进入稳定TF采集。', tag_id)
                 return True
             rate.sleep()
         self.stop_chassis()
         rospy.logwarn(
             '跳过 ID%d：tag_%d 在 %.1fs 内没有发布新的 TF。',
             tag_id, tag_id, self.args.tag_tf_wait_seconds)
+        rospy.logwarn(
+            'TAG_STATUS ID%d在%.1f秒内没有新TF，跳过当前目标。',
+            tag_id, self.args.tag_tf_wait_seconds)
         return False
 
     def run(self):
@@ -677,13 +777,25 @@ class ChassisAlignPickSequence(object):
             remaining_tags = list(self.args.sequence)
             requested = getattr(self.args, 'max_targets', None)
             total = len(remaining_tags) if requested is None else int(requested)
+            allow_partial = getattr(self.args, 'allow_partial', False)
             processed = 0
             completed = 0
             completed_ids = []
             result_file = getattr(self.args, 'result_file', None)
             write_result_file(result_file, completed_ids)
             while remaining_tags and completed < total:
-                tag_id = self.select_next_tag(remaining_tags)
+                try:
+                    tag_id = self.select_next_tag(remaining_tags)
+                except RuntimeError as exc:
+                    if not allow_partial:
+                        raise
+                    rospy.logwarn(
+                        '%s 当前没有可继续处理的目标，结束本次抓取；'
+                        '已完成 %d/%d 个。', exc, completed, total)
+                    rospy.logwarn(
+                        'TAG_STATUS 当前没有可处理Tag，结束抓取，成功%d/%d。',
+                        completed, total)
+                    break
                 processed += 1
                 rospy.loginfo('开始把 ID%d 对准到红框。', tag_id)
                 try:
@@ -692,18 +804,34 @@ class ChassisAlignPickSequence(object):
                     self.stop_chassis()
                     if getattr(self.args, 'fail_on_skip', False):
                         raise RuntimeError(str(exc))
+                    rospy.logwarn(
+                        'TAG_STATUS ID%d红框对准超时，跳过当前目标。', tag_id)
                     rospy.logwarn('%s 跳过当前 ID，继续处理后续目标。', exc)
                     remaining_tags.remove(tag_id)
                     continue
-                self.run_startup_home(tag_id)
-                needs_pick_tf = not self.args.align_only and not self.args.dry_run
-                if needs_pick_tf and not self.wait_for_tag_tf_before_pick(tag_id):
-                    if getattr(self.args, 'fail_on_skip', False):
-                        raise RuntimeError(
-                            'ID%d tag TF 未在限时内准备完成。' % tag_id)
+                try:
+                    self.run_startup_home(tag_id)
+                    needs_pick_tf = not self.args.align_only and not self.args.dry_run
+                    if (needs_pick_tf
+                            and not self.wait_for_tag_tf_before_pick(tag_id)):
+                        if getattr(self.args, 'fail_on_skip', False):
+                            raise RuntimeError(
+                                'ID%d tag TF 未在限时内准备完成。' % tag_id)
+                        remaining_tags.remove(tag_id)
+                        continue
+                    pick_completed = self.run_pick(tag_id)
+                except Exception as exc:
+                    self.stop_chassis()
+                    if not allow_partial:
+                        raise
+                    rospy.logwarn(
+                        '跳过 ID%d：对准后的回零、TF 或单次抓取失败：%s。'
+                        '继续处理剩余目标。', tag_id, exc)
+                    rospy.logwarn(
+                        'TAG_STATUS ID%d抓取失败：%s；跳过并继续。',
+                        tag_id, exc)
                     remaining_tags.remove(tag_id)
                     continue
-                pick_completed = self.run_pick(tag_id)
                 if pick_completed is False:
                     if getattr(self.args, 'fail_on_skip', False):
                         raise RuntimeError('ID%d 抓取未完成。' % tag_id)
@@ -713,11 +841,21 @@ class ChassisAlignPickSequence(object):
                 completed += 1
                 completed_ids.append(tag_id)
                 write_result_file(result_file, completed_ids)
-            if completed < total and (
+                rospy.loginfo(
+                    'TAG_STATUS ID%d抓取成功，当前%d/%d，库存=%s。',
+                    tag_id, completed, total, completed_ids)
+            if completed < total and not allow_partial and (
                     requested is not None
                     or getattr(self.args, 'fail_on_skip', False)):
                 raise RuntimeError(
                     '仅完成 %d/%d 个 Tag 抓取。' % (completed, total))
+            if completed < total and allow_partial:
+                rospy.logwarn(
+                    'Tag 抓取部分完成：成功 %d/%d 个，实际库存=%s；继续比赛。',
+                    completed, total, completed_ids)
+            rospy.loginfo(
+                'TAG_STATUS B点抓取结束，成功%d/%d，实际库存=%s。',
+                completed, total, completed_ids)
         finally:
             self.stop_chassis()
             self.close_debug_window()

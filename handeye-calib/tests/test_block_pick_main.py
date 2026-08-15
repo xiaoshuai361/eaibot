@@ -229,14 +229,29 @@ def test_chassis_sequence_forwards_result_file():
         "/tmp/untagged-result.json"
 
 
-def test_chassis_sequence_forwards_right_side_search_handshake():
+def test_chassis_sequence_forwards_allow_partial():
+    parsed = main.parse_args([
+        "--run-chassis-sequence",
+        "--sequence", "1,2,3,4",
+        "--max-targets", "4",
+        "--allow-partial",
+    ])
+
+    main.validate_runtime_args(parsed, {"distance_method": "calibrated"})
+    command = main.build_child_command(parsed, request_fd=11, response_fd=12)
+
+    assert "--allow-partial" in command
+    assert "--fail-on-skip" not in command
+
+
+def test_chassis_sequence_forwards_full_frame_search_handshake():
     parsed = main.parse_args([
         "--run-chassis-sequence",
         "--search-before-chassis",
         "--search-ready-file", "/tmp/search-ready",
+        "--search-enable-file", "/tmp/search-enable",
         "--search-trigger-file", "/tmp/search-trigger",
         "--search-release-file", "/tmp/search-release",
-        "--search-roi-ratio", "0.60,0.05,0.98,0.95",
         "--search-stable-frames", "4",
         "--search-poll-hz", "2.5",
     ])
@@ -246,12 +261,13 @@ def test_chassis_sequence_forwards_right_side_search_handshake():
     assert "--search-before-chassis" in command
     assert command[command.index("--search-ready-file") + 1] == \
         "/tmp/search-ready"
+    assert command[command.index("--search-enable-file") + 1] == \
+        "/tmp/search-enable"
     assert command[command.index("--search-trigger-file") + 1] == \
         "/tmp/search-trigger"
     assert command[command.index("--search-release-file") + 1] == \
         "/tmp/search-release"
-    assert command[command.index("--search-roi-ratio") + 1] == \
-        "0.60,0.05,0.98,0.95"
+    assert "--search-roi-ratio" not in command
     assert command[command.index("--search-stable-frames") + 1] == "4"
     assert command[command.index("--search-poll-hz") + 1] == "2.5"
 

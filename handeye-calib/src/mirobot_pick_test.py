@@ -68,6 +68,12 @@ MOTION_LOCK_PATH = "/tmp/mirobot_arm_motion.lock"
 CONTACT_PROBE_ENABLE_SERVICE = "/mirobot_contact_probe_enable"
 CONTACT_STATE_SERVICE = "/mirobot_contact_state"
 CONTACT_PROBE_MISS_EXIT_CODE = 4
+POSE_DONE_POSITION_TOLERANCE = 0.015
+POSE_DONE_ORIENTATION_TOLERANCE_RAD = 0.35
+JOINT_STABLE_TOLERANCE_RAD = 0.003
+JOINT_STABLE_SAMPLE_SECONDS = 0.2
+JOINT_STABLE_REQUIRED_SAMPLES = 3
+JOINT_STABLE_TIMEOUT_SECONDS = 3.0
 
 
 class TerminationRequested(RuntimeError):
@@ -201,6 +207,7 @@ def parse_args(argv):
     parser.add_argument("--sequence", default="1,2,3,4")
     parser.add_argument("--max-targets", type=int)
     parser.add_argument("--fail-on-skip", action="store_true")
+    parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--result-file")
     # Legacy no-op: continuous no-Tag pickup never waits for keyboard input.
     parser.add_argument(
@@ -220,9 +227,9 @@ def parse_args(argv):
     parser.add_argument("--show-rgb", action="store_true")
     parser.add_argument("--search-before-chassis", action="store_true")
     parser.add_argument("--search-ready-file")
+    parser.add_argument("--search-enable-file")
     parser.add_argument("--search-trigger-file")
     parser.add_argument("--search-release-file")
-    parser.add_argument("--search-roi-ratio", default="0.60,0.05,0.98,0.95")
     parser.add_argument("--search-stable-frames", type=int, default=3)
     parser.add_argument("--search-poll-hz", type=float, default=3.0)
     ros_argv = rospy.myargv(argv)[1:]
@@ -1226,7 +1233,6 @@ def validate_chassis_sequence_preset(path, targets, config,
 def request_sequence_detections(args, config, detector, remaining_targets,
                                 display_roi_ratio=None):
     capture = capture_rgb_once(config)
-    response = request_detection(detector, None, capture["rgb"])
     rules = {
         "confidence_min": config["confidence_min"],
         "box_width_min_px": config["box_width_min_px"],
@@ -1234,33 +1240,26 @@ def request_sequence_detections(args, config, detector, remaining_targets,
         "box_aspect_ratio_max": config["box_aspect_ratio_max"],
     }
     detections = []
-    for detection in response_detections(response):
-        target = detection.get("target") if isinstance(detection, dict) else None
-        if target not in remaining_targets:
-            continue
-        usable, _reason = is_detection_usable(detection, rules)
-        if usable:
-            detections.append(detection)
-    if args.show_rgb:
-        observations = [detection_to_observation(item) for item in detections]
-        show_rgb_debug(
-            capture["rgb"], detections, observations, 1,
-            roi_ratio=(display_roi_ratio or config["grasp_roi_ratio"]))
-    return capture, detections
-
-
-def parse_search_roi_ratio(value):
     try:
-        values = [float(item.strip()) for item in str(value).split(",")]
-    except (TypeError, ValueError):
-        raise RuntimeError("--search-roi-ratio must contain four numbers")
-    if (len(values) != 4 or not
-            (0.0 <= values[0] < values[2] <= 1.0 and
-             0.0 <= values[1] < values[3] <= 1.0)):
-        raise RuntimeError(
-            "--search-roi-ratio must satisfy 0<=x1<x2<=1 and "
-            "0<=y1<y2<=1")
-    return values
+        response = request_detection(detector, None, capture["rgb"])
+        for detection in response_detections(response):
+            target = detection.get("target") \
+                if isinstance(detection, dict) else None
+            if target not in remaining_targets:
+                continue
+            usable, _reason = is_detection_usable(detection, rules)
+            if usable:
+                detections.append(detection)
+    finally:
+        # 零检测或推理抛出“无可用目标”时也必须刷新窗口，否则现场
+        # 无法观察原始画面、搜索 ROI 和模型是否工作。
+        if args.show_rgb:
+            observations = [
+                detection_to_observation(item) for item in detections]
+            show_rgb_debug(
+                capture["rgb"], detections, observations, 1,
+                roi_ratio=(display_roi_ratio or config["grasp_roi_ratio"]))
+    return capture, detections
 
 
 def write_search_signal(path, text):
@@ -1272,36 +1271,77 @@ def write_search_signal(path, text):
     os.rename(temporary, path)
 
 
+def full_frame_visible_targets(detections, remaining_targets):
+    """返回全画面内已识别的目标种类；抓取 ROI 只在后续对齐使用。"""
+    return set(
+        detection.get("target") for detection in detections
+        if isinstance(detection, dict)
+        and detection.get("target") in remaining_targets)
+
+
 def wait_for_search_trigger(args, config, detector, remaining_targets):
-    search_roi = parse_search_roi_ratio(args.search_roi_ratio)
+    # 发现阶段按全画面统计类别；窗口始终显示后续慢速对齐真正使用的
+    # grasp_roi_ratio，避免额外画一个不参与抓取的“搜索框”。
+    alignment_roi = config["grasp_roi_ratio"]
     required = int(args.search_stable_frames)
+    required_target_count = int(
+        args.max_targets if args.max_targets is not None
+        else len(remaining_targets))
     poll_hz = float(args.search_poll_hz)
-    if required <= 0 or poll_hz <= 0.0:
-        raise RuntimeError("search stable frames and poll rate must be positive")
+    if (required <= 0 or poll_hz <= 0.0
+            or not 1 <= required_target_count <= len(remaining_targets)):
+        raise RuntimeError(
+            "search target count, stable frames and poll rate must be positive")
     stable = 0
     rate = rospy.Rate(poll_hz)
+    if args.show_rgb:
+        try:
+            request_sequence_detections(
+                args, config, detector, remaining_targets,
+                display_roi_ratio=alignment_roi)
+        except Exception as exc:
+            if "No usable YOLO detections" not in safe_log_text(exc):
+                rospy.logwarn(
+                    "A-point initial preview failed: %s",
+                    ascii_log_text(exc))
     write_search_signal(args.search_ready_file, "ready")
     rospy.loginfo(
-        "A-point right-side search started: roi=%s stable=%d.",
-        search_roi, required)
+        "A-point detector and debug window ready; waiting to enable search.")
+    while not rospy.is_shutdown():
+        if os.path.isfile(args.search_enable_file):
+            break
+        if args.show_rgb:
+            try:
+                request_sequence_detections(
+                    args, config, detector, remaining_targets,
+                    display_roi_ratio=alignment_roi)
+            except Exception as exc:
+                if "No usable YOLO detections" not in safe_log_text(exc):
+                    rospy.logwarn_throttle(
+                        2.0, "A-point preview failed: %s",
+                        ascii_log_text(exc))
+            rate.sleep()
+        else:
+            rospy.sleep(0.05)
+    if rospy.is_shutdown():
+        raise TerminationRequested(
+            "ROS shut down while waiting to enable A-point search.")
+    rospy.loginfo(
+        "A-point full-frame search enabled: alignment_roi=%s targets=%d stable=%d.",
+        alignment_roi, required_target_count, required)
     while not rospy.is_shutdown():
         try:
             capture, detections = request_sequence_detections(
                 args, config, detector, remaining_targets,
-                display_roi_ratio=search_roi)
-            height, width = capture["rgb"].shape[:2]
-            x1, y1, x2, y2 = roi_ratio_to_pixels(
-                search_roi, width, height)
-            inside = []
-            for detection in detections:
-                observation = detection_to_observation(detection)
-                if (x1 <= observation["u"] <= x2 and
-                        y1 <= observation["v"] <= y2):
-                    inside.append(detection)
-            stable = stable + 1 if inside else 0
-            if inside:
+                display_roi_ratio=alignment_roi)
+            visible_targets = full_frame_visible_targets(
+                detections, remaining_targets)
+            enough_targets = len(visible_targets) >= required_target_count
+            stable = stable + 1 if enough_targets else 0
+            if visible_targets:
                 rospy.loginfo(
-                    "A-point right-side target confirmation: %d/%d.",
+                    "A-point full-frame targets: %d/%d; confirmation: %d/%d.",
+                    len(visible_targets), required_target_count,
                     stable, required)
             if stable >= required:
                 write_search_signal(args.search_trigger_file, "triggered")
@@ -1331,7 +1371,8 @@ def select_next_sequence_target(args, config, detector, remaining_targets,
     if settings["order"] == "sequence":
         return remaining_targets[0]
     strict_deadline = None
-    if getattr(args, "fail_on_skip", False):
+    if (getattr(args, "fail_on_skip", False)
+            or getattr(args, "allow_partial", False)):
         strict_deadline = time.time() + float(settings["max_align_seconds"])
     rate = rospy.Rate(float(settings["control_hz"]))
     while not rospy.is_shutdown():
@@ -1366,7 +1407,8 @@ def select_next_sequence_target(args, config, detector, remaining_targets,
         "ROS shut down while waiting for a remaining block target.")
 
 
-def align_sequence_target(args, config, detector, target, publisher, settings):
+def align_sequence_target(args, config, detector, target, publisher, settings,
+                          visible_targets=None):
     stable = 0
     last_stamp_ns = None
     last_result = None
@@ -1379,7 +1421,8 @@ def align_sequence_target(args, config, detector, target, publisher, settings):
     while not rospy.is_shutdown() and time.time() < deadline:
         try:
             capture, detections = request_sequence_detections(
-                args, config, detector, [target])
+                args, config, detector,
+                visible_targets if visible_targets is not None else [target])
         except Exception as exc:
             stable = 0
             publisher.publish(make_chassis_twist(0.0))
@@ -1394,7 +1437,9 @@ def align_sequence_target(args, config, detector, target, publisher, settings):
             rate.sleep()
             continue
         last_stamp_ns = capture["stamp_ns"]
-        if not detections:
+        target_detections = [
+            item for item in detections if item.get("target") == target]
+        if not target_detections:
             stable = 0
             publisher.publish(make_chassis_twist(0.0))
             rospy.logwarn_throttle(
@@ -1403,7 +1448,8 @@ def align_sequence_target(args, config, detector, target, publisher, settings):
             rate.sleep()
             continue
         detection = max(
-            detections, key=lambda item: float(item.get("confidence", 0.0)))
+            target_detections,
+            key=lambda item: float(item.get("confidence", 0.0)))
         height, width = capture["rgb"].shape[:2]
         roi_pixels = roi_ratio_to_pixels(
             config["grasp_roi_ratio"], width, height)
@@ -1494,6 +1540,10 @@ def run_sequence_startup_home(config, target, settings, skip):
 
 
 def run_block_chassis_sequence(args, config, detector):
+    if (getattr(args, "fail_on_skip", False)
+            and getattr(args, "allow_partial", False)):
+        raise RuntimeError(
+            "--fail-on-skip and --allow-partial are mutually exclusive.")
     settings = require_chassis_sequence_config(config)
     targets = parse_target_sequence(args.sequence, config)
     if not args.align_only:
@@ -1515,42 +1565,73 @@ def run_block_chassis_sequence(args, config, detector):
             "--max-targets must be between 1 and the sequence length.")
     completed = 0
     completed_ids = []
+    allow_partial = bool(getattr(args, "allow_partial", False))
     result_file = getattr(args, "result_file", None)
     write_chassis_sequence_result(result_file, completed_ids)
     try:
         while (remaining_targets and completed < total
                and not rospy.is_shutdown()):
-            target = select_next_sequence_target(
-                args, config, detector, remaining_targets, settings)
+            try:
+                target = select_next_sequence_target(
+                    args, config, detector, remaining_targets, settings)
+            except RuntimeError as exc:
+                if not allow_partial:
+                    raise
+                rospy.logwarn(
+                    "No remaining target became visible: %s. "
+                    "Ending A-point pickup with actual inventory %s.",
+                    ascii_log_text(exc), completed_ids)
+                break
             rospy.loginfo(
-                "Starting slow chassis alignment for %d=%s.",
+                "A-point pickup %d/%d: slow-aligning %d=%s; "
+                "visible window keeps all remaining targets.",
+                completed + 1, total,
                 target_number(config, target), ascii_log_text(target))
-            align_sequence_target(
-                args, config, detector, target, publisher, settings)
-            stop_chassis(publisher)
-            if not args.align_only:
-                run_sequence_startup_home(
-                    config, target, settings, args.skip_startup_home)
-                args.block_target = target
-                localization = compute_block_localization(
-                    args, config, detector)
-                try:
+            try:
+                align_sequence_target(
+                    args, config, detector, target, publisher, settings,
+                    visible_targets=remaining_targets)
+                stop_chassis(publisher)
+                if not args.align_only:
+                    run_sequence_startup_home(
+                        config, target, settings, args.skip_startup_home)
+                    args.block_target = target
+                    localization = compute_block_localization(
+                        args, config, detector)
                     do_run_taught_block_mono(
                         args, config, localization, "run_taught_block")
-                except ContactProbeMiss:
-                    rospy.logwarn(
-                        "Target %d=%s did not trigger the contact switch; "
-                        "skipping it and continuing with the remaining targets.",
-                        target_number(config, target), ascii_log_text(target))
-                    remaining_targets.remove(target)
-                    continue
+            except ContactProbeMiss as exc:
+                rospy.logwarn(
+                    "Target %d=%s did not trigger the contact switch; "
+                    "skipping it and continuing with the remaining targets: %s.",
+                    target_number(config, target), ascii_log_text(target),
+                    ascii_log_text(exc))
+                remaining_targets.remove(target)
+                continue
+            except Exception as exc:
+                stop_chassis(publisher)
+                if not allow_partial:
+                    raise
+                rospy.logwarn(
+                    "Target %d=%s failed; skipping it and continuing: %s.",
+                    target_number(config, target), ascii_log_text(target),
+                    ascii_log_text(exc))
+                remaining_targets.remove(target)
+                continue
             remaining_targets.remove(target)
             completed += 1
             completed_ids.append(target_number(config, target))
             write_chassis_sequence_result(result_file, completed_ids)
         if completed < total:
-            raise RuntimeError(
-                "Only %d/%d tagless targets completed." % (completed, total))
+            if allow_partial:
+                rospy.logwarn(
+                    "A-point pickup partially completed: %d/%d; "
+                    "actual inventory=%s. Competition will continue.",
+                    completed, total, completed_ids)
+            else:
+                raise RuntimeError(
+                    "Only %d/%d tagless targets completed." % (
+                        completed, total))
     finally:
         publisher.shutdown()
 
@@ -1773,8 +1854,72 @@ def build_move_group(config, group_name):
     return arm
 
 
+def pose_target_error(current_pose, target_pose):
+    dx = current_pose.pose.position.x - target_pose.pose.position.x
+    dy = current_pose.pose.position.y - target_pose.pose.position.y
+    dz = current_pose.pose.position.z - target_pose.pose.position.z
+    position_m = math.sqrt(dx * dx + dy * dy + dz * dz)
+    qa = normalize_quaternion(
+        quaternion_msg_to_tuple(current_pose.pose.orientation))
+    qb = normalize_quaternion(
+        quaternion_msg_to_tuple(target_pose.pose.orientation))
+    dot = abs(sum(a * b for a, b in zip(qa, qb)))
+    dot = max(-1.0, min(1.0, dot))
+    orientation_rad = 2.0 * math.acos(dot)
+    return position_m, orientation_rad
+
+
+def current_pose_reached_target(arm, target_pose, label):
+    try:
+        current_pose = arm.get_current_pose()
+        position_m, orientation_rad = pose_target_error(
+            current_pose, target_pose)
+    except Exception as exc:
+        rospy.logwarn(
+            "MoveIt failed during %s and current pose could not be read: %s.",
+            label, ascii_log_text(exc))
+        return False, None
+    rospy.logwarn(
+        "MoveIt controller reported failure during %s; actual target error "
+        "position=%.1fmm orientation=%.1fdeg.",
+        label, position_m * 1000.0, math.degrees(orientation_rad))
+    reached = (
+        position_m <= POSE_DONE_POSITION_TOLERANCE
+        and orientation_rad <= POSE_DONE_ORIENTATION_TOLERANCE_RAD)
+    if reached:
+        rospy.logwarn(
+            "Actual pose is already within tolerance; accepting %s instead "
+            "of repeating the trajectory.", label)
+    return reached, (position_m, orientation_rad)
+
+
+def wait_for_joint_state_stable(
+        arm, timeout=JOINT_STABLE_TIMEOUT_SECONDS,
+        tolerance=JOINT_STABLE_TOLERANCE_RAD,
+        sample_seconds=JOINT_STABLE_SAMPLE_SECONDS,
+        required_samples=JOINT_STABLE_REQUIRED_SAMPLES):
+    deadline = time.time() + float(timeout)
+    previous = None
+    stable = 0
+    while time.time() < deadline and not rospy.is_shutdown():
+        current = [float(value) for value in arm.get_current_joint_values()]
+        if previous is not None and len(current) == len(previous):
+            delta = max(abs(a - b) for a, b in zip(current, previous)) \
+                if current else 0.0
+            stable = stable + 1 if delta <= float(tolerance) else 0
+            if stable >= int(required_samples):
+                return True
+        previous = current
+        rospy.sleep(float(sample_seconds))
+    rospy.logwarn(
+        "Joint state did not become stable within %.1fs; retrying from the "
+        "latest reported state.", float(timeout))
+    return False
+
+
 def execute_pose(arm, target_pose, label):
     rospy.loginfo("Executing %s", label)
+    last_error = None
     for attempt in range(2):
         arm.set_start_state_to_current_state()
         arm.set_pose_target(target_pose)
@@ -1785,10 +1930,23 @@ def execute_pose(arm, target_pose, label):
             if MOTION_SETTLE_SECONDS > 0.0:
                 rospy.sleep(MOTION_SETTLE_SECONDS)
             return
+        reached, last_error = current_pose_reached_target(
+            arm, target_pose, label)
+        if reached:
+            if MOTION_SETTLE_SECONDS > 0.0:
+                rospy.sleep(MOTION_SETTLE_SECONDS)
+            return
         if attempt == 0:
-            rospy.logwarn("MoveIt failed during %s; retrying once from current state.", label)
-            rospy.sleep(0.4)
-    raise RuntimeError("MoveIt failed during %s." % label)
+            rospy.logwarn(
+                "MoveIt failed during %s; waiting for stable joint state "
+                "before retrying once.", label)
+            wait_for_joint_state_stable(arm)
+            rospy.sleep(0.3)
+    detail = ""
+    if last_error is not None:
+        detail = " Final target error: position=%.1fmm orientation=%.1fdeg." % (
+            last_error[0] * 1000.0, math.degrees(last_error[1]))
+    raise RuntimeError("MoveIt failed during %s.%s" % (label, detail))
 
 
 def execute_joint_values(arm, joint_values, label):
@@ -2227,6 +2385,10 @@ def do_run_taught_block_mono(args, config, localization, action):
     holding_object = False
     try:
         set_pump(pump_proxy, False)
+        # 每个目标前都刚执行过启动回零。服务返回并不等于最后一帧
+        # joint_states 已经稳定，先确认稳定再发送第一条 MoveIt 轨迹，
+        # 避免控制器以过期起点拒绝 block_approach_staging。
+        wait_for_joint_state_stable(arm)
         execute_pose(arm, approach_staging_pose, "block_approach_staging")
         if not run_contact_approach(
                 arm, taught_pre_grasp_pose, pickup_model,

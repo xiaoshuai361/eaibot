@@ -102,6 +102,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-targets", type=int)
     parser.add_argument("--fail-on-skip", action="store_true")
+    parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument(
         "--result-file",
         help="底盘连续抓取实际成功物资 ID 的 JSON 输出路径。",
@@ -134,9 +135,9 @@ def parse_args(argv=None):
     parser.add_argument("--show-rgb", action="store_true")
     parser.add_argument("--search-before-chassis", action="store_true")
     parser.add_argument("--search-ready-file")
+    parser.add_argument("--search-enable-file")
     parser.add_argument("--search-trigger-file")
     parser.add_argument("--search-release-file")
-    parser.add_argument("--search-roi-ratio", default="0.60,0.05,0.98,0.95")
     parser.add_argument("--search-stable-frames", type=int, default=3)
     parser.add_argument("--search-poll-hz", type=float, default=3.0)
     parser.add_argument("--arm-timeout", type=float, default=NORMAL_CHILD_TIMEOUT)
@@ -222,6 +223,10 @@ def validate_runtime_args(args, config):
                 "--max-targets must be between 1 and the sequence length")
     if args.fail_on_skip and action != "run_chassis_sequence":
         raise ValueError("--fail-on-skip requires --run-chassis-sequence")
+    if args.allow_partial and action != "run_chassis_sequence":
+        raise ValueError("--allow-partial requires --run-chassis-sequence")
+    if args.fail_on_skip and args.allow_partial:
+        raise ValueError("--fail-on-skip and --allow-partial are mutually exclusive")
     if args.result_file and action != "run_chassis_sequence":
         raise ValueError("--result-file requires --run-chassis-sequence")
     if args.skip_startup_home and action != "run_chassis_sequence":
@@ -426,6 +431,8 @@ def build_child_command(args, request_fd, response_fd):
         command += ["--max-targets", str(args.max_targets)]
     if args.fail_on_skip:
         command.append("--fail-on-skip")
+    if args.allow_partial:
+        command.append("--allow-partial")
     if args.result_file:
         command += ["--result-file", args.result_file]
     if args.align_only:
@@ -452,9 +459,9 @@ def build_child_command(args, request_fd, response_fd):
     if args.search_before_chassis:
         command.append("--search-before-chassis")
         command += ["--search-ready-file", args.search_ready_file]
+        command += ["--search-enable-file", args.search_enable_file]
         command += ["--search-trigger-file", args.search_trigger_file]
         command += ["--search-release-file", args.search_release_file]
-        command += ["--search-roi-ratio", args.search_roi_ratio]
         command += ["--search-stable-frames", str(args.search_stable_frames)]
         command += ["--search-poll-hz", str(args.search_poll_hz)]
     return command
@@ -551,11 +558,11 @@ def run_parent(args):
         if not args.run_chassis_sequence:
             raise RuntimeError(
                 "--search-before-chassis requires --run-chassis-sequence")
-        for path in (args.search_ready_file, args.search_trigger_file,
-                     args.search_release_file):
+        for path in (args.search_ready_file, args.search_enable_file,
+                     args.search_trigger_file, args.search_release_file):
             if not path:
                 raise RuntimeError(
-                    "search ready/trigger/release files are required")
+                    "search ready/enable/trigger/release files are required")
         if args.search_stable_frames <= 0 or args.search_poll_hz <= 0.0:
             raise RuntimeError(
                 "search stable frames and poll rate must be positive")

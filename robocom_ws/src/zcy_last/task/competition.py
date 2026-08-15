@@ -13,6 +13,7 @@ from geometry_msgs.msg import Twist
 
 from ..algorithms.building_delivery import (
     estimate_building_distance_mm,
+    limited_building_offset_mm,
     load_building_calibration,
     require_building_target,
 )
@@ -49,12 +50,22 @@ except ImportError as traffic_light_import_error:
         return 0, False, None
 
 
+def initial_competition_position(enable_tag_pick, start_untagged_aligned):
+    if start_untagged_aligned:
+        index = UNTAGGED_TRIGGER_INTERSECTION
+        return index, TASK_TURN_COMMANDS[index], "A_PICK_PREPARE"
+    index = 0
+    state = "B_PICK_PREPARE" if enable_tag_pick else "FOLLOW"
+    return index, TASK_TURN_COMMANDS[index], state
+
+
 class LaneFollower(object):
     def __init__(self, grasp_coordinator=None, process_supervisor=None,
                  enable_tag_pick=False, tag_pick_count=1,
                  enable_tag_delivery=False,
                  enable_untagged_pick=False, untagged_pick_count=1,
-                 enable_untagged_delivery=False):
+                 enable_untagged_delivery=False,
+                 start_untagged_aligned=False):
         rospy.init_node("line_cy_task", anonymous=True)
         self.grasp_coordinator = grasp_coordinator
         self.process_supervisor = process_supervisor
@@ -66,7 +77,12 @@ class LaneFollower(object):
         self.untagged_pick_count = int(untagged_pick_count)
         self.enable_untagged_delivery = bool(
             enable_untagged_delivery and enable_untagged_pick)
-        self.tag_pick_completed = not self.enable_tag_pick
+        self.start_untagged_aligned = bool(start_untagged_aligned)
+        if self.start_untagged_aligned and not self.enable_untagged_pick:
+            raise ValueError(
+                "start_untagged_aligned requires enable_untagged_pick")
+        self.tag_pick_completed = (
+            self.start_untagged_aligned or not self.enable_tag_pick)
         self.untagged_pick_completed = not self.enable_untagged_pick
         self.active_pick_kind = None
         self.tag_inventory = []
@@ -76,6 +92,8 @@ class LaneFollower(object):
         self.active_delivery_source = None
         self.active_delivery_id = None
         self.untagged_search_started = False
+        self.untagged_search_enabled = False
+        self.untagged_forward_started_at = None
         self.tag_pick_first_maneuver = False
         self.untagged_pick_next_maneuver = False
         self.pick_recover_hits = 0
@@ -123,8 +141,17 @@ class LaneFollower(object):
         self.tag_pick_first_turn_time = max(0.1, float(rospy.get_param(
             "~tag_pick_first_turn_time", TAG_PICK_FIRST_TURN_TIME
         )))
-        self.untagged_search_forward_speed = max(0.0, float(rospy.get_param(
-            "~untagged_search_forward_speed", UNTAGGED_SEARCH_FORWARD_SPEED
+        self.a_pick_third_right_entry_time = max(0.0, float(rospy.get_param(
+            "~a_pick_third_right_entry_time", A_PICK_THIRD_RIGHT_ENTRY_TIME
+        )))
+        self.a_pick_third_right_turn_time = max(0.1, float(rospy.get_param(
+            "~a_pick_third_right_turn_time", A_PICK_THIRD_RIGHT_TURN_TIME
+        )))
+        self.untagged_search_forward_time = max(0.0, float(rospy.get_param(
+            "~untagged_search_forward_time", UNTAGGED_SEARCH_FORWARD_TIME
+        )))
+        self.untagged_search_speed = max(0.0, float(rospy.get_param(
+            "~untagged_search_speed", UNTAGGED_SEARCH_SPEED
         )))
         self.untagged_pick_next_entry_time = max(0.0, float(rospy.get_param(
             "~untagged_pick_next_entry_time", UNTAGGED_PICK_NEXT_ENTRY_TIME
@@ -161,6 +188,12 @@ class LaneFollower(object):
         )))
         self.yolo_people_stable_frames = max(1, int(rospy.get_param(
             "~yolo_people_stable_frames", YOLO_PEOPLE_STABLE_FRAMES
+        )))
+        self.yolo_trash_stable_frames = max(1, int(rospy.get_param(
+            "~yolo_trash_stable_frames", YOLO_TRASH_STABLE_FRAMES
+        )))
+        self.yolo_building_stable_frames = max(1, int(rospy.get_param(
+            "~yolo_building_stable_frames", YOLO_BUILDING_STABLE_FRAMES
         )))
         self.yolo_confidence = clamp(float(rospy.get_param(
             "~yolo_confidence", YOLO_CONFIDENCE
@@ -199,8 +232,9 @@ class LaneFollower(object):
         self.yolo_event_ignore_time = max(0.0, float(rospy.get_param(
             "~yolo_event_ignore_time", YOLO_EVENT_IGNORE_TIME
         )))
-        self.task_index = 0
-        self.turn_cmd = TASK_TURN_COMMANDS[self.task_index]
+        self.task_index, self.turn_cmd, initial_state = \
+            initial_competition_position(
+                self.enable_tag_pick, self.start_untagged_aligned)
         rospy.loginfo(
             "line_cy_task route=%s entry=%.2f speed=%.2f angular=%.2f "
             "turn_time=%.2f final_exit=%.2f",
@@ -212,6 +246,13 @@ class LaneFollower(object):
             "line_cy_task intersection %d/%d command=%s",
             self.task_index + 1, len(TASK_TURN_COMMANDS), self.turn_cmd,
         )
+        if self.enable_untagged_pick:
+            rospy.loginfo(
+                "line_cy_task A点前第3右转专用时序："
+                "前进=%.2f秒 右转=%.2f秒",
+                self.a_pick_third_right_entry_time,
+                self.a_pick_third_right_turn_time,
+            )
         self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self.vision = BinaryVision()
         self.lanes = LaneDetector(
@@ -254,7 +295,7 @@ class LaneFollower(object):
         self.pid = PID(KP, KD, MAX_ANGULAR)
         self.lane_width = LANE_WIDTH_PIXELS if LANE_WIDTH_PIXELS > 0 else PROCESS_WIDTH * DEFAULT_LANE_WIDTH_RATIO
         self.bridge = DualLineBridge(self.lane_width, fill_width=FILL_WIDTH_PIXELS)
-        self.state = "B_PICK_PREPARE" if self.enable_tag_pick else "FOLLOW"
+        self.state = initial_state
         self.state_started = rospy.get_time()
         self.stop_hits = self.lost_hits = self.align_hits = 0
         self.wait_recover_hits = 0
@@ -277,8 +318,14 @@ class LaneFollower(object):
         self._prepare_yolo_save_dir()
         if self.enable_untagged_delivery:
             self._load_building_delivery_calibration()
-        if self.yolo_enabled and not self.enable_tag_pick:
+        if (self.yolo_enabled and not self.enable_tag_pick
+                and not self.start_untagged_aligned):
             self._init_yolo()
+        if self.start_untagged_aligned:
+            rospy.logwarn(
+                "line_cy_task 调试入口：假定第3个右转已完成且车身摆正，"
+                "从 A_PICK_PREPARE 开始；当前路口4/9 command=%s",
+                self.turn_cmd)
         rospy.on_shutdown(self.cleanup)
 
     def _normalize_ros_class_names(self, value, defaults):
@@ -408,13 +455,16 @@ class LaneFollower(object):
         rospy.loginfo(
             "line_cy_task YOLO %s模型加载和预热完成，"
             "enabled camera=%d backend=%s model=%s interval=%d imgsz=%d "
-            "people_stable=%d people_conf=%.2f trash_conf=%.2f "
+            "people_stable=%d trash_stable=%d building_stable=%d "
+            "people_conf=%.2f trash_conf=%.2f "
             "building_conf=%.2f nms=%.2f "
             "stop=%s debug=%s",
             self.yolo_active_profile,
             self.yolo_camera_index, self.yolo_detector.backend_name,
             self.yolo_detector.model_path, self.yolo_frame_interval,
             self.yolo_image_size, self.yolo_people_stable_frames,
+            self.yolo_trash_stable_frames,
+            self.yolo_building_stable_frames,
             self.yolo_confidence,
             self.yolo_trash_confidence, self.yolo_building_confidence,
             self.yolo_nms_threshold,
@@ -579,6 +629,12 @@ class LaneFollower(object):
                 and self.task_index == 0 and self.turn_cmd == "right"):
             entry_time = self.tag_pick_first_entry_time
             turn_time = self.tag_pick_first_turn_time
+        elif (self.task_index + 1 == UNTAGGED_TRIGGER_INTERSECTION
+              and self.turn_cmd == "right"
+              and getattr(self, "enable_untagged_pick", False)
+              and not getattr(self, "untagged_pick_completed", True)):
+            entry_time = self.a_pick_third_right_entry_time
+            turn_time = self.a_pick_third_right_turn_time
         elif (getattr(self, "untagged_pick_next_maneuver", False)
               and self.task_index == UNTAGGED_TRIGGER_INTERSECTION
               and self.turn_cmd == "left"):
@@ -794,6 +850,7 @@ class LaneFollower(object):
         try:
             self.active_pick_kind = "untagged"
             self.untagged_search_started = True
+            self.untagged_forward_started_at = None
             self.grasp_coordinator.start_untagged_search(
                 self.untagged_pick_count)
             rospy.loginfo("line_cy_task 正在加载 A 点无 Tag 搜索模型")
@@ -805,6 +862,35 @@ class LaneFollower(object):
         if success is not None:
             self._pick_failed(error or "A 点搜索进程提前退出")
             return
+        if not self.untagged_search_enabled:
+            forward_time = max(0.0, float(getattr(
+                self, "untagged_search_forward_time",
+                UNTAGGED_SEARCH_FORWARD_TIME,
+            )))
+            # 这段要求的是现实世界中完整的直行秒数，不能使用可能受
+            # /use_sim_time 或 ROS 时钟跳变影响的 rospy.get_time()。
+            now = time.monotonic()
+            if self.untagged_forward_started_at is None:
+                self.untagged_forward_started_at = now
+                rospy.loginfo(
+                    "line_cy_task A 点开始普通速度直行，"
+                    "按单调时钟计满 %.2f 秒",
+                    forward_time,
+                )
+            elapsed = now - self.untagged_forward_started_at
+            if elapsed < forward_time:
+                self.publish(FOLLOW_SPEED, 0.0)
+                return
+            try:
+                self.grasp_coordinator.enable_untagged_search()
+                self.untagged_search_enabled = True
+            except Exception as exc:
+                self._pick_failed("无法启动 A 点低速搜索：%s" % exc)
+                return
+            rospy.loginfo(
+                "line_cy_task A 点直行完成：要求 %.2f 秒，实际 %.2f 秒；"
+                "切换低速 %.2f 边走边搜索",
+                forward_time, elapsed, self.untagged_search_speed)
         if self.grasp_coordinator.untagged_search_triggered():
             self.publish(0, 0, force=True)
             self.velocity_owner = "grasp"
@@ -818,22 +904,10 @@ class LaneFollower(object):
                 "line_cy_task A 点右侧稳定检测到无 Tag 物块，"
                 "停车并切换到慢速对准抓取")
             return
-
-        entry_candidate = (
-            entry_acceptance_enabled(
-                rospy.get_time(), getattr(self, "entry_accept_after", 0.0))
-            and cross.candidate
-            and len(cross.stripe_polygons) >= ENTRY_MIN_STRIPES
-        )
-        self.stop_hits = follow_entry_hits(entry_candidate, self.stop_hits)
-        if self.stop_hits >= STOP_STABLE_FRAMES:
-            self._pick_failed(
-                "已到达第四个路口入口，"
-                "但 A 点无 Tag 物块未触发抓取")
-        else:
-            # 第 3 个路口的出口已经摆正。A 点搜索阶段不再根据车道线
-            # 修正方向，只保持零角速度直行，直到搜索子进程触发交接。
-            self.publish(self.untagged_search_forward_speed, 0.0)
+        # 第 3 个路口的出口已经摆正。A 点搜索阶段不再根据车道线或
+        # 第 4 个路口横条停车，只保持零角速度直行，直到搜索子进程
+        # 确认足够数量的物块并触发底盘交接。
+        self.publish(self.untagged_search_speed, 0.0)
 
     def _finish_pick(self, kind):
         self.velocity_owner = "line"
@@ -846,15 +920,22 @@ class LaneFollower(object):
         except Exception as exc:
             self._pick_failed("无法读取%s抓取库存：%s" % (label, exc))
             return
-        if len(completed_ids) != expected_count:
+        count_valid = len(completed_ids) <= expected_count
+        if not count_valid:
             self._pick_failed(
-                "%s抓取库存数量异常：期望 %d，实际 %s"
+                "%s抓取库存数量异常：最多 %d，实际 %s"
                 % (label, expected_count, completed_ids))
             return
         if kind == "tag":
             self.tag_inventory = list(completed_ids)
             self.tag_pick_completed = True
             profile = "street"
+            if len(completed_ids) < expected_count:
+                rospy.logwarn(
+                    "line_cy_task 有 Tag 抓取部分完成：成功 %d/%d 个；"
+                    "按实际库存继续比赛",
+                    len(completed_ids), expected_count,
+                )
             rospy.loginfo(
                 "line_cy_task 有 Tag 物资已入仓，库存 ID=%s",
                 self.tag_inventory,
@@ -863,6 +944,12 @@ class LaneFollower(object):
             self.untagged_inventory = list(completed_ids)
             self.untagged_pick_completed = True
             profile = "building"
+            if len(completed_ids) < expected_count:
+                rospy.logwarn(
+                    "line_cy_task 无 Tag 抓取部分完成：成功 %d/%d 个；"
+                    "按实际库存继续比赛",
+                    len(completed_ids), expected_count,
+                )
             rospy.loginfo(
                 "line_cy_task 无 Tag 物资已入仓，库存 ID=%s",
                 self.untagged_inventory,
@@ -945,12 +1032,20 @@ class LaneFollower(object):
                 _center_ratio, distance_mm = estimate_building_distance_mm(
                     event.detection, entry, event.detection.frame_shape)
                 reference_mm = float(entry["reference_distance_mm"])
-                distance_offset_m = (distance_mm - reference_mm) * 0.001
+                raw_offset_mm, limited_offset_mm = limited_building_offset_mm(
+                    distance_mm, reference_mm,
+                    BUILDING_DELIVERY_OFFSET_MIN_MM,
+                    BUILDING_DELIVERY_OFFSET_MAX_MM,
+                )
+                distance_offset_m = limited_offset_mm * 0.001
                 rospy.loginfo(
                     "line_cy_task 无 Tag ID%d 停车估距 %.1fmm，"
-                    "示教参考 %.1fmm，机械臂P修正 %+.1fmm",
+                    "示教参考 %.1fmm，原始P修正 %+.1fmm，"
+                    "限幅后 %+.1fmm（范围 %+.1f~%+.1fmm）",
                     item_id, distance_mm, reference_mm,
-                    distance_offset_m * 1000.0,
+                    raw_offset_mm, limited_offset_mm,
+                    BUILDING_DELIVERY_OFFSET_MIN_MM,
+                    BUILDING_DELIVERY_OFFSET_MAX_MM,
                 )
             except Exception as exc:
                 failed_ids.add(item_id)
@@ -1037,23 +1132,38 @@ class LaneFollower(object):
                 self._start_pick("tag", self.tag_pick_count, "B_PICKING")
             return
         if self.state == "A_PICK_PREPARE":
+            # 出口摆正后先保持停车，等 Astra、模型和搜索子进程全部
+            # ready。只有 ready 后才启用检测并按默认循迹速度直行。
             self.publish(0, 0, force=True)
-            if (not self.untagged_search_started
-                    and now - self.state_started >= GRASP_SETTLE_TIME):
+            if not self.untagged_search_started:
                 self._start_untagged_search()
             if self.state != "A_PICK_PREPARE":
+                return
+            # 搜索尚未启动时不能读取协调器里的旧任务结果，否则 B 点
+            # 抓取的完成状态会被误判成 A 点搜索进程提前退出。
+            if not self.untagged_search_started:
                 return
             success, error = self.grasp_coordinator.poll()
             if success is not None:
                 self._pick_failed(error or "A 点搜索进程提前退出")
-            elif (self.untagged_search_started
-                  and self.grasp_coordinator.untagged_search_ready()):
+            elif self.grasp_coordinator.untagged_search_ready():
                 self.velocity_owner = "line"
                 self.stop_hits = 0
                 self._set_state("A_PICK_SEARCH")
                 rospy.loginfo(
-                    "line_cy_task A 点无 Tag 模型已就绪，"
-                    "按固定方向直行并监测画面右侧物块")
+                    "line_cy_task A 点模型和识别窗口全部就绪，"
+                    "先按默认速度 %.2f 直行 %.2f 秒，"
+                    "再以 %.2f 低速搜索",
+                    FOLLOW_SPEED,
+                    getattr(self, "untagged_search_forward_time",
+                            UNTAGGED_SEARCH_FORWARD_TIME),
+                    getattr(self, "untagged_search_speed",
+                            UNTAGGED_SEARCH_SPEED))
+            return
+        if self.state == "A_PICK_SEARCH":
+            # 已完成第三个路口摆正，搜索阶段不需要循迹图像。独立按
+            # 20Hz 刷新速度，确保底盘真正收到完整的快速直行时长。
+            self._handle_untagged_search(None, None, None)
             return
         if self.state in ("B_PICKING", "A_PICKING"):
             success, error = self.grasp_coordinator.poll()
@@ -1093,6 +1203,15 @@ class LaneFollower(object):
         self.lost_hits = self.align_hits = 0
         self.align_lock = None
         self.align_last_angle = None
+        if state == "EXIT_ALIGN":
+            tolerance_deg, align_kp, min_angular, max_angular = \
+                self._exit_alignment_parameters()
+            if tolerance_deg == A_PICK_EXIT_ALIGN_TOLERANCE_DEG:
+                rospy.loginfo(
+                    "line_cy_task 第3路口 A 点专用出口精调："
+                    "容差=%.1f度 kp=%.3f angular=%.2f~%.2f",
+                    tolerance_deg, align_kp, min_angular, max_angular,
+                )
         if (state == "FOLLOW"
                 and previous_state in ("EXIT_ALIGN", "MANEUVER",
                                        "PICK_RECOVER")):
@@ -1157,10 +1276,11 @@ class LaneFollower(object):
             self.publish(0, 0, force=True)
             self._shutdown_yolo()
             self.untagged_search_started = False
+            self.untagged_search_enabled = False
             self._set_state("A_PICK_PREPARE")
             rospy.loginfo(
                 "line_cy_task 已完成第 %d 个路口，"
-                "准备 A 点无 Tag 搜索",
+                "停车加载 A 点抓取模型，全部就绪后再直行搜索",
                 completed,
             )
             return
@@ -1169,6 +1289,27 @@ class LaneFollower(object):
         rospy.loginfo(
             "line_cy_task intersection %d/%d command=%s",
             self.task_index + 1, len(TASK_TURN_COMMANDS), self.turn_cmd,
+        )
+
+    def _exit_alignment_parameters(self):
+        third_right_before_a_pick = (
+            self.task_index + 1 == UNTAGGED_TRIGGER_INTERSECTION
+            and self.turn_cmd == "right"
+            and self.enable_untagged_pick
+            and not self.untagged_pick_completed
+        )
+        if third_right_before_a_pick:
+            return (
+                A_PICK_EXIT_ALIGN_TOLERANCE_DEG,
+                A_PICK_EXIT_ALIGN_KP,
+                A_PICK_EXIT_ALIGN_MIN_ANGULAR,
+                A_PICK_EXIT_ALIGN_MAX_ANGULAR,
+            )
+        return (
+            ALIGN_TOLERANCE_DEG,
+            ALIGN_KP,
+            ALIGN_MIN_ANGULAR,
+            ALIGN_MAX_ANGULAR,
         )
 
     def _update_lane_width(self, observation, frame_width):
@@ -1356,6 +1497,10 @@ class LaneFollower(object):
             getattr(self, "yolo_people_stable_frames",
                     YOLO_PEOPLE_STABLE_FRAMES),
             getattr(self, "yolo_trash_confidence", YOLO_TRASH_CONFIDENCE),
+            getattr(self, "yolo_trash_stable_frames",
+                    YOLO_TRASH_STABLE_FRAMES),
+            getattr(self, "yolo_building_stable_frames",
+                    YOLO_BUILDING_STABLE_FRAMES),
         )
 
     def _maybe_enter_yolo_stop(self, observation):
@@ -1540,20 +1685,22 @@ class LaneFollower(object):
             self._handle_traffic_light_wait(now)
 
         elif self.state == "EXIT_ALIGN":
+            tolerance_deg, align_kp, min_angular, max_angular = \
+                self._exit_alignment_parameters()
             angle = cross.stop_angle if cross.candidate else cross.tracking_angle
             visible = angle is not None
             if angle is None:
                 self.lost_hits += 1
                 self.publish(0, 0)
-            elif abs(angle) <= ALIGN_TOLERANCE_DEG:
+            elif abs(angle) <= tolerance_deg:
                 self.lost_hits = 0
                 self.align_hits += 1
                 self.publish(0, 0)
             else:
                 self.lost_hits = 0
                 self.align_hits = 0
-                magnitude = clamp(abs(angle) * ALIGN_KP,
-                                  ALIGN_MIN_ANGULAR, ALIGN_MAX_ANGULAR)
+                magnitude = clamp(abs(angle) * align_kp,
+                                  min_angular, max_angular)
                 self.publish(0, -magnitude if angle > 0 else magnitude)
             next_state = exit_alignment_next_state(
                 self.align_hits, self.lost_hits, now - self.state_started
@@ -1796,7 +1943,7 @@ class LaneFollower(object):
                             "托管进程 %s 异常退出，状态码 %s" % failed)
                 if self.state in (
                         "B_PICK_PREPARE", "B_PICKING",
-                        "A_PICK_PREPARE", "A_PICKING", "DELIVERING",
+                        "A_PICK_PREPARE", "A_PICK_SEARCH", "A_PICKING", "DELIVERING",
                         "PICK_FAILED"):
                     self._handle_pick_without_frame(rospy.get_time())
                     rate.sleep()

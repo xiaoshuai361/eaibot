@@ -66,10 +66,15 @@ cd /home/eaibot/handeye-calib/src
 先确认窗口显示 `ID1~ID4`，且检测框覆盖整个物块：
 
 ```bash
+source /opt/ros/melodic/setup.bash
+source /home/eaibot/mirobot_ws/devel/setup.bash
+source /home/eaibot/handeye-calib/devel/setup.bash
+conda activate ww
+cd /home/eaibot/handeye-calib/src
 python3 block_pick_main.py \
   --live-preview \
   --preview-hz 1.0 \
-  --confidence 0.5 \
+  --confidence 0.3 \
   --config /home/eaibot/handeye-calib/src/config/tag_yolo_grasp.yaml
 ```
 
@@ -157,7 +162,7 @@ cat /tmp/tag_yolo_pick_result.json
 四类全部成功时结果为：
 
 ```json
-{"completed_ids": [1, 2, 3, 4]}
+{ "completed_ids": [1, 2, 3, 4] }
 ```
 
 测试本流程时不要同时运行旧 AprilTag 检测/抓取程序，也不要从正式比赛
