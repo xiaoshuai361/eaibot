@@ -519,6 +519,24 @@ def test_wait_until_reports_owned_process_exit_and_log_tail(tmp_path, capsys):
     assert "calibration file missing" in capsys.readouterr().out
 
 
+def test_owned_process_check_accepts_successful_delivery_exit_only(tmp_path):
+    supervisor = processes.ProcessSupervisor(
+        enabled=True, log_root=str(tmp_path))
+    delivery = types.SimpleNamespace(process=types.SimpleNamespace(
+        poll=lambda: 0))
+    supervisor.processes["delivery"] = delivery
+
+    assert supervisor.check_owned_processes() == []
+
+    delivery.process.poll = lambda: 4
+    assert supervisor.check_owned_processes() == [("delivery", 4)]
+
+    supervisor.processes = {
+        "base": types.SimpleNamespace(
+            process=types.SimpleNamespace(poll=lambda: 0))}
+    assert supervisor.check_owned_processes() == [("base", 0)]
+
+
 def test_arm_common_reuses_prestarted_external_stack(monkeypatch, tmp_path):
     supervisor = processes.ProcessSupervisor(
         enabled=True, log_root=str(tmp_path))

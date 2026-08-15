@@ -533,6 +533,8 @@ class ProcessSupervisor(object):
             if name.startswith("pick_"):
                 continue
             code = item.process.poll()
+            if name == "delivery" and code == 0:
+                continue
             if code is not None:
                 failed.append((name, code))
         return failed
