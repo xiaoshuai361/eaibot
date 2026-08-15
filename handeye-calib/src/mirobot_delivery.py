@@ -58,6 +58,22 @@ def delivery_status(item_id, message):
     sys.stdout.flush()
 
 
+def mark_release_ready(path, item_id):
+    """通知底盘可恢复；调用方负责完成关泵后的等待。"""
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    temporary = '%s.tmp.%d' % (path, os.getpid())
+    with open(temporary, 'w') as handle:
+        handle.write('ID%d pump_off\n' % int(item_id))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.rename(temporary, path)
+    delivery_status(item_id, '已关泵，底盘可恢复循迹；机械臂后台回idle')
+
+
 def parse_sequence(text):
     if not isinstance(text, STRING_TYPES) or not text.strip():
         raise RuntimeError('--sequence 必须是逗号分隔的正整数 ID。')
@@ -116,6 +132,9 @@ def parse_args(argv):
     parser.add_argument('--motion-settle-seconds', type=float, default=0.25)
     parser.add_argument('--pump-on-settle-seconds', type=float, default=1.0)
     parser.add_argument('--pump-off-settle-seconds', type=float, default=0.7)
+    parser.add_argument(
+        '--release-ready-file', default=None,
+        help='关泵并等待 --pump-off-settle-seconds 后写入，用于提前恢复循迹。')
     parser.add_argument('--contact-release', action='store_true')
     parser.add_argument(
         '--force-release-on-contact-miss', action='store_true')
@@ -548,6 +567,8 @@ def run_delivery(args, arm, pump_proxy):
             arm_api.set_pump(pump_proxy, False)
             holding_object = False
             rospy.sleep(args.pump_off_settle_seconds)
+            mark_release_ready(
+                getattr(args, 'release_ready_file', None), item_id)
             delivery_status(item_id, '物资已释放，正在回退并归位')
             if contact_release:
                 arm_api.execute_cartesian_pose(

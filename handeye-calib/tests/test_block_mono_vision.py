@@ -36,8 +36,8 @@ def test_default_config_is_loaded_from_the_canonical_yaml():
         assert DEFAULT_CONFIG == yaml.safe_load(stream)
 
 
-def test_default_grasp_uses_same_five_stable_samples_as_tag_workflow():
-    assert DEFAULT_CONFIG["frames_required"] == 5
+def test_default_grasp_uses_three_stable_samples():
+    assert DEFAULT_CONFIG["frames_required"] == 3
     assert DEFAULT_CONFIG["max_axis_distance_disagreement_mm"] == 0.0
 
 

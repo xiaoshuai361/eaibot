@@ -40,6 +40,17 @@ def test_delivery_status_emits_machine_readable_stage(capsys):
         "DELIVERY_STATUS ID4 前往固定投递位姿\n"
 
 
+def test_release_ready_marker_is_written_after_callers_release_delay(
+        tmp_path, capsys):
+    mark_release_ready, = load_symbols("mark_release_ready")
+    path = tmp_path / "release.ready"
+
+    mark_release_ready(str(path), 3)
+
+    assert path.read_text(encoding="utf-8") == "ID3 pump_off\n"
+    assert "ID3 已关泵，底盘可恢复循迹" in capsys.readouterr().out
+
+
 def make_item(seed):
     return {
         "cargo_pick_joint_values": [seed + value for value in range(6)],
@@ -95,6 +106,7 @@ def test_parse_args_defaults_to_three_point_delivery_workflow():
     assert args.camera_frame == "camera_rgb_optical_frame"
     assert args.velocity_scale == pytest.approx(0.2)
     assert args.acceleration_scale == pytest.approx(0.2)
+    assert args.release_ready_file is None
 
 
 def test_vertical_offset_moves_only_base_z_by_five_centimeters():
@@ -341,11 +353,14 @@ def test_run_delivery_skips_home_then_runs_three_points_and_idle(tmp_path):
             loginfo=lambda *items: None,
             logwarn=lambda *items: None,
             logerr=lambda *items: None),
+        "mark_release_ready": lambda path, item_id: events.append(
+            ("release_ready", path, item_id)),
     })
     args = SimpleNamespace(
         delivery_file=str(delivery_path),
         tag_preset_file=str(tag_path), sequence=[1], dry_run=False,
-        pump_on_settle_seconds=1.0, pump_off_settle_seconds=0.7)
+        pump_on_settle_seconds=1.0, pump_off_settle_seconds=0.7,
+        release_ready_file="/tmp/release.ready")
 
     run_delivery(args, object(), object())
 
@@ -362,6 +377,7 @@ def test_run_delivery_skips_home_then_runs_three_points_and_idle(tmp_path):
         ("joint", "delivery_1_release"),
         ("pump", False),
         ("sleep", 0.7),
+        ("release_ready", "/tmp/release.ready"),
         ("joint", "idle"),
     ]
 

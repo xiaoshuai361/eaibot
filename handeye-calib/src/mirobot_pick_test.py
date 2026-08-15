@@ -1109,6 +1109,12 @@ def target_number(config, target):
         raise RuntimeError("Target %s has no valid target_id." % target)
 
 
+def untagged_status(config, target, message):
+    print_utf8(u"UNTAGGED_STATUS ID%d %s" % (
+        target_number(config, target), safe_log_text(message)))
+    sys.stdout.flush()
+
+
 def write_chassis_sequence_result(path, completed_ids):
     """原子记录无 Tag 连续抓取实际完成的物资 ID。"""
     if not path:
@@ -1583,15 +1589,23 @@ def run_block_chassis_sequence(args, config, detector):
                 "visible window keeps all remaining targets.",
                 completed + 1, total,
                 target_number(config, target), ascii_log_text(target))
+            untagged_status(
+                config, target, u"当前目标，开始底盘对准")
             try:
                 align_sequence_target(
                     args, config, detector, target, publisher, settings,
                     visible_targets=remaining_targets)
                 stop_chassis(publisher)
                 if not args.align_only:
+                    untagged_status(
+                        config, target,
+                        u"停稳对准完成，开始采集%d帧稳定定位" %
+                        int(args.frames or config["frames_required"]))
                     args.block_target = target
                     localization = compute_block_localization(
                         args, config, detector)
+                    untagged_status(
+                        config, target, u"定位完成，开始机械臂抓取")
                     do_run_taught_block_mono(
                         args, config, localization, "run_taught_block",
                         pre_pick_transit)
@@ -1601,6 +1615,8 @@ def run_block_chassis_sequence(args, config, detector):
                     "skipping it and continuing with the remaining targets: %s.",
                     target_number(config, target), ascii_log_text(target),
                     ascii_log_text(exc))
+                untagged_status(
+                    config, target, u"限位未触发，已安全跳过")
                 remaining_targets.remove(target)
                 continue
             except Exception as exc:
@@ -1611,8 +1627,12 @@ def run_block_chassis_sequence(args, config, detector):
                     "Target %d=%s failed; skipping it and continuing: %s.",
                     target_number(config, target), ascii_log_text(target),
                     ascii_log_text(exc))
+                untagged_status(
+                    config, target,
+                    u"抓取失败，已跳过：%s" % safe_log_text(exc))
                 remaining_targets.remove(target)
                 continue
+            untagged_status(config, target, u"抓取完成")
             remaining_targets.remove(target)
             completed += 1
             completed_ids.append(target_number(config, target))
@@ -2388,9 +2408,12 @@ def do_run_taught_block_mono(args, config, localization, action,
     holding_object = False
     try:
         set_pump(pump_proxy, False)
+        untagged_status(config, target, u"前往A/B共用抓取前中转点")
         execute_joint_values(
             arm, pre_pick_transit_joint_values, "block_pre_pick_transit")
+        untagged_status(config, target, u"前往P后方40mm安全点")
         execute_pose(arm, approach_staging_pose, "block_approach_staging")
+        untagged_status(config, target, u"限位已开启，开始受保护前探")
         if not run_contact_approach(
                 arm, taught_pre_grasp_pose, pickup_model,
                 localization["base_frame"], probe_settings,
@@ -2407,11 +2430,13 @@ def do_run_taught_block_mono(args, config, localization, action,
             raise ContactProbeMiss(target)
         set_pump(pump_proxy, True)
         holding_object = True
+        untagged_status(config, target, u"限位已触发，吸泵开启")
         rospy.sleep(0.8)
         rospy.loginfo(
             "Contact secured; retreating straight %.0fmm past pre-grasp before carry planning.",
             probe_settings["retreat_extra_mm"])
         execute_cartesian_pose(arm, retreat_pose, "taught_block_retreat")
+        untagged_status(config, target, u"已退回P后方40mm，开始搬运入仓")
         execute_joint_values(arm, carry_joint_values, "block_carry")
         execute_pose(arm, pre_place_pose, "taught_block_pre_place")
         execute_cartesian_pose(

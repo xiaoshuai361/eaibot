@@ -393,7 +393,19 @@ class ProcessSupervisor(object):
             return None
         return line.split(marker, 1)[1].strip()
 
-    def _run_tag_job_with_status(self, name, command, log_handle):
+    @staticmethod
+    def _untagged_status_from_output(raw_line):
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = str(raw_line)
+        marker = "UNTAGGED_STATUS "
+        if marker not in line:
+            return None
+        return line.split(marker, 1)[1].strip()
+
+    def _run_pick_job_with_status(self, name, command, log_handle,
+                                  status_parser, display_name):
         process = subprocess.Popen(
             list(command), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=True)
@@ -404,9 +416,9 @@ class ProcessSupervisor(object):
                 raw_line = process.stdout.readline()
                 if raw_line:
                     log_handle.write(raw_line)
-                    status = self._tag_status_from_output(raw_line)
+                    status = status_parser(raw_line)
                     if status:
-                        self._info("Tag抓取：%s" % status)
+                        self._info("%s：%s" % (display_name, status))
                     continue
                 if process.poll() is not None:
                     break
@@ -511,8 +523,13 @@ class ProcessSupervisor(object):
         log_path = os.path.join(self.log_dir, "%s.log" % name)
         log_handle = open(log_path, "ab", buffering=0)
         if name == "pick_tag":
-            return self._run_tag_job_with_status(
-                name, command, log_handle)
+            return self._run_pick_job_with_status(
+                name, command, log_handle,
+                self._tag_status_from_output, "Tag抓取")
+        if name == "pick_untagged":
+            return self._run_pick_job_with_status(
+                name, command, log_handle,
+                self._untagged_status_from_output, "无Tag抓取")
         if name == "delivery":
             return self._run_delivery_job_with_status(
                 name, command, log_handle)

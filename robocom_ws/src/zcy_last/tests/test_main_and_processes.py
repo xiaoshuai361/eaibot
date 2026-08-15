@@ -89,6 +89,15 @@ def test_tag_status_filter_only_returns_explicit_concise_markers():
     ) is None
 
 
+def test_untagged_status_filter_only_returns_explicit_concise_markers():
+    assert processes.ProcessSupervisor._untagged_status_from_output(
+        "UNTAGGED_STATUS ID4 定位完成，开始机械臂抓取\n"
+    ) == "ID4 定位完成，开始机械臂抓取"
+    assert processes.ProcessSupervisor._untagged_status_from_output(
+        "[INFO] MoveIt planning details\n"
+    ) is None
+
+
 def test_delivery_status_filter_only_returns_explicit_stage_markers():
     assert processes.ProcessSupervisor._delivery_status_from_output(
         "DELIVERY_STATUS ID4 前往固定投递位姿\n"

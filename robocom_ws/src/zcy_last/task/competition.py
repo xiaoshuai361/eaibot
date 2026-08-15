@@ -91,6 +91,7 @@ class LaneFollower(object):
         self.untagged_delivery_failed_ids = set()
         self.active_delivery_source = None
         self.active_delivery_id = None
+        self.delivery_arm_wait_reported = False
         self.untagged_search_started = False
         self.untagged_search_enabled = False
         self.untagged_forward_started_at = None
@@ -1016,6 +1017,16 @@ class LaneFollower(object):
         if (item_id is None or item_id not in inventory
                 or item_id in failed_ids):
             return False
+        arm_job_active = getattr(
+            self.grasp_coordinator, "arm_job_active", None)
+        if callable(arm_job_active) and arm_job_active():
+            if not getattr(self, "delivery_arm_wait_reported", False):
+                rospy.loginfo(
+                    "line_cy_task 上一次投递已关泵但机械臂仍在回idle；"
+                    "当前目标处等待归位后再开始下一次投递"
+                )
+                self.delivery_arm_wait_reported = True
+            return None
         if self.grasp_coordinator is None:
             failed_ids.add(item_id)
             rospy.logwarn(
@@ -1064,6 +1075,7 @@ class LaneFollower(object):
             self.velocity_owner = "grasp"
             self.active_delivery_source = source
             self.active_delivery_id = item_id
+            self.delivery_arm_wait_reported = False
             if source == "untagged":
                 self.grasp_coordinator.start_delivery(
                     source, [item_id], distance_offset_m)
@@ -1113,7 +1125,12 @@ class LaneFollower(object):
                 source == "tag" and not inventory
                 and not self.enable_untagged_pick
             )
-            if arm_no_longer_needed and self.process_supervisor is not None:
+            arm_job_active = getattr(
+                self.grasp_coordinator, "arm_job_active", None)
+            arm_still_returning = (
+                callable(arm_job_active) and arm_job_active())
+            if (arm_no_longer_needed and not arm_still_returning
+                    and self.process_supervisor is not None):
                 self.process_supervisor.stop_arm_common()
         else:
             failed_ids.add(item_id)
@@ -1523,6 +1540,7 @@ class LaneFollower(object):
         self.yolo_stop_event = event
         self.yolo_stop_reported = False
         self.yolo_stop_report_seq = self._latest_yolo_seq()
+        self.delivery_arm_wait_reported = False
         self._set_state("YOLO_STOP")
         self.publish(0, 0)
         return True

@@ -53,6 +53,9 @@ class GraspCoordinator(object):
             result_directory, "untagged_search_trigger_%d" % os.getpid())
         self.untagged_search_release_file = os.path.join(
             result_directory, "untagged_search_release_%d" % os.getpid())
+        self.delivery_release_ready_file = os.path.join(
+            result_directory, "delivery_release_ready_%d" % os.getpid())
+        self.delivery_source = None
 
     @staticmethod
     def _sequence_text():
@@ -99,8 +102,15 @@ class GraspCoordinator(object):
             "--cargo-pick-file", TAG_DELIVERY_PRESET_FILE,
             "--tag-preset-file", idle_preset_file,
         ]
+        if source == "tag":
+            command.extend([
+                "--release-ready-file", self.delivery_release_ready_file,
+                "--pump-off-settle-seconds", "0.0",
+            ])
         if source == "untagged":
             command.extend([
+                "--release-ready-file", self.delivery_release_ready_file,
+                "--pump-off-settle-seconds", "1.0",
                 "--contact-release",
                 "--force-release-on-contact-miss",
                 "--contact-staging-gap", "0.030",
@@ -228,6 +238,8 @@ class GraspCoordinator(object):
             elif kind == "delivery":
                 source, item_ids, contact_distance_offset_m = payload
                 result_items = [int(item_id) for item_id in item_ids]
+                with self.lock:
+                    self.result_items = list(result_items)
                 command = self._delivery_command(
                     source, result_items, contact_distance_offset_m)
             else:
@@ -318,7 +330,9 @@ class GraspCoordinator(object):
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("已有机械臂流程正在运行")
+            self._remove_files((self.delivery_release_ready_file,))
             self.kind = "delivery"
+            self.delivery_source = source
             self.result = None
             self.result_items = []
             self.error = None
@@ -331,9 +345,18 @@ class GraspCoordinator(object):
 
     def poll(self):
         with self.lock:
+            if (self.kind == "delivery"
+                    and self.delivery_source in ("tag", "untagged")
+                    and self.result is None
+                    and os.path.isfile(self.delivery_release_ready_file)):
+                return True, None
             if self.result is None:
                 return None, None
             return bool(self.result), self.error
+
+    def arm_job_active(self):
+        with self.lock:
+            return self.thread is not None and self.thread.is_alive()
 
     def completed_items(self):
         with self.lock:

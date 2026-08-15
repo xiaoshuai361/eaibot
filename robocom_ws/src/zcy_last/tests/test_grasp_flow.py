@@ -4,8 +4,11 @@
 import json
 import os
 import sys
+import threading
 import time
 import types
+
+import pytest
 
 
 class _Vector(object):
@@ -218,6 +221,47 @@ def test_delivery_directly_runs_preset_without_dependency_recheck():
     assert supervisor.command[2].endswith("/src/mirobot_delivery.py")
     assert supervisor.command[
         supervisor.command.index("--sequence") + 1] == "2"
+    assert "--release-ready-file" in supervisor.command
+    assert supervisor.command[
+        supervisor.command.index("--pump-off-settle-seconds") + 1] == "0.0"
+
+
+@pytest.mark.parametrize("source", ["tag", "untagged"])
+def test_delivery_reports_success_after_release_delay_while_arm_returns_idle(
+        tmp_path, source):
+    class BlockingSupervisor(FakeSupervisor):
+        def __init__(self):
+            super(BlockingSupervisor, self).__init__()
+            self.log_dir = str(tmp_path)
+            self.started = threading.Event()
+            self.finish = threading.Event()
+
+        def run_job(self, name, command):
+            self.calls.append(name)
+            self.command = list(command)
+            self.started.set()
+            assert self.finish.wait(1.0)
+            return 0
+
+    supervisor = BlockingSupervisor()
+    coordinator = GraspCoordinator(supervisor, python3="/env/python3")
+    coordinator.start_delivery(source, [2])
+    assert supervisor.started.wait(1.0)
+    marker = supervisor.command[
+        supervisor.command.index("--release-ready-file") + 1]
+
+    with open(marker, "w") as handle:
+        handle.write("ID2 pump_off\n")
+
+    result, error = coordinator.poll()
+    assert result is True
+    assert error is None
+    assert coordinator.completed_items() == [2]
+    assert coordinator.arm_job_active() is True
+
+    supervisor.finish.set()
+    coordinator.join(1.0)
+    assert coordinator.arm_job_active() is False
 
 
 def test_tag_pick_can_request_all_four_targets_in_left_to_right_order():
@@ -375,6 +419,9 @@ def test_untagged_delivery_uses_its_own_motion_presets():
     assert supervisor.command[
         supervisor.command.index("--tag-preset-file") + 1].endswith(
             "/block_mono_pick_place_presets.json")
+    assert "--release-ready-file" in supervisor.command
+    assert supervisor.command[
+        supervisor.command.index("--pump-off-settle-seconds") + 1] == "1.0"
     assert "--contact-release" in supervisor.command
     assert "--force-release-on-contact-miss" in supervisor.command
     assert supervisor.command[
@@ -1044,6 +1091,62 @@ def test_street_event_delivers_only_matching_tag_inventory():
     assert follower.grasp_coordinator.calls == [
         ("delivery", "tag", [3], 0.0)]
     assert follower.states == ["DELIVERING"]
+
+
+def test_next_delivery_waits_when_previous_arm_is_still_returning_idle():
+    class BusyCoordinator(FakeCoordinator):
+        @staticmethod
+        def arm_job_active():
+            return True
+
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.enable_tag_delivery = True
+    follower.enable_untagged_delivery = False
+    follower.tag_inventory = [3]
+    follower.untagged_inventory = []
+    follower.tag_delivery_failed_ids = set()
+    follower.untagged_delivery_failed_ids = set()
+    follower.grasp_coordinator = BusyCoordinator()
+    follower.delivery_arm_wait_reported = False
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._set_state = follower.states.append
+    event = types.SimpleNamespace(
+        kind="street", area="C区", class_name="Recyclable waste",
+        display_name="可回收垃圾")
+
+    assert follower._start_delivery_for_event(event) is None
+    assert follower.delivery_arm_wait_reported is True
+    assert follower.grasp_coordinator.calls == []
+    assert follower.states == []
+    assert follower.tag_delivery_failed_ids == set()
+
+
+def test_early_delivery_success_keeps_background_arm_return_running():
+    class BusyCoordinator(FakeCoordinator):
+        @staticmethod
+        def arm_job_active():
+            return True
+
+    follower = LaneFollower.__new__(LaneFollower)
+    follower.enable_untagged_pick = True
+    follower.tag_inventory = []
+    follower.untagged_inventory = [4]
+    follower.tag_delivery_failed_ids = set()
+    follower.untagged_delivery_failed_ids = set()
+    follower.active_delivery_source = "untagged"
+    follower.active_delivery_id = 4
+    follower.grasp_coordinator = BusyCoordinator()
+    follower.process_supervisor = FakeSupervisor()
+    follower.states = []
+    follower.publish = lambda *args, **kwargs: True
+    follower._set_state = follower.states.append
+
+    follower._finish_delivery(True)
+
+    assert follower.untagged_inventory == []
+    assert "stop_arm_common" not in follower.process_supervisor.calls
+    assert follower.states == ["FOLLOW"]
 
 
 def test_building_event_delivers_only_matching_untagged_inventory():

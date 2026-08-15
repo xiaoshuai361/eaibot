@@ -26,6 +26,7 @@ def test_default_model_and_config_paths_match_robot_layout():
 
 
 def test_default_no_tag_probe_distances_match_tag_flow():
+    assert main.DEFAULT_CONFIG["frames_required"] == 3
     assert main.DEFAULT_CONFIG["teach_assist_distance_mm"] == pytest.approx(85.0)
     assert main.DEFAULT_CONFIG["approach_gap_mm"] == pytest.approx(40.0)
     assert main.DEFAULT_CONFIG["contact_probe"]["max_travel_mm"] == pytest.approx(65.0)

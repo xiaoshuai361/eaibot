@@ -27,8 +27,8 @@ distance_method: calibrated
 input_size: 640
 confidence_min: 0.70
 nms_iou: 0.45
-# 与有 Tag 正式抓取一致：确认 5 个新鲜稳定观测后立即继续。
-frames_required: 5
+# A 点每次抓取使用 3 个新鲜稳定观测，与 B 点多帧定位数量一致。
+frames_required: 3
 observation_timeout: 50.0
 image_max_age_seconds: 1.0
 box_width_min_px: 30.0

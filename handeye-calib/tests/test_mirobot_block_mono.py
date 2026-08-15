@@ -700,6 +700,7 @@ def test_no_tag_chassis_sequence_is_wired_to_existing_pick_workflow():
     assert 'require_joint_values(motion_preset, "carry_joint_values")' in source
     assert 'require_joint_values(motion_preset, "idle_joint_values")' in source
     assert "signal.signal(signal.SIGTERM, raise_termination_requested)" in source
+    assert "UNTAGGED_STATUS ID%d %s" in source
     assert "finally:\n        publisher.shutdown()" in source
     assert 'deadline = time.time() + float(settings["max_align_seconds"])' in source
     sequence_start = source.index("def run_block_chassis_sequence")
@@ -780,6 +781,8 @@ def test_partial_chassis_sequence_skips_failed_target_and_records_success():
         "target_number": lambda _config, target: {
             "power": 1, "fire": 2}[target],
         "ascii_log_text": str,
+        "safe_log_text": str,
+        "untagged_status": lambda *_args: None,
         "ContactProbeMiss": ContactProbeMissForTest,
     })
 
