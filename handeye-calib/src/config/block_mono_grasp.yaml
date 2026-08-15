@@ -99,8 +99,8 @@ contact_probe:
   poll_seconds: 0.02
   # 吸附后沿原接近轴退到预抓点后方 30mm，再进行搬运规划。
   retreat_extra_mm: 30.0
-velocity_scale: 0.05
-acceleration_scale: 0.05
+velocity_scale: 0.20
+acceleration_scale: 0.20
 planning_time: 5.0
 motion_settle_seconds: 0.25
 base_min_z_mm: 40.0
