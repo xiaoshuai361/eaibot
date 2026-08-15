@@ -235,6 +235,7 @@ def test_tag_pick_can_request_all_four_targets_in_left_to_right_order():
         supervisor.command.index("--max-targets") + 1] == "4"
     assert supervisor.command[
         supervisor.command.index("--order") + 1] == "left_to_right"
+    assert "--skip-startup-home" in supervisor.command
 
 
 def test_tag_pick_accepts_partial_inventory():
@@ -286,6 +287,7 @@ def test_untagged_pick_reports_actual_inventory_and_can_keep_arm():
     assert error is None
     assert coordinator.completed_items() == [1, 2]
     assert "--result-file" in supervisor.command
+    assert "--skip-startup-home" in supervisor.command
     assert supervisor.calls[0] == "start_astra"
     assert supervisor.calls[-1] == "stop_astra"
     assert "stop_arm_common" not in supervisor.calls

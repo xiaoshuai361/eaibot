@@ -123,7 +123,7 @@ AprilTag 自带的 `show_image` 窗口默认关闭，YOLO relay 也不在送给 
 ```text
 从当前可见剩余 Tag 中选择最左者
 -> 底盘低速移入红色 ROI，以1个新检测帧确认停车
--> 启动回零
+-> 不回零，从当前机械臂姿态继续
 -> 等待新的 base -> tag_N TF
 -> 收集3个不同时间戳的新鲜 TF 并过滤
 -> 普通规划到示教预抓点后方30mm（`--pick-approach-gap` 可配置）

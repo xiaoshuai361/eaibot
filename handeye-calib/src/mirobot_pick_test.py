@@ -2385,9 +2385,8 @@ def do_run_taught_block_mono(args, config, localization, action):
     holding_object = False
     try:
         set_pump(pump_proxy, False)
-        # 每个目标前都刚执行过启动回零。服务返回并不等于最后一帧
-        # joint_states 已经稳定，先确认稳定再发送第一条 MoveIt 轨迹，
-        # 避免控制器以过期起点拒绝 block_approach_staging。
+        # 从当前姿态规划前先确认 joint_states 已稳定，避免控制器以
+        # 过期起点拒绝第一条 block_approach_staging 轨迹。
         wait_for_joint_state_stable(arm)
         execute_pose(arm, approach_staging_pose, "block_approach_staging")
         if not run_contact_approach(
