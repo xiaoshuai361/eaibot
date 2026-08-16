@@ -24,6 +24,8 @@ from ..config import (
     UNTAGGED_SEARCH_STABLE_FRAMES,
 )
 
+UNTAGGED_PICK_IDS = (2, 3)
+
 
 class GraspCoordinator(object):
     def __init__(self, supervisor, keep_arm_after_tag=False,
@@ -58,8 +60,8 @@ class GraspCoordinator(object):
         self.delivery_source = None
 
     @staticmethod
-    def _sequence_text():
-        return ",".join(str(item) for item in PICK_CANDIDATE_IDS)
+    def _sequence_text(item_ids=PICK_CANDIDATE_IDS):
+        return ",".join(str(item) for item in item_ids)
 
     def _tag_command(self, count):
         try:
@@ -157,7 +159,7 @@ class GraspCoordinator(object):
         command = [
             self.python3, UNTAGGED_PICK_SCRIPT,
             "--run-chassis-sequence",
-            "--sequence", self._sequence_text(),
+            "--sequence", self._sequence_text(UNTAGGED_PICK_IDS),
             "--max-targets", str(int(count)),
             "--allow-partial",
             "--result-file", self.untagged_result_file,
@@ -285,9 +287,12 @@ class GraspCoordinator(object):
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("已有抓取流程正在运行")
-            if not 1 <= int(count) <= len(PICK_CANDIDATE_IDS):
-                raise ValueError("抓取数量必须在 1 到 4 之间")
             self.kind = str(kind)
+            maximum = len(UNTAGGED_PICK_IDS) \
+                if self.kind in ("untagged", "untagged_search") \
+                else len(PICK_CANDIDATE_IDS)
+            if not 1 <= int(count) <= maximum:
+                raise ValueError("抓取数量必须在 1 到 %d 之间" % maximum)
             if self.kind in ("untagged", "untagged_search"):
                 # 必须在后台启动 Astra 之前同步清除旧握手文件，避免主
                 # 状态机把上一次 ready 当成本次就绪并过早写 enable。

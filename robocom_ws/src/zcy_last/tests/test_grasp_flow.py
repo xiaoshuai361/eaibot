@@ -163,6 +163,14 @@ def test_untagged_pick_command_enables_detection_window():
     command = coordinator._untagged_command(1)
 
     assert "--show-rgb" in command
+    assert command[command.index("--sequence") + 1] == "2,3"
+
+
+def test_untagged_pick_rejects_more_than_two_targets():
+    coordinator = GraspCoordinator(FakeSupervisor(), python3="/env/python3")
+
+    with pytest.raises(ValueError, match="1 到 2"):
+        coordinator.start("untagged", 3)
 
 
 def test_untagged_search_command_uses_full_frame_and_handshake_files():
@@ -171,6 +179,8 @@ def test_untagged_search_command_uses_full_frame_and_handshake_files():
 
     command = coordinator._untagged_command(2, search_before_pick=True)
 
+    assert command[command.index("--sequence") + 1] == "2,3"
+    assert command[command.index("--max-targets") + 1] == "2"
     assert "--search-before-chassis" in command
     assert "--show-rgb" in command
     assert "--allow-partial" in command

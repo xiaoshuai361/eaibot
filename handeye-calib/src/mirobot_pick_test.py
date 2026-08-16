@@ -454,11 +454,6 @@ def mapped_target_for_visual_target(config, target, mapping_name):
     return mapped_target.strip()
 
 
-def grasp_target_for_visual_target(config, target):
-    return mapped_target_for_visual_target(
-        config, target, "grasp_target_by_id")
-
-
 def motion_target_for_visual_target(config, target):
     return mapped_target_for_visual_target(
         config, target, "motion_target_by_id")
@@ -1249,8 +1244,7 @@ def validate_chassis_sequence_preset(path, targets, config,
     require_joint_values(motion_preset, "carry_joint_values")
     require_joint_values(motion_preset, "idle_joint_values")
     for target in targets:
-        grasp_target = grasp_target_for_visual_target(config, target)
-        require_block_grasp_entry(preset, grasp_target)
+        require_block_grasp_entry(preset, target)
         motion_target = motion_target_for_visual_target(config, target)
         motion_entry = require_block_motion_entry(
             motion_preset, motion_target)
@@ -2332,9 +2326,8 @@ def do_run_taught_block_mono(args, config, localization, action,
                              pre_pick_transit_joint_values=None):
     target = require_taught_target(args, action)
     preset = load_block_preset(args.preset_file)
-    grasp_target = grasp_target_for_visual_target(config, target)
     _entry, pickup_model, pregrasp_offset = require_block_grasp_entry(
-        preset, grasp_target)
+        preset, target)
     probe_settings = require_contact_probe_config(config)
     anchor_pose = block_anchor_pose_from_localization(localization, config)
     taught_pre_grasp_pose = compute_taught_block_pregrasp_pose(
@@ -2367,11 +2360,6 @@ def do_run_taught_block_mono(args, config, localization, action,
         "taught_block_pre_grasp", taught_pre_grasp_pose))
     rospy.loginfo(pose_to_text("taught_block_probe_end", probe_end_pose))
     rospy.loginfo(pose_to_text("taught_block_retreat", retreat_pose))
-    if grasp_target != target:
-        rospy.loginfo(
-            "Using grasp P target %s for visual target %s.",
-            ascii_log_text(grasp_target), ascii_log_text(target))
-
     if action == "stop_at_taught_pre_grasp":
         if pre_pick_transit_joint_values is None:
             pre_pick_transit_joint_values = \

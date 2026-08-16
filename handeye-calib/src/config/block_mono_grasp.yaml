@@ -19,14 +19,6 @@ target_classes:
     class_id: 3
     class_name: Structural support device
 
-# 临时真机验证：ID1、ID4 只复用 ID3(gas) 的预抓取 P 点；各自检测、估距
-# 和入仓放置点不变。
-grasp_target_by_id:
-  "1": gas
-  "2": fire
-  "3": gas
-  "4": gas
-
 target_size_mm: 30.0
 target_height_mm: 30.0
 # 2026-08-08：640 遮挡模型使用 340~460mm、400mm 附近加密数据完成标定。

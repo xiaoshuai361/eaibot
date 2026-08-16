@@ -445,27 +445,6 @@ def test_tag_yolo_motion_target_maps_native_ids_to_no_tag_actions():
         }, "id2")
 
 
-def test_grasp_target_mapping_does_not_change_the_place_target():
-    mapped_target, grasp_target, motion_target = load_symbols(
-        "mapped_target_for_visual_target",
-        "grasp_target_for_visual_target",
-        "motion_target_for_visual_target")
-    grasp_target.__globals__["mapped_target_for_visual_target"] = mapped_target
-    motion_target.__globals__["mapped_target_for_visual_target"] = mapped_target
-    config = {
-        "target_classes": {
-            "power": {"target_id": 1},
-            "support": {"target_id": 4},
-        },
-        "grasp_target_by_id": {"1": "gas", "4": "gas"},
-    }
-
-    assert grasp_target(config, "power") == "gas"
-    assert grasp_target(config, "support") == "gas"
-    assert motion_target(config, "power") == "power"
-    assert motion_target(config, "support") == "support"
-
-
 def test_visual_grasp_and_motion_place_can_come_from_separate_entries():
     (
         finite_scalar,
@@ -656,13 +635,12 @@ def test_separate_pregrasp_and_place_teaching_preserve_the_other_half():
     assert entry["place_ee_in_base"] == {"captured": True}
 
 
-def test_runtime_can_read_visual_grasp_and_mapped_motion_place_separately():
+def test_runtime_reads_own_visual_grasp_and_mapped_motion_place():
     source = SCRIPT.read_text(encoding="utf-8")
     start = source.index("def do_run_taught_block_mono")
     function_source = source[start:source.index("\ndef ", start + 1)]
 
-    assert "grasp_target_for_visual_target(config, target)" in function_source
-    assert "require_block_grasp_entry(\n        preset, grasp_target)" in \
+    assert "require_block_grasp_entry(\n        preset, target)" in \
         function_source
     assert "anchor_pose, pickup_model, pregrasp_offset" in function_source
     assert "motion_target_for_visual_target(config, target)" in function_source

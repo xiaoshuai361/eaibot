@@ -206,9 +206,8 @@ MoveIt 速度/加速度：0.20/0.20
 Tag 一致：经过共用抓取前中转点后规划到 P 后方30mm，在这里开启限位，受保护地直线到 P，未触发才
 继续前探，触发后直退到 P 后方30mm。
 
-当前临时真机验证映射写在 `block_mono_grasp.yaml` 的
-`grasp_target_by_id`：无 Tag ID1、ID4 抓取只复用 ID3(gas) 的 P 点、吸盘姿态
-和前探方向；视觉检测、单目估距及各自入仓放置点保持原 ID，不复制或覆盖真机 preset。
+无 Tag ID1、ID4 已取消临时复用 ID3 P 点的测试映射；四类重新读取各自示教的
+预抓点、吸盘姿态和前探方向，真机 preset 不需要复制或覆盖。
 
 有 Tag 放置示教仍使用 `tag_pick_place_presets.json` 顶层的
 `place_teach_start_ee_in_base`，这一链路不改。无 Tag 不读取该起点或其中的
@@ -271,6 +270,10 @@ B_PICK_PREPARE -> B_PICKING
 
 A 点在第 3 个路口完成后进入搜索握手：
 
+比赛候选固定为 ID2、ID3：协调器只向子进程传 `--sequence 2,3`，因此 ID1、ID4
+不显示检测框、不计入搜索触发，也不会参与逐个对准和抓取。默认抓取数量为2，命令行
+最多只能设置为2。
+
 开启 A 点抓取时，第 3 个右拐在入口摆正后独立使用 `A_PICK_THIRD_RIGHT_ENTRY_TIME` 前进、`A_PICK_THIRD_RIGHT_TURN_TIME` 右转；这两个参数只影响该路口，其他路口仍使用全局 `TURN_ENTRY_TIME/TURN_TIME`。
 
 入口横条使用 `STOP_STABLE_FRAMES=1`，单帧命中即进入 `APPROACH`；每次出口完成后通过 `EXIT_ENTRY_IGNORE_TIME=3.0s` 暂停接受入口横条，防止刚经过的出口被再次计作入口。
@@ -295,7 +298,7 @@ A_PICK_PREPARE：停车启动 Astra/机械臂/无Tag模型
 抓取子进程写：
 
 ```json
-{"completed_ids": [1, 3]}
+{"completed_ids": [2, 3]}
 ```
 
 B 点协调器在退出码 `0`、ID 合法且不重复、数量不超过请求数量时判定成功，允许空库存；A 点仍要求数量严格等于请求数量。库存必须来自该 JSON，不能根据检测画面或计划数量猜测。
