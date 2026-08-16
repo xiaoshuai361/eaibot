@@ -236,15 +236,15 @@ def test_five_official_competition_commands(argv, expected):
         ),
         (
             ["--tag-pick", "--no-untagged-pick"],
-            ["astra", "tag", "run", "shutdown"],
+            ["arm", "astra", "tag", "run", "shutdown"],
         ),
         (
             ["--no-tag-pick", "--untagged-pick"],
-            ["run", "shutdown"],
+            ["arm", "run", "shutdown"],
         ),
         (
             ["--tag-pick", "--untagged-pick"],
-            ["astra", "tag", "run", "shutdown"],
+            ["arm", "astra", "tag", "run", "shutdown"],
         ),
     ],
 )
@@ -258,6 +258,9 @@ def test_main_starts_only_required_initial_dependencies(
 
         def start_astra(self):
             calls.append("astra")
+
+        def start_arm_common(self):
+            calls.append("arm")
 
         def start_tag_stack(self):
             calls.append("tag")
@@ -291,6 +294,9 @@ def test_main_passes_untagged_aligned_start_to_follower(monkeypatch):
 
     class Supervisor(object):
         def __init__(self, **_kwargs):
+            pass
+
+        def start_arm_common(self):
             pass
 
         def shutdown(self):
@@ -511,8 +517,8 @@ def test_stop_owned_astra_cleans_residual_camera_nodes(
     assert "rosnode kill" in probes[0][0]
     assert "timeout 2" in probes[0][0]
     assert "& done; wait" in probes[0][0]
-    assert "rosnode cleanup" in probes[0][0]
-    assert probes[0][1] == 12.0
+    assert "rosnode cleanup" not in probes[0][0]
+    assert probes[0][1] == 6.0
 
 
 def test_stop_owned_astra_reports_residual_nodes_after_cleanup(

@@ -348,17 +348,14 @@ class ProcessSupervisor(object):
     def _cleanup_astra_nodes(self):
         # 不要把所有节点一次性交给 rosnode kill。Astra 的某个 nodelet
         # 无响应时会卡住整条命令，使后续节点完全没有收到关闭请求。
-        # 逐节点加超时关闭，再用 rosnode cleanup 清掉已经死亡但仍被
-        # ROS Master 列出的陈旧注册。cleanup 只删除无法 ping 通的节点，
-        # 不会关闭仍在运行的底盘、MoveIt 或手眼 TF。
+        # 只关闭 /camera 命名空间，禁止调用全局 rosnode cleanup；后者
+        # 可能把短暂未响应的 MoveIt 或 robot_state_publisher 一并注销。
         self._probe(
             "for node in $(rosnode list 2>/dev/null | "
             "grep -E '^/camera(/|$)'); do "
             "timeout 2 rosnode kill \"$node\" >/dev/null 2>&1 & "
-            "done; wait || true; "
-            "printf 'y\\n' | timeout 8 rosnode cleanup >/dev/null 2>&1 "
-            "|| true",
-            timeout=12.0,
+            "done; wait || true",
+            timeout=6.0,
         )
 
     def start_tag_stack(self):

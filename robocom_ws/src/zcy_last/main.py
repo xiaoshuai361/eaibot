@@ -205,6 +205,8 @@ def main(argv=None):
         python3=sys.executable,
     )
     try:
+        if options.tag_pick or options.untagged_pick:
+            supervisor.start_arm_common()
         return run_competition(options, ros_args, supervisor)
     finally:
         supervisor.shutdown()

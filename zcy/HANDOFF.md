@@ -233,7 +233,12 @@ bash /home/eaibot/robocom_ws/src/zcy_last/比赛一键准备.sh
 ```
 
 它会启动或复用底盘，临时启动 Astra 以建立相机坐标系，再启动 MoveIt 和手眼 TF，检查成功后关闭临时 Astra。底盘、MoveIt 和手眼 TF 转为外部常驻进程，由正式任务复用。
-正式任务在 B/A 点重新启动 Astra 前若发现残留 `/camera` 节点，会自动逐节点限时关闭并清理 ROS Master；清理成功后继续，只有清理后仍存活才为避免相机冲突停止抓取。
+只要启用了有 Tag 或无 Tag 抓取，`main.py` 也会在出发前启动或复用 MoveIt、
+机械臂服务和手眼 TF，并等待 `base -> camera_link` 可用；不得等到 A/B 点定位时
+才发现 `target_frame base does not exist`。`--external-ros` 模式仍由用户自行保证外部依赖。
+正式任务在 B/A 点重新启动 Astra 前若发现仍可响应的 `/camera` 节点，只会在该
+命名空间内逐节点限时关闭；禁止调用全局 `rosnode cleanup`，避免误注销 MoveIt、
+`robot_state_publisher` 或底盘节点。无响应的相机残留名称直接忽略。
 
 主要总调度文件：
 
