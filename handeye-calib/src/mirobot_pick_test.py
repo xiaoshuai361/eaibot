@@ -432,12 +432,12 @@ def require_block_target_entry(preset, target):
     return entry, pickup_model, pregrasp_offset
 
 
-def motion_target_for_visual_target(config, target):
-    mapping = config.get("motion_target_by_id")
+def mapped_target_for_visual_target(config, target, mapping_name):
+    mapping = config.get(mapping_name)
     if mapping is None:
         return target
     if not isinstance(mapping, dict):
-        raise RuntimeError("motion_target_by_id must be a mapping.")
+        raise RuntimeError("%s must be a mapping." % mapping_name)
     metadata = config.get("target_classes", {}).get(target)
     if not isinstance(metadata, dict):
         raise RuntimeError("Missing target metadata for %s." % target)
@@ -445,13 +445,23 @@ def motion_target_for_visual_target(config, target):
         target_id = int(metadata.get("target_id"))
     except (TypeError, ValueError, OverflowError):
         raise RuntimeError("target_id for %s must be an integer." % target)
-    motion_target = mapping.get(str(target_id))
-    if motion_target is None:
-        motion_target = mapping.get(target_id)
-    if not isinstance(motion_target, STRING_TYPES) or not motion_target.strip():
+    mapped_target = mapping.get(str(target_id))
+    if mapped_target is None:
+        mapped_target = mapping.get(target_id)
+    if not isinstance(mapped_target, STRING_TYPES) or not mapped_target.strip():
         raise RuntimeError(
-            "motion_target_by_id has no target for ID%d." % target_id)
-    return motion_target.strip()
+            "%s has no target for ID%d." % (mapping_name, target_id))
+    return mapped_target.strip()
+
+
+def grasp_target_for_visual_target(config, target):
+    return mapped_target_for_visual_target(
+        config, target, "grasp_target_by_id")
+
+
+def motion_target_for_visual_target(config, target):
+    return mapped_target_for_visual_target(
+        config, target, "motion_target_by_id")
 
 
 def require_block_motion_entry(preset, target):
@@ -1239,7 +1249,8 @@ def validate_chassis_sequence_preset(path, targets, config,
     require_joint_values(motion_preset, "carry_joint_values")
     require_joint_values(motion_preset, "idle_joint_values")
     for target in targets:
-        require_block_grasp_entry(preset, target)
+        grasp_target = grasp_target_for_visual_target(config, target)
+        require_block_grasp_entry(preset, grasp_target)
         motion_target = motion_target_for_visual_target(config, target)
         motion_entry = require_block_motion_entry(
             motion_preset, motion_target)
@@ -2321,8 +2332,9 @@ def do_run_taught_block_mono(args, config, localization, action,
                              pre_pick_transit_joint_values=None):
     target = require_taught_target(args, action)
     preset = load_block_preset(args.preset_file)
+    grasp_target = grasp_target_for_visual_target(config, target)
     _entry, pickup_model, pregrasp_offset = require_block_grasp_entry(
-        preset, target)
+        preset, grasp_target)
     probe_settings = require_contact_probe_config(config)
     anchor_pose = block_anchor_pose_from_localization(localization, config)
     taught_pre_grasp_pose = compute_taught_block_pregrasp_pose(
@@ -2355,6 +2367,10 @@ def do_run_taught_block_mono(args, config, localization, action,
         "taught_block_pre_grasp", taught_pre_grasp_pose))
     rospy.loginfo(pose_to_text("taught_block_probe_end", probe_end_pose))
     rospy.loginfo(pose_to_text("taught_block_retreat", retreat_pose))
+    if grasp_target != target:
+        rospy.loginfo(
+            "Using grasp P target %s for visual target %s.",
+            ascii_log_text(grasp_target), ascii_log_text(target))
 
     if action == "stop_at_taught_pre_grasp":
         if pre_pick_transit_joint_values is None:

@@ -421,7 +421,10 @@ def test_target_entry_requires_independent_model_offset_and_place():
 
 
 def test_tag_yolo_motion_target_maps_native_ids_to_no_tag_actions():
-    motion_target, = load_symbols("motion_target_for_visual_target")
+    mapped_target, motion_target = load_symbols(
+        "mapped_target_for_visual_target",
+        "motion_target_for_visual_target")
+    motion_target.__globals__["mapped_target_for_visual_target"] = mapped_target
     config = {
         "target_classes": {
             "id1": {"target_id": 1},
@@ -440,6 +443,27 @@ def test_tag_yolo_motion_target_maps_native_ids_to_no_tag_actions():
             "target_classes": {"id2": {"target_id": 2}},
             "motion_target_by_id": {"1": "power"},
         }, "id2")
+
+
+def test_grasp_target_mapping_does_not_change_the_place_target():
+    mapped_target, grasp_target, motion_target = load_symbols(
+        "mapped_target_for_visual_target",
+        "grasp_target_for_visual_target",
+        "motion_target_for_visual_target")
+    grasp_target.__globals__["mapped_target_for_visual_target"] = mapped_target
+    motion_target.__globals__["mapped_target_for_visual_target"] = mapped_target
+    config = {
+        "target_classes": {
+            "power": {"target_id": 1},
+            "support": {"target_id": 4},
+        },
+        "grasp_target_by_id": {"1": "gas", "4": "gas"},
+    }
+
+    assert grasp_target(config, "power") == "gas"
+    assert grasp_target(config, "support") == "gas"
+    assert motion_target(config, "power") == "power"
+    assert motion_target(config, "support") == "support"
 
 
 def test_visual_grasp_and_motion_place_can_come_from_separate_entries():
@@ -637,7 +661,9 @@ def test_runtime_can_read_visual_grasp_and_mapped_motion_place_separately():
     start = source.index("def do_run_taught_block_mono")
     function_source = source[start:source.index("\ndef ", start + 1)]
 
-    assert "require_block_grasp_entry(\n        preset, target)" in function_source
+    assert "grasp_target_for_visual_target(config, target)" in function_source
+    assert "require_block_grasp_entry(\n        preset, grasp_target)" in \
+        function_source
     assert "anchor_pose, pickup_model, pregrasp_offset" in function_source
     assert "motion_target_for_visual_target(config, target)" in function_source
     assert "motion_entry, motion_target, localization[\"base_frame\"]" in \

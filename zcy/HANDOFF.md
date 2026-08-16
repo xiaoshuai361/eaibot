@@ -206,6 +206,10 @@ MoveIt 速度/加速度：0.20/0.20
 Tag 一致：经过共用抓取前中转点后规划到 P 后方30mm，在这里开启限位，受保护地直线到 P，未触发才
 继续前探，触发后直退到 P 后方30mm。
 
+当前临时真机验证映射写在 `block_mono_grasp.yaml` 的
+`grasp_target_by_id`：无 Tag ID1、ID4 抓取只复用 ID3(gas) 的 P 点、吸盘姿态
+和前探方向；视觉检测、单目估距及各自入仓放置点保持原 ID，不复制或覆盖真机 preset。
+
 有 Tag 放置示教仍使用 `tag_pick_place_presets.json` 顶层的
 `place_teach_start_ee_in_base`，这一链路不改。无 Tag 不读取该起点或其中的
 Tag 放置点，而是在每个类别的组合示教中，从刚采集的本类别预抓点 P 开始移动
