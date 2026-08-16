@@ -421,7 +421,9 @@ def test_untagged_delivery_uses_its_own_motion_presets():
             "/block_mono_pick_place_presets.json")
     assert "--release-ready-file" in supervisor.command
     assert supervisor.command[
-        supervisor.command.index("--pump-off-settle-seconds") + 1] == "1.0"
+        supervisor.command.index("--pump-off-settle-seconds") + 1] == "0.7"
+    assert supervisor.command[
+        supervisor.command.index("--release-ready-delay-seconds") + 1] == "3.0"
     assert "--contact-release" in supervisor.command
     assert "--force-release-on-contact-miss" in supervisor.command
     assert supervisor.command[

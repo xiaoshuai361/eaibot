@@ -9,6 +9,7 @@ import json
 import math
 import os
 import sys
+import time
 
 if sys.version_info[0] != 2:
     sys.stderr.write(
@@ -133,8 +134,11 @@ def parse_args(argv):
     parser.add_argument('--pump-on-settle-seconds', type=float, default=1.0)
     parser.add_argument('--pump-off-settle-seconds', type=float, default=0.7)
     parser.add_argument(
+        '--release-ready-delay-seconds', type=float, default=0.0,
+        help='从关泵开始至少等待该时长后才通知底盘恢复；等待期间可执行直退。')
+    parser.add_argument(
         '--release-ready-file', default=None,
-        help='关泵并等待 --pump-off-settle-seconds 后写入，用于提前恢复循迹。')
+        help='安全直退且达到恢复等待时间后写入，用于提前恢复循迹。')
     parser.add_argument('--contact-release', action='store_true')
     parser.add_argument(
         '--force-release-on-contact-miss', action='store_true')
@@ -161,6 +165,8 @@ def parse_args(argv):
     nonnegative(args.motion_settle_seconds, '--motion-settle-seconds')
     nonnegative(args.pump_on_settle_seconds, '--pump-on-settle-seconds')
     nonnegative(args.pump_off_settle_seconds, '--pump-off-settle-seconds')
+    nonnegative(args.release_ready_delay_seconds,
+                '--release-ready-delay-seconds')
     positive(args.contact_staging_gap, '--contact-staging-gap')
     positive(args.contact_staging_step, '--contact-staging-step')
     positive(args.contact_probe_step, '--contact-probe-step')
@@ -564,17 +570,23 @@ def run_delivery(args, arm, pump_proxy):
                 arm_api.execute_joint_values(
                     arm, entry['delivery_joint_values'],
                     'delivery_%d_release' % item_id)
+            release_started = time.time()
             arm_api.set_pump(pump_proxy, False)
             holding_object = False
             rospy.sleep(args.pump_off_settle_seconds)
-            mark_release_ready(
-                getattr(args, 'release_ready_file', None), item_id)
             delivery_status(item_id, '物资已释放，正在回退并归位')
             if contact_release:
                 arm_api.execute_cartesian_pose(
                     arm, staging_pose,
                     'delivery_%d_release_retreat_30mm' % item_id,
                     eef_step=args.contact_staging_step)
+            ready_delay = float(getattr(
+                args, 'release_ready_delay_seconds', 0.0))
+            remaining = ready_delay - (time.time() - release_started)
+            if remaining > 0.0:
+                rospy.sleep(remaining)
+            mark_release_ready(
+                getattr(args, 'release_ready_file', None), item_id)
             arm_api.execute_joint_values(
                 arm, idle_joint_values, 'idle')
         except Exception as exc:

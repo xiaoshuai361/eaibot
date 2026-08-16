@@ -110,7 +110,8 @@ class GraspCoordinator(object):
         if source == "untagged":
             command.extend([
                 "--release-ready-file", self.delivery_release_ready_file,
-                "--pump-off-settle-seconds", "1.0",
+                "--pump-off-settle-seconds", "0.7",
+                "--release-ready-delay-seconds", "3.0",
                 "--contact-release",
                 "--force-release-on-contact-miss",
                 "--contact-staging-gap", "0.030",

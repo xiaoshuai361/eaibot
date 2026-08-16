@@ -283,6 +283,8 @@ python2 /home/eaibot/handeye-calib/src/mirobot_delivery.py \
 正确顺序：仓内抓取 → 中转点 → P后方30mm → 5mm到P → 2mm前探最多65mm
 → 关泵等待0.7秒 → 直退30mm → idle。
 
+正式 `main.py --untagged-delivery` 中，关泵0.7秒后机械臂立即直退；自关泵起至少满3秒且直退成功后底盘才恢复巡线，机械臂随后在后台回idle。
+
 走满65mm未触发限位时会报警，但仍按要求强制释放并返回成功。限位服务、串口或
 轨迹执行报错时保持泵开启并返回失败，必须人工处理。
 

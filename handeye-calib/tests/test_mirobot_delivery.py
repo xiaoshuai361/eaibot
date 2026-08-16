@@ -1,5 +1,6 @@
 import ast
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ def load_symbols(*names):
         "math": __import__("math"),
         "os": __import__("os"),
         "sys": __import__("sys"),
+        "time": time,
         "STRING_TYPES": (str,),
         "arm_api": SimpleNamespace(
             DEFAULT_STARTUP_HOME_SERVICE="/mirobot_startup_home"),
@@ -107,6 +109,7 @@ def test_parse_args_defaults_to_three_point_delivery_workflow():
     assert args.velocity_scale == pytest.approx(0.2)
     assert args.acceleration_scale == pytest.approx(0.2)
     assert args.release_ready_file is None
+    assert args.release_ready_delay_seconds == pytest.approx(0.0)
 
 
 def test_vertical_offset_moves_only_base_z_by_five_centimeters():
@@ -481,6 +484,9 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
             loginfo=lambda *items: None,
             logwarn=lambda *items: None,
             logerr=lambda *items: None),
+        "time": SimpleNamespace(time=iter([10.0, 11.5]).__next__),
+        "mark_release_ready": lambda path, item_id: events.append(
+            ("release_ready", path, item_id)),
     })
     args = SimpleNamespace(
         delivery_file=str(delivery_path), cargo_pick_file=str(cargo_path),
@@ -490,7 +496,9 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
         contact_probe_step=0.002, contact_probe_max_travel=0.065,
         contact_distance_offset=0.1,
         base_frame="base", pump_on_settle_seconds=0.0,
-        pump_off_settle_seconds=0.7)
+        pump_off_settle_seconds=0.7,
+        release_ready_delay_seconds=3.0,
+        release_ready_file="/tmp/release.ready")
 
     run_delivery(args, object(), object())
 
@@ -499,8 +507,11 @@ def test_contact_miss_forces_release_then_retreats_before_idle(tmp_path):
         if event == ("pump", False))
     retreat_index = events.index(
         ("cartesian", "delivery_1_release_retreat_30mm"))
+    delay_index = events.index(("sleep", pytest.approx(1.5)))
+    ready_index = events.index(
+        ("release_ready", "/tmp/release.ready", 1))
     idle_index = events.index(("joint", "idle"))
-    assert pump_off_index < retreat_index < idle_index
+    assert pump_off_index < retreat_index < delay_index < ready_index < idle_index
     assert contact_options == [{
         "staging_step_m": pytest.approx(0.005),
         "probe_step_m": pytest.approx(0.002),
