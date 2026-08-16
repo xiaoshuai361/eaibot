@@ -229,6 +229,7 @@ bash /home/eaibot/robocom_ws/src/zcy_last/比赛一键准备.sh
 ```
 
 它会启动或复用底盘，临时启动 Astra 以建立相机坐标系，再启动 MoveIt 和手眼 TF，检查成功后关闭临时 Astra。底盘、MoveIt 和手眼 TF 转为外部常驻进程，由正式任务复用。
+正式任务在 B/A 点重新启动 Astra 前若发现残留 `/camera` 节点，会自动逐节点限时关闭并清理 ROS Master；清理成功后继续，只有清理后仍存活才为避免相机冲突停止抓取。
 
 主要总调度文件：
 

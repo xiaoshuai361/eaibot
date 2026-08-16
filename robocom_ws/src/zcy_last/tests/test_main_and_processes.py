@@ -419,12 +419,35 @@ def test_astra_start_prefers_explicit_calibration(monkeypatch, tmp_path):
     assert "rgb_camera_info_url:=file://%s" % calibration in started[0][1]
 
 
-def test_external_astra_is_rejected(monkeypatch, tmp_path):
+def test_residual_astra_is_cleaned_automatically(monkeypatch, tmp_path):
     supervisor = processes.ProcessSupervisor(
         enabled=True, log_root=str(tmp_path))
-    monkeypatch.setattr(supervisor, "_probe", lambda *_args, **_kwargs: True)
+    events = []
+    monkeypatch.setattr(
+        supervisor, "_astra_nodes_running", lambda: True)
+    monkeypatch.setattr(
+        supervisor, "_cleanup_astra_nodes",
+        lambda: events.append("cleanup"))
+    monkeypatch.setattr(
+        supervisor, "_wait_astra_nodes_stopped",
+        lambda timeout=5.0: events.append(("wait", timeout)) or True)
 
-    with pytest.raises(RuntimeError, match="外部 Astra"):
+    supervisor._assert_astra_not_running()
+
+    assert events == ["cleanup", ("wait", 6.0)]
+
+
+def test_residual_astra_reports_failure_only_after_auto_cleanup(
+        monkeypatch, tmp_path):
+    supervisor = processes.ProcessSupervisor(
+        enabled=True, log_root=str(tmp_path))
+    monkeypatch.setattr(supervisor, "_astra_nodes_running", lambda: True)
+    monkeypatch.setattr(supervisor, "_cleanup_astra_nodes", lambda: None)
+    monkeypatch.setattr(
+        supervisor, "_wait_astra_nodes_stopped",
+        lambda timeout=5.0: False)
+
+    with pytest.raises(RuntimeError, match="自动清理后仍有 Astra"):
         supervisor._assert_astra_not_running()
 
 

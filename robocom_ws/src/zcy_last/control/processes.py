@@ -125,12 +125,20 @@ class ProcessSupervisor(object):
 
     def _assert_astra_not_running(self):
         """Astra 按 USB 设备启动，不依赖不稳定的 /dev/videoN 编号。"""
-        if self._process_alive(self.processes.get("astra")):
+        current = self.processes.get("astra")
+        if self._process_alive(current):
             return
-        if self._astra_nodes_running():
+        if current is not None:
+            self.stop("astra")
+        if not self._astra_nodes_running():
+            return
+        self._info(
+            "检测到残留 Astra /camera 节点，正在自动关闭并清理 ROS Master")
+        self._cleanup_astra_nodes()
+        if not self._wait_astra_nodes_stopped(timeout=6.0):
             raise RuntimeError(
-                "检测到外部 Astra 相机节点；请先关闭临时启动的 "
-                "astrapro.launch，再运行比赛主程序")
+                "自动清理后仍有 Astra /camera 节点存活；为避免相机冲突，"
+                "停止 A 点抓取，请检查相机进程")
 
     def _astra_nodes_running(self):
         return self._probe(
@@ -326,6 +334,14 @@ class ProcessSupervisor(object):
         self._info(
             "Astra roslaunch 已退出但 /camera 节点仍残留，"
             "正在清理本次启动的相机节点")
+
+        self._cleanup_astra_nodes()
+        if not self._wait_astra_nodes_stopped(timeout=6.0):
+            raise RuntimeError(
+                "本次启动的 Astra 已停止，但 ROS Master 中仍有 /camera "
+                "节点；不要启动 main，请先检查 `rosnode list | grep '^/camera'`")
+
+    def _cleanup_astra_nodes(self):
         # 不要把所有节点一次性交给 rosnode kill。Astra 的某个 nodelet
         # 无响应时会卡住整条命令，使后续节点完全没有收到关闭请求。
         # 逐节点加超时关闭，再用 rosnode cleanup 清掉已经死亡但仍被
@@ -340,10 +356,6 @@ class ProcessSupervisor(object):
             "|| true",
             timeout=12.0,
         )
-        if not self._wait_astra_nodes_stopped(timeout=6.0):
-            raise RuntimeError(
-                "本次启动的 Astra 已停止，但 ROS Master 中仍有 /camera "
-                "节点；不要启动 main，请先检查 `rosnode list | grep '^/camera'`")
 
     def start_tag_stack(self):
         if not self.enabled:
