@@ -2414,7 +2414,9 @@ def do_run_taught_block_mono(args, config, localization, action,
         untagged_status(config, target, u"前往A/B共用抓取前中转点")
         execute_joint_values(
             arm, pre_pick_transit_joint_values, "block_pre_pick_transit")
-        untagged_status(config, target, u"前往P后方40mm安全点")
+        untagged_status(
+            config, target, u"前往P后方%.0fmm安全点" %
+            config["approach_gap_mm"])
         approach_staging_pose, selected_staging_gap = \
             move_to_staging_with_fallback(
                 config["approach_gap_mm"] * 0.001,
@@ -2448,7 +2450,9 @@ def do_run_taught_block_mono(args, config, localization, action,
             "Contact secured; retreating straight %.0fmm past pre-grasp before carry planning.",
             probe_settings["retreat_extra_mm"])
         execute_cartesian_pose(arm, retreat_pose, "taught_block_retreat")
-        untagged_status(config, target, u"已退回P后方40mm，开始搬运入仓")
+        untagged_status(
+            config, target, u"已退回P后方%.0fmm，开始搬运入仓" %
+            probe_settings["retreat_extra_mm"])
         execute_joint_values(arm, carry_joint_values, "block_carry")
         execute_pose(arm, pre_place_pose, "taught_block_pre_place")
         execute_cartesian_pose(
