@@ -923,19 +923,16 @@ def test_no_tag_runtime_uses_tag_style_staging_then_taught_pregrasp():
     function_start = source.index("def do_run_taught_block_mono")
     function_source = source[function_start:source.index("\ndef ", function_start + 1)]
 
-    staging = function_source.index(
-        'execute_pose(arm, approach_staging_pose, "block_approach_staging")')
-    taught_pregrasp = function_source.index(
-        'arm, taught_pre_grasp_pose, "taught_block_pre_grasp"', staging)
-    contact_probe = function_source.index("if not run_contact_approach(", taught_pregrasp)
-
     transit = function_source.index(
         'arm, pre_pick_transit_joint_values, "block_pre_pick_transit"')
     runtime_staging = function_source.index(
-        'execute_pose(arm, approach_staging_pose, "block_approach_staging")',
-        transit)
+        "move_to_staging_with_fallback(", transit)
+    contact_probe = function_source.index(
+        "if not run_contact_approach(", runtime_staging)
+
     assert transit < runtime_staging < contact_probe
-    assert staging < taught_pregrasp < contact_probe
+    assert 'config["approach_gap_mm"] * 0.001' in function_source
+    assert "selected_staging_gap <= 1e-9" in function_source
 
 
 def test_execute_pose_accepts_controller_failure_if_target_was_reached():

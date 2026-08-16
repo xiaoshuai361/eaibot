@@ -55,6 +55,8 @@ POSE_DONE_POSITION_TOLERANCE = 0.015
 POSE_DONE_ORIENTATION_TOLERANCE_RAD = 0.35
 DEFAULT_STARTUP_HOME_SERVICE = '/mirobot_startup_home'
 MOTION_SETTLE_SECONDS = DEFAULT_MOTION_SETTLE_SECONDS
+STAGING_FALLBACK_GAPS_M = (0.020, 0.010, 0.0)
+STAGING_FALLBACK_INTERVAL_SECONDS = 0.1
 
 try:
     STRING_TYPES = (basestring,)
@@ -1255,6 +1257,33 @@ def execute_pose(arm, target_pose, label):
     raise RuntimeError('MoveIt 执行 %s 失败。' % display_label(label))
 
 
+def move_to_staging_with_fallback(primary_gap_m, build_pose, move_pose,
+                                  sleep_fn, logwarn_fn, label,
+                                  abort_exceptions=()):
+    """安全点不可达时逐步靠近 P；主距离成功时不增加额外动作。"""
+    gaps = [float(primary_gap_m)]
+    for gap in STAGING_FALLBACK_GAPS_M:
+        if gap < gaps[0] - 1e-9:
+            gaps.append(gap)
+    for index, gap in enumerate(gaps):
+        pose = build_pose(gap)
+        attempt_label = label if index == 0 else '%s_fallback_%dmm' % (
+            label, int(round(gap * 1000.0)))
+        try:
+            move_pose(pose, attempt_label)
+            return pose, gap
+        except RuntimeError as exc:
+            if abort_exceptions and isinstance(exc, abort_exceptions):
+                raise
+            if index + 1 >= len(gaps):
+                raise
+            logwarn_fn(
+                '%s 后方 %.0fmm 规划失败：%s；0.1秒后改试 %.0fmm。' % (
+                    label, gap * 1000.0, exc,
+                    gaps[index + 1] * 1000.0))
+            sleep_fn(STAGING_FALLBACK_INTERVAL_SECONDS)
+
+
 def execute_joint_values(arm, joint_values, label):
     rospy.loginfo('执行关节动作：%s joint_values=%s',
                   display_label(label), joint_values)
@@ -1343,6 +1372,7 @@ def execute_cartesian_pose(arm, target_pose, label, eef_step=0.005,
 
 def run_contact_approach(arm, taught_pre_grasp_pose, pickup_model, base_frame,
                          enable_proxy, state_proxy,
+                         skip_staging_motion=False,
                          staging_step_m=CONTACT_STAGING_STEP_M,
                          probe_step_m=CONTACT_PROBE_STEP_M,
                          max_travel_m=CONTACT_PROBE_MAX_TRAVEL_M,
@@ -1359,15 +1389,16 @@ def run_contact_approach(arm, taught_pre_grasp_pose, pickup_model, base_frame,
             max_travel_m * 1000.0,
             probe_step_m * 1000.0,
             )
-        execute_cartesian_pose(
-            arm, taught_pre_grasp_pose, 'guarded_to_taught_pre_grasp',
-            eef_step=staging_step_m,
-            quiet=True, settle=False, stop_after=False,
-            min_point_interval=point_interval)
-        rospy.sleep(poll_seconds)
-        if contact_is_triggered(state_proxy):
-            rospy.loginfo('到达示教预抓点 P 之前已触发限位，停止继续前探。')
-            return True
+        if not skip_staging_motion:
+            execute_cartesian_pose(
+                arm, taught_pre_grasp_pose, 'guarded_to_taught_pre_grasp',
+                eef_step=staging_step_m,
+                quiet=True, settle=False, stop_after=False,
+                min_point_interval=point_interval)
+            rospy.sleep(poll_seconds)
+            if contact_is_triggered(state_proxy):
+                rospy.loginfo('到达示教预抓点 P 之前已触发限位，停止继续前探。')
+                return True
         probe_end_pose = build_contact_probe_pose(
             taught_pre_grasp_pose, pickup_model,
             max_travel_m, base_frame)
@@ -1697,10 +1728,18 @@ def run_taught_sequence(args, arm, pump_proxy, contact_proxies=None):
             set_pump(pump_proxy, False)
             execute_joint_values(
                 arm, pre_pick_transit, 'pre_pick_transit')
-            execute_pose(arm, approach_staging_pose, 'approach_staging')
+            approach_staging_pose, selected_staging_gap = \
+                move_to_staging_with_fallback(
+                    args.approach_gap,
+                    lambda gap: build_backoff_pose(
+                        taught_pre_grasp_pose, pickup_model,
+                        gap, args.base_frame),
+                    lambda pose, label: execute_pose(arm, pose, label),
+                    rospy.sleep, rospy.logwarn, 'approach_staging')
             if not run_contact_approach(
                     arm, taught_pre_grasp_pose, pickup_model, args.base_frame,
-                    enable_contact_proxy, contact_state_proxy):
+                    enable_contact_proxy, contact_state_proxy,
+                    selected_staging_gap <= 1e-9):
                 rospy.logwarn(
                     'CONTACT_PROBE_MISS tag_%d：前进 %.0fmm 仍未触发限位，退回并跳过当前物块。',
                     tag_id, CONTACT_PROBE_MAX_TRAVEL_M * 1000.0)

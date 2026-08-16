@@ -33,6 +33,7 @@ from tag_chassis_align_pick_sequence import (
     compute_drive_command,
     roi_ratio_to_pixels,
 )
+from mirobot_pick_test_tag import move_to_staging_with_fallback
 
 from block_mono_vision import (
     DEFAULT_CONFIG,
@@ -2086,7 +2087,8 @@ def contact_is_triggered(state_proxy):
 
 
 def run_contact_approach(arm, taught_pre_grasp_pose, pickup_model, base_frame,
-                         settings, enable_proxy, state_proxy):
+                         settings, enable_proxy, state_proxy,
+                         skip_staging_motion=False):
     max_travel_mm = finite_scalar(
         settings["max_travel_mm"], "contact_probe.max_travel_mm")
     staging_step_mm = finite_scalar(
@@ -2103,16 +2105,17 @@ def run_contact_approach(arm, taught_pre_grasp_pose, pickup_model, base_frame,
             "Contact guard active before taught pre-grasp; staging uses "
             "%.0fmm steps, then probes up to %.0fmm past P in %.0fmm steps.",
             staging_step_mm, max_travel_mm, step_mm)
-        execute_cartesian_pose(
-            arm, taught_pre_grasp_pose, "block_guarded_to_pregrasp",
-            eef_step=staging_step_mm * 0.001,
-            settle=False, stop_after=False,
-            min_point_interval=interval, quiet=True)
-        rospy.sleep(float(settings.get("poll_seconds", 0.02)))
-        if contact_is_triggered(state_proxy):
-            rospy.loginfo(
-                "Contact triggered before reaching the taught pre-grasp P.")
-            return True
+        if not skip_staging_motion:
+            execute_cartesian_pose(
+                arm, taught_pre_grasp_pose, "block_guarded_to_pregrasp",
+                eef_step=staging_step_mm * 0.001,
+                settle=False, stop_after=False,
+                min_point_interval=interval, quiet=True)
+            rospy.sleep(float(settings.get("poll_seconds", 0.02)))
+            if contact_is_triggered(state_proxy):
+                rospy.loginfo(
+                    "Contact triggered before reaching the taught pre-grasp P.")
+                return True
         probe_end_pose = build_contact_probe_end_pose(
             taught_pre_grasp_pose, pickup_model, max_travel_mm, base_frame)
         execute_cartesian_pose(
@@ -2412,12 +2415,21 @@ def do_run_taught_block_mono(args, config, localization, action,
         execute_joint_values(
             arm, pre_pick_transit_joint_values, "block_pre_pick_transit")
         untagged_status(config, target, u"前往P后方40mm安全点")
-        execute_pose(arm, approach_staging_pose, "block_approach_staging")
+        approach_staging_pose, selected_staging_gap = \
+            move_to_staging_with_fallback(
+                config["approach_gap_mm"] * 0.001,
+                lambda gap: build_block_backoff_pose(
+                    taught_pre_grasp_pose, pickup_model, gap * 1000.0,
+                    localization["base_frame"]),
+                lambda pose, label: execute_pose(arm, pose, label),
+                rospy.sleep, rospy.logwarn, "block_approach_staging",
+                abort_exceptions=(TerminationRequested,))
         untagged_status(config, target, u"限位已开启，开始受保护前探")
         if not run_contact_approach(
                 arm, taught_pre_grasp_pose, pickup_model,
                 localization["base_frame"], probe_settings,
-                contact_proxies[0], contact_proxies[1]):
+                contact_proxies[0], contact_proxies[1],
+                selected_staging_gap <= 1e-9):
             rospy.logwarn(
                 "CONTACT_PROBE_MISS target=%s: no contact within %.0fmm; retreating.",
                 ascii_log_text(target), probe_settings["max_travel_mm"])

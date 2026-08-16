@@ -61,6 +61,49 @@ def make_pose(x=0.0, y=0.0, z=0.0, q=None, frame="base"):
     return pose
 
 
+@pytest.mark.parametrize("primary_gap", [0.030, 0.040])
+def test_staging_fallback_tries_twenty_ten_then_p(primary_gap):
+    move_with_fallback, = load_module_symbols(
+        "move_to_staging_with_fallback")
+    attempts = []
+    waits = []
+
+    def move_pose(pose, label):
+        attempts.append((pose, label))
+        if pose > 0.0:
+            raise RuntimeError("no plan")
+
+    pose, selected_gap = move_with_fallback(
+        primary_gap, lambda gap: gap, move_pose, waits.append,
+        lambda message: None, "approach_staging")
+
+    assert [item[0] for item in attempts] == pytest.approx(
+        [primary_gap, 0.020, 0.010, 0.0])
+    assert attempts[0][1] == "approach_staging"
+    assert attempts[-1][1] == "approach_staging_fallback_0mm"
+    assert waits == pytest.approx([0.1, 0.1, 0.1])
+    assert pose == pytest.approx(0.0)
+    assert selected_gap == pytest.approx(0.0)
+
+
+def test_staging_fallback_does_not_swallow_termination():
+    move_with_fallback, = load_module_symbols(
+        "move_to_staging_with_fallback")
+
+    class StopNow(RuntimeError):
+        pass
+
+    waits = []
+    with pytest.raises(StopNow):
+        move_with_fallback(
+            0.030, lambda gap: gap,
+            lambda pose, label: (_ for _ in ()).throw(StopNow()),
+            waits.append, lambda message: None, "approach_staging",
+            abort_exceptions=(StopNow,))
+
+    assert waits == []
+
+
 def make_v3_preset(tag_ids=(1, 2), idle_joint_values=None,
                    carry_joint_values=None,
                    pre_pick_transit_joint_values=None):
@@ -1315,6 +1358,31 @@ def test_contact_probe_stops_at_sixty_five_mm_when_switch_never_triggers():
     assert len(targets) == 2
     assert targets[0].pose.position.x == pytest.approx(0.10)
     assert targets[-1].pose.position.x == pytest.approx(0.165)
+
+
+def test_contact_probe_can_start_directly_from_p_after_staging_fallback():
+    run_contact_probe, = load_module_symbols("run_contact_approach")
+    start = make_pose(0.10, 0.20, 0.30)
+    targets = []
+    run_contact_probe.__globals__.update({
+        "execute_cartesian_pose": lambda arm, pose, label, **kwargs: (
+            targets.append((label, copy.deepcopy(pose)))),
+        "rospy": SimpleNamespace(
+            loginfo=lambda *items: None,
+            sleep=lambda seconds: None,
+        ),
+    })
+    enable_proxy = lambda enabled: SimpleNamespace(success=True, message="ok")
+    state_proxy = lambda: SimpleNamespace(
+        success=False, message="NOT_TRIGGERED")
+
+    assert run_contact_probe(
+        object(), start, {"approach_axis_xyz_base": [-1.0, 0.0, 0.0]},
+        "base", enable_proxy, state_proxy,
+        skip_staging_motion=True) is False
+
+    assert [item[0] for item in targets] == ["contact_probe_path"]
+    assert targets[0][1].pose.position.x == pytest.approx(0.165)
 
 
 def test_contact_guard_skips_probe_when_switch_triggers_before_p():
