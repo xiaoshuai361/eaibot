@@ -459,6 +459,20 @@ def test_astra_check_does_not_require_v4l_device(monkeypatch, tmp_path):
     supervisor._assert_astra_not_running()
 
 
+def test_astra_running_check_requires_a_live_camera_node(monkeypatch, tmp_path):
+    supervisor = processes.ProcessSupervisor(
+        enabled=True, log_root=str(tmp_path))
+    probes = []
+    monkeypatch.setattr(
+        supervisor, "_probe",
+        lambda command, timeout=3.0: probes.append((command, timeout)) or False)
+
+    assert supervisor._astra_nodes_running() is False
+    assert "rosnode ping -c 1" in probes[0][0]
+    assert "grep -q '^xmlrpc reply'" in probes[0][0]
+    assert probes[0][1] == 3.0
+
+
 def test_stop_owned_astra_waits_until_camera_nodes_disappear(
         monkeypatch, tmp_path):
     supervisor = processes.ProcessSupervisor(

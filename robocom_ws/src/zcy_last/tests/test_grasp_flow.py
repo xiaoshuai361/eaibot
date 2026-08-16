@@ -319,6 +319,22 @@ def test_untagged_pick_failure_stops_camera_and_arm_stack():
     assert supervisor.calls[-2:] == ["stop_astra", "stop_arm_common"]
 
 
+def test_astra_cleanup_failure_is_reported_without_crashing_worker_thread():
+    class CleanupFailSupervisor(FakeSupervisor):
+        def stop_astra(self):
+            raise RuntimeError("camera cleanup failed")
+
+    supervisor = CleanupFailSupervisor()
+    coordinator = GraspCoordinator(
+        supervisor, keep_arm_after_untagged=True, python3="/env/python3")
+
+    coordinator.start("untagged", 1)
+    result, error = _wait_result(coordinator)
+
+    assert result is False
+    assert "camera cleanup failed" in str(error)
+
+
 def test_untagged_pick_reports_actual_inventory_and_can_keep_arm():
     supervisor = FakeSupervisor()
     coordinator = GraspCoordinator(

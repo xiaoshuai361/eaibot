@@ -262,15 +262,20 @@ class GraspCoordinator(object):
         except Exception as exc:
             error = exc
         finally:
-            if kind == "tag":
-                self.supervisor.stop_tag_stack()
-                self.supervisor.stop_astra()
-                if not self.keep_arm_after_tag:
-                    self.supervisor.stop_arm_common()
-            elif kind in ("untagged", "untagged_search"):
-                self.supervisor.stop_astra()
-                if not self.keep_arm_after_untagged:
-                    self.supervisor.stop_arm_common()
+            try:
+                if kind == "tag":
+                    self.supervisor.stop_tag_stack()
+                    self.supervisor.stop_astra()
+                    if not self.keep_arm_after_tag:
+                        self.supervisor.stop_arm_common()
+                elif kind in ("untagged", "untagged_search"):
+                    self.supervisor.stop_astra()
+                    if not self.keep_arm_after_untagged:
+                        self.supervisor.stop_arm_common()
+            except Exception as exc:
+                success = False
+                if error is None:
+                    error = exc
             with self.lock:
                 self.result = success
                 self.result_items = result_items

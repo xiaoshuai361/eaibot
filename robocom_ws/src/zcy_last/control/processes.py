@@ -142,8 +142,11 @@ class ProcessSupervisor(object):
 
     def _astra_nodes_running(self):
         return self._probe(
-            "rosnode list 2>/dev/null | grep -qE '^/camera(/|$)'",
-            timeout=2.0)
+            "for node in $(rosnode list 2>/dev/null | "
+            "grep -E '^/camera(/|$)'); do "
+            "timeout 1 rosnode ping -c 1 \"$node\" 2>/dev/null | "
+            "grep -q '^xmlrpc reply' && exit 0; done; exit 1",
+            timeout=3.0)
 
     def _wait_astra_nodes_stopped(self, timeout=5.0):
         deadline = time.time() + float(timeout)
@@ -339,7 +342,8 @@ class ProcessSupervisor(object):
         if not self._wait_astra_nodes_stopped(timeout=6.0):
             raise RuntimeError(
                 "本次启动的 Astra 已停止，但 ROS Master 中仍有 /camera "
-                "节点；不要启动 main，请先检查 `rosnode list | grep '^/camera'`")
+                "节点可响应；"
+                "不要启动 main，请先检查 `rosnode list | grep '^/camera'`")
 
     def _cleanup_astra_nodes(self):
         # 不要把所有节点一次性交给 rosnode kill。Astra 的某个 nodelet
